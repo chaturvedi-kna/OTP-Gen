@@ -1,0 +1,215 @@
+Endpoints:
+
+Get Balance
+GET
+
+Retrieve your current account balance
+
+Endpoint
+GET
+https://api.temporasms.com/stubs/handler_api.php?api_key=$api_key&action=getBalance
+Parameters
+Field	Type	Required	Description
+action	String	Yes	API action to perform.
+api_key	String	Yes	Your API key.
+Response
+Code / Key	Value / Description
+ACCESS_BALANCE:100.1234	Your account balance (in your currency).
+Error Responses
+Code	Description
+BAD_ACTION	Invalid action requested.
+BAD_KEY	Invalid or missing API key.
+USER_BANNED	Your account has been banned.
+ERROR	A generic server error occurred.
+TOO_MANY_REQUESTS	Rate limit exceeded. Please slow down your requests.
+UNDER_DEVELOPMENT	This feature is under development. Please try later.
+
+
+Request a Phone Number
+GET
+
+Get a temporary SMS number for SMS verification. If operator is omitted, maxPrice selects price-first auto mode; without maxPrice it selects best mode. Use a numeric operator to choose one operator; operator=cheap targets only the lowest-priced eligible operator; operator=auto tries eligible operators from lowest final price to highest; operator=best tries the highest-success-rate operator first.
+
+Endpoint
+GET
+https://api.temporasms.com/stubs/handler_api.php?api_key=$api_key&action=getNumber&service=$service&country=$country&operator=$operator&providerIds=$providerIds
+Parameters
+Field	Type	Required	Description
+api_key	String	Yes	Your API key.
+action	String	Yes	API action to perform.
+service	String	Yes	Service identifier, for example wa or go.
+country	String	Yes	Country identifier, for example 22 or 21.
+operator	String	No	Optional operator identifier, for example 1 or 2.
+maxPrice	Integer	No	Maximum price you approve for the number.
+providerIds	String	No	Optional public provider option IDs from getPricesV3, tried in the supplied order.
+Automatic operator selection
+
+The operator parameter is optional. Omitting it with maxPrice behaves like operator=auto; omitting both uses operator=best.
+
+operator=auto
+Lowest final price first; try the next operator if unavailable.
+operator=cheap
+Only the single lowest-priced eligible operator.
+operator=best
+Highest success-rate operator first; then the next if unavailable.
+Response
+Code / Key	Value / Description
+ACCESS_NUMBER:3423423432:914738485900	Activation successful; returns order ID and phone number.
+NO_NUMBERS	No description available.
+Error Responses
+Code	Description
+BAD_ACTION	Invalid action requested.
+BAD_SERVICE	Requested service is unavailable or invalid.
+NO_BALANCE	Insufficient balance to complete the request.
+BAD_OPERATOR	Invalid or unsupported operator specified.
+BAD_COUNTRY	Invalid or unsupported country code.
+WRONG_MAX_PRICE	The max price parameter is invalid.
+BAD_KEY	Invalid or missing API key.
+SERVICE_BANNED	Temporarily blocked due to excessive requests/cancellations.
+USER_BANNED	Your account has been banned.
+ERROR	A generic server error occurred.
+TOO_MANY_REQUESTS	Rate limit exceeded. Please slow down your requests.
+UNDER_DEVELOPMENT	This feature is under development. Please try later.
+
+Request a Phone Number V2
+GET
+
+Get a temporary SMS number and return activation metadata as JSON. If operator is omitted, maxPrice selects price-first auto mode; without maxPrice it selects best mode. Explicit operator=cheap, operator=auto, operator=best, and numeric operator IDs are also supported.
+
+Endpoint
+GET
+https://api.temporasms.com/stubs/handler_api.php?api_key=$api_key&action=getNumberV2&service=$service&country=$country&operator=$operator&providerIds=$providerIds
+Parameters
+Field	Type	Required	Description
+api_key	String	Yes	Your API key.
+action	String	Yes	API action to perform.
+service	String	Yes	Service identifier, for example wa or go.
+country	String	Yes	Country identifier, for example 22 or 21.
+operator	String	No	Optional operator identifier, for example 1 or 2.
+maxPrice	Integer	No	Maximum price you approve for the number.
+providerIds	String	No	Optional public provider option IDs from getPricesV3, tried in the supplied order.
+Automatic operator selection
+
+The operator parameter is optional. Omitting it with maxPrice behaves like operator=auto; omitting both uses operator=best.
+
+operator=auto
+Lowest final price first; try the next operator if unavailable.
+operator=cheap
+Only the single lowest-priced eligible operator.
+operator=best
+Highest success-rate operator first; then the next if unavailable.
+Response
+{
+  "success": true,
+  "activationId": "665f1d2d7f6c0f001234abcd",
+  "phoneNumber": 914738485900,
+  "activationCost": 25,
+  "countryCode": "IN",
+  "canGetAnotherSms": true,
+  "activationTime": "2026-05-23T10:30:00.000Z",
+  "activationOperator": "3"
+}
+Error Responses
+Code	Description
+BAD_ACTION	Invalid action requested.
+BAD_SERVICE	Requested service is unavailable or invalid.
+NO_BALANCE	Insufficient balance to complete the request.
+BAD_OPERATOR	Invalid or unsupported operator specified.
+BAD_COUNTRY	Invalid or unsupported country code.
+WRONG_MAX_PRICE	The max price parameter is invalid.
+BAD_KEY	Invalid or missing API key.
+SERVICE_BANNED	Temporarily blocked due to excessive requests/cancellations.
+USER_BANNED	Your account has been banned.
+ERROR	A generic server error occurred.
+TOO_MANY_REQUESTS	Rate limit exceeded. Please slow down your requests.
+UNDER_DEVELOPMENT	This feature is under development. Please try later.
+
+Get SMS
+GET
+
+Retrieve SMS code from the temporary SMS number
+
+Endpoint
+GET
+https://api.temporasms.com/stubs/handler_api.php?api_key=$api_key&action=getStatus&id=$id
+Parameters
+Field	Type	Required	Description
+api_key	String	Yes	Your API key.
+action	String	Yes	API action to perform.
+id	String	Yes	Activation ID.
+Response
+Code / Key	Value / Description
+STATUS_OK:12343	SMS received successfully.
+STATUS_CANCEL	Activation was cancelled or timed out.
+Error Responses
+Code	Description
+NO_ACTIVATION	Activation required before proceeding, or invalid activation ID.
+BAD_ACTION	Invalid action requested.
+BAD_KEY	Invalid or missing API key.
+USER_BANNED	Your account has been banned.
+ERROR	A generic server error occurred.
+TOO_MANY_REQUESTS	Rate limit exceeded. Please slow down your requests.
+UNDER_DEVELOPMENT	This feature is under development. Please try later.
+
+Get SMS V2 (Batch)
+GET
+
+Fetch SMS status for multiple activations in a single request
+
+Endpoint
+GET
+https://api.temporasms.com/stubs/handler_api.php?api_key=$api_key&action=getStatusV2
+Parameters
+Field	Type	Required	Description
+api_key	String	Yes	Your API key.
+action	String	Yes	API action to perform.
+id	String	Yes	Activation ID.
+Response
+{
+  "321387984398": "STATUS_WAIT_CODE",
+  "321387984399": "STATUS_OK:12345"
+}
+Error Responses
+Code	Description
+NO_ACTIVATION	Activation required before proceeding, or invalid activation ID.
+BAD_ACTION	Invalid action requested.
+BAD_KEY	Invalid or missing API key.
+USER_BANNED	Your account has been banned.
+ERROR	A generic server error occurred.
+TOO_MANY_REQUESTS	Rate limit exceeded. Please slow down your requests.
+UNDER_DEVELOPMENT	This feature is under development. Please try later.
+
+
+Change Request Status
+GET
+
+Update the status of a phone number request
+
+Endpoint
+GET
+https://api.temporasms.com/stubs/handler_api.php?api_key=$api_key&action=setStatus&status=$status&id=$id
+Parameters
+Field	Type	Required	Description
+api_key	String	Yes	Your API key.
+action	String	Yes	API action to perform.
+status	Integer	Yes	3 requests another SMS; 8 cancels the activation.
+id	String	Yes	Activation ID.
+Response
+Code / Key	Value / Description
+ACCESS_CANCEL	Cancellation request accepted.
+ACCESS_CANCEL_ALREADY	This activation was already cancelled.
+Error Responses
+Code	Description
+NO_ACTIVATION	Activation required before proceeding, or invalid activation ID.
+BAD_STATUS	The requested status is invalid or cannot be processed.
+BAD_ACTION	Invalid action requested.
+BAD_KEY	Invalid or missing API key.
+USER_BANNED	Your account has been banned.
+ERROR	A generic server error occurred.
+TOO_MANY_REQUESTS	Rate limit exceeded. Please slow down your requests.
+UNDER_DEVELOPMENT	This feature is under development. Please try later.
+
+
+
+
+

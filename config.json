@@ -1,0 +1,68 @@
+{
+  "active_otp_provider": "all",
+
+  "otpcart": {
+    "enabled": true,
+    "base_url": "https://api.otpcart.xyz",
+    "ws_url": "wss://api.otpcart.xyz/check-otp",
+    "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiI2YTkxOWQ5ZThlMTRlZDlkZDE4MDhjNTciLCJyb2xlIjoidXNlciIsImlhdCI6MTc4ODQ1MDgyMCwiZXhwIjoxODIwMDA4NDIwfQ.23Dx6Gxn-j2E4c4KRT7xMw4XW-wZvVmU3XKoMoMhUtc",
+    "service_id": "68b18f42980e8cf480b1dda8",
+    "is_deep_check": true,
+    "max_price": 12,
+    "max_attempts": 500,
+    "balance_update_delay_seconds": 80.0
+  },
+
+  "tempora": {
+    "enabled": true,
+    "base_url": "https://api.temporasms.com/stubs/handler_api.php",
+    "api_key": "77406bf7b2e5becec96437e80f4c30684509",
+    "country": "22",
+    "service": "meesho",
+    "operator": "4",
+    "max_price": null,
+    "max_attempts": 1000,
+    "operator_services": {}
+  },
+
+  "otp": {
+    "enabled": true,
+    "base_url": "https://otpdoctor.in/stubs/handler_api.php",
+    "api_key": "cnis63cpc16umpleul2faa0iy5cwa0js",
+    "country": "in",
+    "service": "5841",
+    "max_price": 12,
+    "max_attempts": 500
+  },
+
+  "checker": {
+    "base_url": "https://superassets.in",
+    "api_key": "AK__3b9HMjWPCtV8_kNsN4npV64lwPVqdAa",
+    "service": "meesho"
+  },
+
+  "termux": {
+    "enabled": true
+  },
+
+  "telegram": {
+    "enabled": true,
+    "bot_token": "8670376621:AAEoyDlUzzKZshZEkJfxiyVtSWm-nvUDbXU",
+    "chat_id": "883480917"
+  },
+
+  "automation": {
+    "target_registered": false,
+    "max_attempts": 200,
+    "retry_delay_seconds": 0.5,
+    "cancel_cooldown_seconds": 1,
+    "refund_check_delay_seconds": 2,
+    "balance_tolerance": 0.001,
+    "require_manual_trigger": true,
+    "trigger_wait_seconds": 300,
+    "trigger_poll_interval_seconds": 2,
+    "otp_timeout_seconds": 180,
+    "otp_poll_interval_seconds": 3,
+    "auto_finish_activation": true
+  }
+}

@@ -1,0 +1,110 @@
+authorization
+Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiI2YTkxOWQ5ZThlMTRlZDlkZDE4MDhjNTciLCJyb2xlIjoidXNlciIsImlhdCI6MTc4ODQ1MDgyMCwiZXhwIjoxODIwMDA4NDIwfQ.23Dx6Gxn-j2E4c4KRT7xMw4XW-wZvVmU3XKoMoMhUtc
+
+https://api.otpcart.xyz/payment/balance
+
+post https://api.otpcart.xyz/mobile/generate 
+payload:
+{serviceId: "68b18f42980e8cf480b1dda8", isDeepCheck: false}
+isDeepCheck
+: 
+false
+serviceId
+: 
+"68b18f42980e8cf480b1dda8"
+
+response:
+{
+    "message": "Number unavailable due to high traffic. Please try again later.",
+    "isNumberGenerated": false
+}
+
+payload:
+{serviceId: "69aad5de5137262a53440e37", isDeepCheck: true}
+isDeepCheck
+: 
+true
+serviceId
+: 
+"69aad5de5137262a53440e37" 
+response"
+{
+    "message": "Mobile Number Successfully Generated!",
+    "mobile": {
+        "userId": "6a919d9e8e14ed9dd1808c57",
+        "mobileno": "+918092469523",
+        "serialNumber": "590559070",
+        "otpIds": [],
+        "price": 10,
+        "serviceId": "69aad5de5137262a53440e37",
+        "status": "pending",
+        "time": "1/9/2026 : 21:56:29",
+        "_id": "6a96fcb58e14ed9dd1c9e60e",
+        "createdAt": "2026-09-01T16:26:29.276Z",
+        "updatedAt": "2026-09-01T16:26:29.276Z",
+        "__v": 0
+    },
+    "balance": 0,
+    "isNumberGenerated": true
+}
+
+
+https://api.otpcart.xyz/otp/cancelOtp
+payload:
+{serialNumber: "590559070", mobileId: "6a96fcb58e14ed9dd1c9e60e",…}
+mobileId
+: 
+"6a96fcb58e14ed9dd1c9e60e"
+serialNumber
+: 
+"590559070"
+serviceId
+: 
+"69aad5de5137262a53440e37"
+response:
+{"message":"Otp canceled successfully!!!","balance":10}
+
+
+wss://api.otpcart.xyz/check-otp?token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiI2YTkxOWQ5ZThlMTRlZDlkZDE4MDhjNTciLCJyb2xlIjoidXNlciIsImlhdCI6MTc4ODI3OTIxMywiZXhwIjoxODE5ODM2ODEzfQ.Aa8qYqeaR72S7vUsiOpMs2owNXLFi-3gOB69m2Iy1H0
+Request Method
+GET
+
+{serialNumber: "590564325", mobileId: "6a96fe4b8e14ed9dd1ca08e3", resend: false}
+mobileId
+: 
+"6a96fe4b8e14ed9dd1ca08e3"
+resend
+: 
+false
+serialNumber
+: 
+"590564325"
+
+
+Request URL
+https://api.otpcart.xyz/otp/cancelOtp
+Request Method
+POST
+{serialNumber: "590564325", mobileId: "6a96fe4b8e14ed9dd1ca08e3",…}
+mobileId
+: 
+"6a96fe4b8e14ed9dd1ca08e3"
+serialNumber
+: 
+"590564325"
+serviceId
+: 
+"69aad5de5137262a53440e37"
+response
+{"message":"Otp canceled successfully!!!","balance":10}
+
+
+need this
+{serviceId: "68b18f42980e8cf480b1dda8", isDeepCheck: true}
+isDeepCheck
+: 
+true
+serviceId
+: 
+"68b18f42980e8cf480b1dda8"
+
