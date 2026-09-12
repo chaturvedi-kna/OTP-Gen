@@ -1,5 +1,5 @@
 {
-  "active_otp_provider": "all",
+  "active_otp_provider": "tempora",
 
   "otpcart": {
     "enabled": true,
@@ -19,8 +19,8 @@
     "api_key": "77406bf7b2e5becec96437e80f4c30684509",
     "country": "22",
     "service": "meesho",
-    "operator": "4",
-    "max_price": null,
+    "operator": "5",
+    "max_price": 7,
     "max_attempts": 1000,
     "operator_services": {}
   },
