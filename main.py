@@ -287,6 +287,14 @@ class ParallelAutomationCoordinator:
             try:
                 if client.name == "tempora":
                     res = client.get_number()
+                elif client.name == "vsimpro":
+                    vsi_conf = self.config.get("vsimpro", {})
+                    res = client.get_number(
+                        service=vsi_conf.get("service", "meesho"),
+                        country=vsi_conf.get("country", "22"),
+                        operator=vsi_conf.get("operator", "smart"),
+                        max_price=vsi_conf.get("max_price")
+                    )
                 elif client.name == "otpcart":
                     res = client.get_number()
                 else:
@@ -740,7 +748,7 @@ def load_config():
 
 def main():
     parser = argparse.ArgumentParser(description="Meesho OTP Automation with Dual Parallel Clients.")
-    parser.add_argument("--provider", choices=["both", "tempora", "otpdoctor"], help="Override active OTP provider")
+    parser.add_argument("--provider", choices=["both", "all", "tempora", "otpdoctor", "otpcart", "vsimpro"], help="Override active OTP provider")
     parser.add_argument("--balance", action="store_true", help="Print live balances for all providers and exit")
     parser.add_argument("--daemon", action="store_true", help="Keep Telegram command listener alive after runs")
 

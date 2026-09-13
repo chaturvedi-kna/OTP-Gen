@@ -35,6 +35,18 @@
     "max_attempts": 500
   },
 
+  "vsimpro": {
+    "enabled": true,
+    "base_url": "https://api.vsimpro.com/stubs/handler_api.php",
+    "api_key": "f4507462ba3c0b68580d7cdd2e237cf6bd58",
+    "country": "22",
+    "service": "meesho",
+    "operator": "smart",
+    "max_price": 7,
+    "max_attempts": 1000,
+    "operator_services": {}
+  },
+
   "checker": {
     "base_url": "https://superassets.in",
     "api_key": "AK__3b9HMjWPCtV8_kNsN4npV64lwPVqdAa",

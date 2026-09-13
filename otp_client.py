@@ -14,6 +14,7 @@ from base_otp import (
 from otpdoctor_client import OTPDoctorClient
 from tempora_client import TemporaClient
 from otpcart_client import OTPCartClient
+from vsimpro_client import VSImproClient
 
 # Backward compatibility alias
 OTPClient = OTPDoctorClient
@@ -57,13 +58,27 @@ def build_otpcart_client(config):
     )
 
 
+def build_vsimpro_client(config):
+    """Build a VSImproClient instance from config dictionary."""
+    vsi_conf = config.get("vsimpro", {})
+    return VSImproClient(
+        base_url=vsi_conf.get("base_url", "https://api.vsimpro.com/stubs/handler_api.php"),
+        api_key=vsi_conf.get("api_key", ""),
+        default_service=vsi_conf.get("service", "meesho"),
+        default_country=vsi_conf.get("country", "22"),
+        default_operator=vsi_conf.get("operator", "smart"),
+        max_price=vsi_conf.get("max_price"),
+        operator_services=vsi_conf.get("operator_services", {})
+    )
+
+
 def create_otp_clients(config, provider_override=None):
     """
     Returns a list of active OTP client instances based on config and override.
     Options for provider:
-      - 'all': runs all enabled providers (otpdoctor, tempora, otpcart)
-      - list of names: e.g. ['tempora', 'otpcart']
-      - specific name: 'otpcart', 'tempora', 'otpdoctor'
+      - 'all': runs all enabled providers (otpdoctor, tempora, otpcart, vsimpro)
+      - list of names: e.g. ['tempora', 'vsimpro']
+      - specific name: 'vsimpro', 'otpcart', 'tempora', 'otpdoctor'
     """
     provider_val = (
         provider_override
@@ -83,18 +98,22 @@ def create_otp_clients(config, provider_override=None):
     tempora_conf = config.get("tempora", {})
     otp_conf = config.get("otp", {})
     cart_conf = config.get("otpcart", {})
+    vsi_conf = config.get("vsimpro", {})
 
     tempora_enabled = tempora_conf.get("enabled", True) and bool(tempora_conf.get("api_key"))
     otp_enabled = otp_conf.get("enabled", True) and bool(otp_conf.get("api_key"))
     cart_enabled = cart_conf.get("enabled", True) and bool(cart_conf.get("token"))
+    vsi_enabled = vsi_conf.get("enabled", True) and bool(vsi_conf.get("api_key"))
 
-    if "all" in requested:
+    if "all" in requested or "both" in requested:
         if tempora_enabled:
             clients.append(build_tempora_client(config))
         if otp_enabled:
             clients.append(build_otpdoctor_client(config))
         if cart_enabled:
             clients.append(build_otpcart_client(config))
+        if vsi_enabled:
+            clients.append(build_vsimpro_client(config))
     else:
         for p in requested:
             if p in ("tempora", "temporasms") and tempora_enabled:
@@ -103,6 +122,8 @@ def create_otp_clients(config, provider_override=None):
                 clients.append(build_otpdoctor_client(config))
             elif p in ("otpcart", "cart") and cart_enabled:
                 clients.append(build_otpcart_client(config))
+            elif p in ("vsimpro", "vsi") and vsi_enabled:
+                clients.append(build_vsimpro_client(config))
 
     if not clients:
         # Fallback to whatever has credentials enabled
@@ -112,6 +133,8 @@ def create_otp_clients(config, provider_override=None):
             clients.append(build_otpdoctor_client(config))
         if cart_enabled:
             clients.append(build_otpcart_client(config))
+        if vsi_enabled:
+            clients.append(build_vsimpro_client(config))
 
     return clients
 
