@@ -1,8 +1,10 @@
 """
 Meesho OTP Automation Orchestrator.
-Supports true parallel multi-threaded worker execution for OtpDoctor and TemporaSMS,
-independent cancellation wait queues, interactive Telegram bot commands (/run, /status, /balance, /stop),
-and robust checker validation.
+
+Parallel worker execution for SMS providers (TemporaSMS, VSImpro, OtpDoctor,
+OTPCart) with checker validation, refund/balance safety gating, interactive
+Telegram commands (/run, /status, /balance, /stop), and optional end-to-end
+automation of the PRIMES Meesho concierge Telegram bot via a Telethon userbot.
 """
 
 import argparse
@@ -39,6 +41,13 @@ from checker_client import (
     CheckerUnavailable
 )
 from state import StateStore
+from stats import StatsStore
+from balance_guard import BalanceGuard
+from meesho_bot_client import (
+    MeeshoBotClient,
+    MeeshoBotError,
+    MeeshoBotUnknownScreen,
+)
 from notifier import Notifier
 
 
@@ -87,7 +96,10 @@ class ParallelAutomationCoordinator:
         self.target_registered = self.settings.get("target_registered", False)
 
         self.state = StateStore()
+        self.stats = StatsStore()
+        self.guard = BalanceGuard(config.get("balance_guard", {}), log_fn=log)
         self.notify = Notifier(config)
+        self.bot = MeeshoBotClient(config, log_fn=log)
 
         # Thread synchronization primitives
         self.stop_requested = threading.Event()
@@ -103,6 +115,15 @@ class ParallelAutomationCoordinator:
         self.attempts_lock = threading.Lock()
         self.is_running = False
 
+        # Per-provider balance ledger (expected balance after refund, etc.)
+        self.ledger = {}
+        self.ledger_lock = threading.Lock()
+
+        # PRIMES bot flow state
+        self.bot_at_number_prompt = False  # bot sitting on offer/number prompt after Change Number
+        self.bot_change_attempts = 0
+        self._bot_warned = False
+
         # Build active clients
         self.clients = create_otp_clients(config, provider_override=provider_override)
         for c in self.clients:
@@ -117,6 +138,41 @@ class ParallelAutomationCoordinator:
             run_cb=self.request_run,
             stop_cb=self.request_stop
         )
+
+    # -- Ledger helpers ------------------------------------------------------
+
+    def _ledger(self, name):
+        with self.ledger_lock:
+            return self.ledger.setdefault(name, {
+                "expected_balance": None,
+                "activation_id": None,
+                "number": None,
+            })
+
+    def _note_balance(self, name, balance):
+        if balance is None:
+            return
+        with self.ledger_lock:
+            entry = self.ledger.setdefault(name, {})
+            entry["expected_balance"] = float(balance)
+
+    def _note_activation(self, name, activation_id, number):
+        with self.ledger_lock:
+            entry = self.ledger.setdefault(name, {"expected_balance": None})
+            entry["activation_id"] = activation_id
+            entry["number"] = number
+
+    def _expected_balance(self, name, activation_id):
+        with self.ledger_lock:
+            entry = self.ledger.get(name, {})
+            return entry.get("expected_balance")
+
+    def _critical_stop(self, title, message):
+        """Halt ALL workers and send a max-priority alert."""
+        log(f"CRITICAL STOP: {title} - {message}")
+        self.stop_requested.set()
+        self.stats.increment("critical_stops")
+        self.notify.alert(f"🛑 {title}", message + "\n\nAutomation STOPPED. Manual intervention required.")
 
     # -- Status and Balances for Telegram & CLI ------------------------------
 
@@ -136,7 +192,8 @@ class ParallelAutomationCoordinator:
         state_str = "🟢 RUNNING" if self.is_running else "⚪ IDLE / STOPPED"
         lines = [
             f"🤖 Meesho Automation: {state_str}",
-            f"Mode: {self.config.get('active_otp_provider', 'both').upper()}"
+            f"Mode: {self.config.get('active_otp_provider', 'both').upper()}",
+            f"PRIMES bot automation: {'🟢 ON' if self.bot.ready else '⚪ manual'}",
         ]
 
         if self.worker_max_attempts:
@@ -158,6 +215,19 @@ class ParallelAutomationCoordinator:
             for name, st in self.worker_statuses.items():
                 lines.append(f"  • {name.upper()}: {st}")
 
+        s = self.stats.snapshot()
+        lines.append(
+            "\n📊 Totals\n"
+            f"  Accounts linked: {s['accounts_linked']}\n"
+            f"  Targets found: {s['targets_found']} | OTPs received: {s['otp_received']}\n"
+            f"  Wrong OTP: {s['otp_wrong']} | Expired: {s['otp_expired']} | Blocked: {s['user_blocked']}\n"
+            f"  OTP timeouts: {s['otp_timeout']} | Change-number: {s['change_number']}\n"
+            f"  Numbers consumed (charged): {s['numbers_consumed']}\n"
+            f"  Refunds verified: {s['refunds_verified']} | Refunds missing: {s['refunds_missing']} | "
+            f"Late OTP salvaged: {s['late_otp_salvaged']}"
+            + (f"\n  🛑 Critical stops: {s['critical_stops']}" if s.get('critical_stops') else "")
+        )
+
         lines.append("\n" + self.get_balances_summary())
         return "\n".join(lines)
 
@@ -172,15 +242,27 @@ class ParallelAutomationCoordinator:
         self.stop_requested.set()
         log("Stop requested via command.")
 
-    # -- Cancellation & Cooldown Logic --------------------------------------
+    # -- Cancellation, salvage & refund tally --------------------------------
 
-    def handle_cancellation(self, client, activation_id, number, reason):
+    def handle_cancellation(self, client, activation_id, number, reason,
+                            expected_balance=None, expect_refund=True):
         """
-        Cancels an activation on the specific provider client to trigger refund.
-        Any wait cooldown (e.g. WAIT_CANCEL:120 on OtpDoctor) happens strictly
-        inside the calling thread without blocking other providers.
+        Cancel an activation and VERIFY the refund tallies before any new number
+        may be purchased. Handles provider cooldowns and the race in which the
+        OTP lands while the cancellation is in flight (late-OTP salvage).
+
+        expect_refund:
+          - True  (no SMS delivered): refund must restore the pre-purchase
+                  balance; mismatch triggers a global critical stop.
+          - False (SMS already delivered, e.g. bot rejected the OTP): the charge
+                  legitimately stands; the new lower balance becomes the baseline.
+
+        Returns {"tally_ok", "salvaged", "balance"}.
         """
         pname = client.name.upper()
+        if expected_balance is None:
+            expected_balance = self._expected_balance(client.name, activation_id)
+
         log(f"Cancelling activation {activation_id} for number {number} (Reason: {reason})...", prefix=pname)
 
         cancel_res = None
@@ -196,9 +278,7 @@ class ParallelAutomationCoordinator:
             log(f"[COOLDOWN] Waiting {wait_seconds}s before retrying cancellation...", prefix=pname)
             self.worker_statuses[client.name] = f"Waiting cooldown ({wait_seconds}s)"
             time.sleep(wait_seconds + 1)
-
             try:
-                log(f"Retrying cancellation for activation {activation_id}...", prefix=pname)
                 cancel_res = client.cancel(activation_id)
                 log(f"Cancellation response after cooldown: {cancel_res}", prefix=pname)
             except Exception as exc:
@@ -209,27 +289,85 @@ class ParallelAutomationCoordinator:
             log(f"[COOLDOWN] Early cancel denied. Waiting {cooldown}s before retrying...", prefix=pname)
             self.worker_statuses[client.name] = f"Waiting cooldown ({cooldown}s)"
             time.sleep(cooldown)
-
             try:
-                log(f"Retrying cancellation for activation {activation_id}...", prefix=pname)
                 cancel_res = client.cancel(activation_id)
                 log(f"Cancellation response after cooldown: {cancel_res}", prefix=pname)
             except Exception as exc:
                 log(f"Error while retrying cancellation {activation_id}: {exc}", prefix=pname)
 
-        refund_delay = self.settings.get("refund_check_delay_seconds", 2)
-        if refund_delay > 0:
-            time.sleep(refund_delay)
+        self.stats.increment("numbers_cancelled")
 
-        try:
-            curr_bal = client.get_balance()
-            if curr_bal < 5.0 and hasattr(client, "wait_for_usable_balance"):
-                log(f"Balance is {curr_bal:.4f}. Waiting for refund ledger update...", prefix=pname)
-                client.wait_for_usable_balance(min_balance=5.0)
-                curr_bal = client.get_balance()
-            log(f"Balance after cancellation: {curr_bal:.4f}", prefix=pname)
-        except Exception:
-            pass
+        salvaged = None
+        tally_ok = True
+        actual_balance = None
+
+        if not expect_refund:
+            # SMS was already delivered (e.g. the bot rejected a wrong/expired
+            # code): the charge legitimately stands. The new (lower) balance is
+            # the correct baseline for the next number.
+            refund_delay = self.settings.get("refund_check_delay_seconds", 2)
+            if refund_delay > 0:
+                time.sleep(refund_delay)
+            try:
+                actual_balance = client.get_balance()
+                self._note_balance(client.name, actual_balance)
+            except Exception:
+                pass
+            self.stats.increment("numbers_consumed")
+            log(f"Number consumed (SMS delivered); new balance baseline: {actual_balance}", prefix=pname)
+        else:
+            # Salvage race: an OTP may have landed as the cancel was processed.
+            try:
+                salvaged = self.guard.salvage_late_otp(
+                    client, activation_id,
+                    probes=self.settings.get("cancel_salvage_probes", 2),
+                    delay=self.settings.get("cancel_salvage_delay", 1.5),
+                    prefix=pname,
+                )
+            except Exception:
+                salvaged = None
+            if salvaged:
+                self.stats.increment("late_otp_salvaged")
+                code = salvaged.get("code")
+                sms = salvaged.get("sms", "")
+                log(f"🚨 OTP arrived during cancellation race! Code: {code}", prefix=pname)
+                self.notify.alert(
+                    f"🚨 [{pname}] OTP arrived during cancellation - act NOW",
+                    f"Number: {number}\nActivation: {activation_id}\nReason: {reason}\n\n"
+                    f"Code: `{code}`\nSMS: {sms}\n\n"
+                    "The SMS was delivered, so the provider may deny the refund. "
+                    "Use the code manually now if it is still valid."
+                )
+
+            refund_delay = self.settings.get("refund_check_delay_seconds", 2)
+            if refund_delay > 0:
+                time.sleep(refund_delay)
+
+            tally_ok, actual_balance = self.guard.verify_refund(
+                client, expected_balance,
+                activation_id=activation_id, number=number,
+                stop_event=self.stop_requested, prefix=pname,
+            )
+
+            if expected_balance is not None and tally_ok:
+                self.stats.increment("refunds_verified")
+                self._note_balance(client.name, actual_balance)
+            elif expected_balance is not None and not tally_ok:
+                self.stats.increment("refunds_missing")
+                salvage_note = (
+                    f"\nLate OTP code: `{salvaged.get('code')}`" if salvaged else
+                    "\nNo OTP was seen - check the provider panel for this activation."
+                )
+                self._critical_stop(
+                    f"[{pname}] REFUND DID NOT TALLY",
+                    f"Number: {number}\nActivation: {activation_id}\n"
+                    f"Expected balance: ~{expected_balance:.4f}\nActual balance: {actual_balance}\n"
+                    f"Reason for cancel: {reason}{salvage_note}\n\n"
+                    "No new numbers will be purchased until you verify this activation "
+                    "in the provider dashboard."
+                )
+
+        result = {"tally_ok": bool(tally_ok), "salvaged": salvaged, "balance": actual_balance}
 
         self.state.save({
             "status": "CANCELLED",
@@ -237,16 +375,22 @@ class ParallelAutomationCoordinator:
             "activation_id": activation_id,
             "number": number,
             "reason": reason,
+            "expect_refund": expect_refund,
+            "refund_tallied": bool(tally_ok) if expect_refund else None,
+            "expected_balance": expected_balance,
+            "actual_balance": actual_balance,
+            "salvaged_otp": (salvaged or {}).get("code"),
             "cancelled_at": now()
         })
+        return result
 
     # -- Parallel Worker Loop ------------------------------------------------
 
     def worker_loop(self, client):
         """
         Independent thread loop for a single provider.
-        Fetches numbers, validates with checker, cancels if used, and yields to
-        coordinator when an unregistered match is found.
+        Fetches numbers, validates with checker, cancels if used (verifying the
+        refund tally), and yields to the coordinator on an unregistered match.
         """
         pname = client.name.upper()
         log(f"Worker started.", prefix=pname)
@@ -257,17 +401,18 @@ class ParallelAutomationCoordinator:
         self.worker_attempts[client.name] = 0
         retry_delay = self.settings.get("retry_delay_seconds", 1.0)
 
-        # Initial provider balance
+        # Initial provider balance seeds the refund-tally ledger.
         try:
             bal = client.get_balance()
+            self._note_balance(client.name, bal)
             log(f"Initial balance: {bal:.4f} (Max Attempts: {client_max_attempts})", prefix=pname)
         except Exception as exc:
             log(f"Warning: Could not fetch initial balance: {exc}", prefix=pname)
 
         while not self.stop_requested.is_set():
-            # If a target was found by either worker, pause fetching
+            # If a target is being processed, pause fetching
             if self.target_found_event.is_set():
-                self.worker_statuses[client.name] = "Paused (Target found by a worker)"
+                self.worker_statuses[client.name] = "Paused (target being processed)"
                 time.sleep(1)
                 continue
 
@@ -279,6 +424,10 @@ class ParallelAutomationCoordinator:
                 self.worker_attempts[client.name] += 1
                 current_attempt = self.worker_attempts[client.name]
                 self.total_attempts += 1
+
+            # SAFETY GATE: never buy a number while a refund discrepancy is open.
+            if self.stop_requested.is_set():
+                break
 
             self.worker_statuses[client.name] = f"Attempt {current_attempt}/{client_max_attempts}: Requesting number"
             log(f"Requesting number (Attempt {current_attempt}/{client_max_attempts})...", prefix=pname)
@@ -317,11 +466,11 @@ class ParallelAutomationCoordinator:
                             bal = client.get_balance()
                             if bal >= 5.0:
                                 log(f"Balance updated to {bal:.4f}. Resuming search...", prefix=pname)
+                                self._note_balance(client.name, bal)
                                 restored = True
                                 break
                         except Exception:
                             pass
-
                     if restored:
                         continue
 
@@ -331,9 +480,7 @@ class ParallelAutomationCoordinator:
                     f"⚠️ [{pname}] Insufficient Balance",
                     f"Provider {pname} reported insufficient balance (NO_BALANCE).\n"
                     f"Please recharge your account.\n\n"
-                    f"Once recharged:\n"
-                    f"• Send /balance to verify your updated balance\n"
-                    f"• Send /run to restart search"
+                    f"Once recharged:\n• Send /balance\n• Send /run"
                 )
                 return
             except (OTPProviderUnavailable, OTPNoNumbers) as exc:
@@ -346,6 +493,12 @@ class ParallelAutomationCoordinator:
                 self.worker_statuses[client.name] = f"Error: {exc}"
                 time.sleep(retry_delay * 2)
                 continue
+            except Exception as exc:
+                # Never let an unexpected error silently kill an unattended worker.
+                log(f"Unexpected error while requesting number: {exc!r}. Retrying...", prefix=pname)
+                self.worker_statuses[client.name] = f"Unexpected error: {exc}"
+                time.sleep(retry_delay * 3)
+                continue
 
             res_type = res.get("type")
 
@@ -355,35 +508,12 @@ class ParallelAutomationCoordinator:
                 continue
 
             if res_type == "NO_BALANCE":
-                balance_wait = getattr(client, "balance_wait_seconds", 0) or client_conf.get("balance_update_delay_seconds", 0)
-                if balance_wait > 0:
-                    log(f"Provider reported NO_BALANCE. Waiting up to {balance_wait}s for balance/refund update...", prefix=pname)
-                    self.worker_statuses[client.name] = f"Waiting balance update (up to {balance_wait}s)"
-                    deadline = time.time() + balance_wait
-                    restored = False
-                    while time.time() < deadline and not self.stop_requested.is_set():
-                        time.sleep(3.0)
-                        try:
-                            bal = client.get_balance()
-                            if bal >= 5.0:
-                                log(f"Balance updated to {bal:.4f}. Resuming search...", prefix=pname)
-                                restored = True
-                                break
-                        except Exception:
-                            pass
-
-                    if restored:
-                        continue
-
                 log(f"Provider reported fatal error: NO_BALANCE (Insufficient Balance)", prefix=pname)
                 self.worker_statuses[client.name] = "Stopped (NO_BALANCE)"
                 self.notify.alert(
                     f"⚠️ [{pname}] Insufficient Balance",
                     f"Provider {pname} reported NO_BALANCE.\n"
-                    f"Please recharge your account.\n\n"
-                    f"Once recharged:\n"
-                    f"• Send /balance to verify your updated balance\n"
-                    f"• Send /run to restart search"
+                    f"Please recharge.\nOnce recharged:\n• Send /balance\n• Send /run"
                 )
                 return
 
@@ -416,6 +546,7 @@ class ParallelAutomationCoordinator:
             activation_id = res["activation_id"]
             raw_number = res["number"]
             clean_number = CheckerClient.format_number(raw_number)
+            self._note_activation(client.name, activation_id, clean_number)
 
             context = NumberContext(
                 client=client,
@@ -425,7 +556,6 @@ class ParallelAutomationCoordinator:
             )
 
             log(f"Acquired number: {raw_number} (Clean: {clean_number}, Activation: {activation_id})", prefix=pname)
-
             self.state.save({
                 "status": "ACQUIRED",
                 "provider": client.name,
@@ -438,23 +568,24 @@ class ParallelAutomationCoordinator:
             # Check registration on Meesho checker
             self.worker_statuses[client.name] = f"Checking registration for {clean_number}"
             log(f"Checking {clean_number} on {self.checker_service} checker...", prefix=pname)
-
             try:
                 check = self.checker.check(self.checker_service, clean_number)
             except (CheckerUnavailable, CheckerError) as exc:
                 log(f"Checker error: {exc}. Cancelling number...", prefix=pname)
                 self.handle_cancellation(client, activation_id, clean_number, f"Checker error: {exc}")
+                if self.stop_requested.is_set():
+                    return
                 continue
 
             is_registered = check.get("is_registered", False)
             log(f"Checker result: is_registered={is_registered} (Target: {self.target_registered})", prefix=pname)
 
-            # Evaluate registration
             if is_registered != self.target_registered:
-                # Already registered / used number -> Cancel on provider (refund)
                 reason = "Already registered on Meesho" if is_registered else "Not registered on Meesho"
                 log(f"Number {clean_number} does not match target. Cancelling on {pname}...", prefix=pname)
                 self.handle_cancellation(client, activation_id, clean_number, reason)
+                if self.stop_requested.is_set():
+                    return
                 continue
 
             # MATCH FOUND!
@@ -476,21 +607,219 @@ class ParallelAutomationCoordinator:
                     "raw_number": context.raw_number,
                     "number": context.clean_number,
                     "is_registered": is_registered,
-                    "target_registered": self.target_registered,
                     "found_at": now()
                 })
-                # Worker waits here OUTSIDE the lock while coordinator handles manual trigger & OTP
+                # This worker parks here while the coordinator drives the bot/OTP flow.
                 while self.target_found_event.is_set() and not self.stop_requested.is_set():
                     time.sleep(0.5)
             else:
-                # Another worker beat us to target, cancel ours
                 log(f"Another worker already claimed target. Cancelling duplicate...", prefix=pname)
                 self.handle_cancellation(client, activation_id, clean_number, "Duplicate target match")
+                if self.stop_requested.is_set():
+                    return
 
         log(f"Worker stopped.", prefix=pname)
         self.worker_statuses[client.name] = "Stopped"
 
-    # -- Manual Trigger & OTP Resolution (Main Thread) ----------------------
+    # -- PRIMES bot flow + manual trigger ------------------------------------
+
+    def _bot_send_number(self, context, from_prompt):
+        """Drive the PRIMES bot up to its 'OTP on its way' screen. Returns result dict or None."""
+        number = context.clean_number
+        pname = context.provider_name.upper()
+        self.worker_statuses[context.provider_name] = f"Bot: entering {number}"
+        log(f"Driving PRIMES bot for {number} (from_prompt={from_prompt})...", prefix=pname)
+        try:
+            if from_prompt:
+                res = self.bot.continue_with_number(number)
+            else:
+                res = self.bot.prepare_login(number)
+        except MeeshoBotUnknownScreen as exc:
+            log(f"PRIMES bot unexpected screen: {exc}; screen: {exc.screen_text[:300]}", prefix=pname)
+            self.notify.alert(
+                f"⚠️ [{pname}] PRIMES bot needs attention",
+                f"Unexpected bot screen while processing {number}:\n\n{exc.screen_text[:600]}\n\n"
+                "Cancelling this number and resetting the bot flow."
+            )
+            try:
+                self.bot.cancel_flow()
+            except Exception:
+                pass
+            self.bot_at_number_prompt = False
+            self.bot_change_attempts = 0
+            self.handle_cancellation(context.client, context.activation_id, number,
+                                     "PRIMES bot unexpected screen")
+            return None
+        except MeeshoBotError as exc:
+            log(f"PRIMES bot error: {exc}", prefix=pname)
+            self.notify.alert(f"⚠️ [{pname}] PRIMES bot error", f"{exc}\nCancelling this number.")
+            self.handle_cancellation(context.client, context.activation_id, number, f"Bot error: {exc}")
+            return None
+
+        if res.get("stage") == "blocked":
+            self.stats.increment("user_blocked")
+            totals = self.stats.summary()
+            log(f"Number {number} blocked by Meesho. Changing number.", prefix=pname)
+            self.notify.alert(
+                f"🚫 [{pname}] Number blocked by Meesho",
+                f"Number: {number}\n{res.get('message', '')[:300]}\n\n{totals}"
+            )
+            try:
+                self.bot.cancel_flow()
+            except Exception:
+                pass
+            self.bot_at_number_prompt = False
+            self.bot_change_attempts = 0
+            self.handle_cancellation(context.client, context.activation_id, number, "Meesho blocked number")
+            return None
+
+        if res.get("stage") != "otp_sent":
+            log(f"PRIMES bot did not reach OTP screen: {res}", prefix=pname)
+            self.handle_cancellation(context.client, context.activation_id, number, "Bot flow failed")
+            return None
+
+        rerolls = res.get("rerolls", 0)
+        if rerolls:
+            self.stats.increment("offer_rerolls", rerolls)
+        self.state.save({
+            "status": "BOT_OTP_REQUESTED",
+            "provider": context.provider_name,
+            "activation_id": context.activation_id,
+            "number": number,
+            "upi_price": res.get("upi"),
+            "offer_rerolls": rerolls,
+            "requested_at": now()
+        })
+        self.notify.send(
+            "📲 OTP requested via PRIMES bot",
+            f"Number: `{number}` ({pname})\nUPI price: ₹{res.get('upi')}\n"
+            f"Offer rerolls: {rerolls}\nWaiting for SMS code..."
+        )
+        return res
+
+    def _bot_submit_code(self, context, code, sms, late=False):
+        """Submit the OTP into the PRIMES bot and classify the result. Returns status string."""
+        pname = context.provider_name.upper()
+        log(f"Submitting OTP {code} to PRIMES bot...", prefix=pname)
+        try:
+            res = self.bot.submit_otp(code)
+        except MeeshoBotUnknownScreen as exc:
+            self.notify.alert(
+                f"⚠️ [{pname}] PRIMES bot needs attention after OTP",
+                f"Number: {context.clean_number}\nCode: `{code}`\n\n"
+                f"Unexpected screen:\n{exc.screen_text[:600]}\n\nSubmit/verify manually if needed."
+            )
+            return "unknown"
+        except MeeshoBotError as exc:
+            self.notify.alert(
+                f"⚠️ [{pname}] PRIMES bot error after OTP",
+                f"Number: {context.clean_number}\nCode: `{code}`\n{exc}"
+            )
+            return "unknown"
+
+        status = res.get("status", "unknown")
+        totals = self.stats.summary()
+
+        if status == "linked":
+            n_linked = self.stats.increment("accounts_linked")
+            # The account is created - accept the provider charge (status 6).
+            try:
+                context.client.finish(context.activation_id)
+                log(f"Activation {context.activation_id} finished after link.", prefix=pname)
+            except Exception as exc:
+                log(f"Note: could not finish activation: {exc}", prefix=pname)
+            try:
+                bal = context.client.get_balance()
+                self._note_balance(context.provider_name, bal)
+            except Exception:
+                pass
+            try:
+                self.bot.return_to_menu()
+            except Exception:
+                pass
+            self.bot_at_number_prompt = False
+            self.bot_change_attempts = 0
+
+            self.state.save({
+                "status": "ACCOUNT_LINKED",
+                "provider": context.provider_name,
+                "activation_id": context.activation_id,
+                "number": context.clean_number,
+                "otp_code": code,
+                "meesho_user_id": res.get("user_id"),
+                "meesho_account_number": res.get("account_number"),
+                "linked_at": now()
+            })
+            self.notify.alert(
+                f"🎉 [{pname}] Account linked! (#{n_linked})",
+                f"Number: {context.clean_number}\n"
+                f"Meesho User ID: {res.get('user_id') or 'n/a'}\n"
+                f"Bot account #{res.get('account_number') or 'n/a'}\n"
+                f"OTP: {code}{' (late salvage)' if late else ''}\n\n{totals}"
+            )
+            return "linked"
+
+        if status == "wrong_otp":
+            n = self.stats.increment("otp_wrong")
+            self.notify.alert(
+                f"❌ [{pname}] Wrong OTP (#{n})",
+                f"Number: {context.clean_number}\nCode rejected: {code}\n"
+                f"Will change number and retry.\n\n{totals}"
+            )
+        elif status == "otp_expired":
+            n = self.stats.increment("otp_expired")
+            self.notify.alert(
+                f"⌛ [{pname}] OTP expired (#{n})",
+                f"Number: {context.clean_number}\nWill change number and retry.\n\n{totals}"
+            )
+        elif status == "blocked":
+            n = self.stats.increment("user_blocked")
+            self.notify.alert(
+                f"🚫 [{pname}] User blocked (#{n})",
+                f"Number: {context.clean_number} was blocked during verification.\n"
+                f"Will change number and retry.\n\n{totals}"
+            )
+        else:
+            self.notify.alert(
+                f"⚠️ [{pname}] Unconfirmed bot result: {status}",
+                f"Number: {context.clean_number}\nCode: `{code}`\n"
+                f"Screen:\n{res.get('screen', '')[:500]}\nWill change number and retry."
+            )
+        return status
+
+    def _bot_prepare_change_number(self, context):
+        """
+        Tell the PRIMES bot to Change Number so the next found number is sent
+        straight to the number prompt. Cancels/refunds the provider activation
+        via the caller. Returns True if the bot now awaits a new number.
+        """
+        pname = context.provider_name.upper()
+        self.bot_change_attempts += 1
+        if self.bot_change_attempts > self.bot.max_change_number:
+            log("Change Number attempt cap reached; resetting bot to main menu.", prefix=pname)
+            try:
+                self.bot.cancel_flow()
+            except Exception:
+                pass
+            self.bot_at_number_prompt = False
+            self.bot_change_attempts = 0
+            return False
+
+        try:
+            res = self.bot.change_number(None)
+            self.stats.increment("change_number")
+            if res.get("stage") in ("prompt", "needs_full_flow"):
+                self.bot_at_number_prompt = res.get("stage") == "prompt"
+                log(f"Bot ready for replacement number (attempt {self.bot_change_attempts}).", prefix=pname)
+                return self.bot_at_number_prompt
+        except MeeshoBotError as exc:
+            log(f"Change Number failed in bot: {exc}; full flow will restart.", prefix=pname)
+            try:
+                self.bot.cancel_flow()
+            except Exception:
+                pass
+            self.bot_at_number_prompt = False
+        return False
 
     def wait_for_manual_trigger(self, context):
         wait_seconds = self.settings.get("trigger_wait_seconds", 300)
@@ -512,12 +841,11 @@ class ParallelAutomationCoordinator:
             last_probe[0] = time.time()
             try:
                 st = context.client.get_status(context.activation_id)
-                st_type = st.get("type")
-                if st_type == "STATUS_OK":
-                    log(f"OTP arrived before confirmation - proceeding immediately.", prefix=context.provider_name.upper())
+                if st.get("type") == "STATUS_OK":
+                    log("OTP arrived before confirmation - proceeding immediately.", prefix=context.provider_name.upper())
                     return "go"
-                if st_type == "STATUS_CANCEL":
-                    log(f"Activation cancelled remotely while waiting.", prefix=context.provider_name.upper())
+                if st.get("type") == "STATUS_CANCEL":
+                    log("Activation cancelled remotely while waiting.", prefix=context.provider_name.upper())
                     return "skip"
             except Exception:
                 pass
@@ -533,6 +861,15 @@ class ParallelAutomationCoordinator:
         )
 
     def wait_for_otp(self, context):
+        """
+        Poll the provider for the SMS.
+
+        Returns (kind, status):
+          ("ok", status)        - OTP received in time
+          ("late", status)      - OTP found by the final salvage probes after timeout
+          ("cancelled", None)   - provider cancelled the activation
+          ("timeout", None)     - no OTP (and no late salvage)
+        """
         timeout = self.settings.get("otp_timeout_seconds", 180)
         poll_interval = self.settings.get("otp_poll_interval_seconds", 3)
         start_time = time.time()
@@ -543,7 +880,6 @@ class ParallelAutomationCoordinator:
 
         while (time.time() - start_time) < timeout and not self.stop_requested.is_set():
             elapsed = int(time.time() - start_time)
-
             try:
                 status_res = context.client.get_status(context.activation_id)
             except Exception as exc:
@@ -554,48 +890,52 @@ class ParallelAutomationCoordinator:
             status_type = status_res.get("type")
 
             if status_type == "STATUS_OK":
-                sms = status_res.get("sms", "")
-                code = status_res.get("code") or sms
-
-                log(f"🎉 [SUCCESS] OTP Received! Code: {code}", prefix=pname)
-                log(f"Full SMS Content: {sms}", prefix=pname)
-
+                code = status_res.get("code") or status_res.get("sms", "")
+                log(f"🎉 OTP Received! Code: {code}", prefix=pname)
+                log(f"Full SMS Content: {status_res.get('sms', '')}", prefix=pname)
                 self.state.save({
-                    "status": "COMPLETED",
+                    "status": "OTP_RECEIVED",
                     "provider": context.provider_name,
                     "activation_id": context.activation_id,
                     "number": context.clean_number,
                     "otp_code": code,
-                    "sms": sms,
-                    "completed_at": now()
+                    "sms": status_res.get("sms", ""),
+                    "received_at": now()
                 })
+                return "ok", status_res
 
-                self.notify.otp_result(code, context.clean_number, sms, provider_name=context.provider_name)
+            if status_type == "STATUS_CANCEL":
+                log("Activation was cancelled remotely.", prefix=pname)
+                return "cancelled", None
 
-                if self.settings.get("auto_finish_activation", True):
-                    try:
-                        context.client.finish(context.activation_id)
-                        log(f"Activation {context.activation_id} finished successfully.", prefix=pname)
-                    except Exception as exc:
-                        log(f"Note: Could not complete activation: {exc}", prefix=pname)
-
-                return True
-
-            elif status_type == "STATUS_WAIT_CODE":
+            if status_type == "STATUS_WAIT_CODE":
                 if elapsed - last_log >= 15:
                     log(f"Waiting for OTP ({elapsed}s/{timeout}s)...", prefix=pname)
                     last_log = elapsed
-                time.sleep(poll_interval)
+            time.sleep(poll_interval)
 
-            elif status_type == "STATUS_CANCEL":
-                log(f"Activation was cancelled remotely.", prefix=pname)
-                return False
+        # FINAL SALVAGE: the SMS can land in the seconds between timeout and a
+        # cancel call. Probe a few times before declaring the number dead.
+        log(f"OTP wait window elapsed ({timeout}s). Running final salvage probes...", prefix=pname)
+        late = self.guard.salvage_late_otp(
+            context.client, context.activation_id,
+            probes=self.settings.get("timeout_salvage_probes", 3),
+            delay=self.settings.get("timeout_salvage_delay", 2.0),
+            prefix=pname,
+        )
+        if late:
+            self.stats.increment("late_otp_salvaged")
+            code = late.get("code")
+            self.notify.alert(
+                f"🆘 [{pname}] Late OTP salvaged",
+                f"Number: {context.clean_number}\nCode arrived right at timeout: `{code}`\n"
+                f"Attempting to use it..."
+            )
+            return "late", late
 
-            else:
-                time.sleep(poll_interval)
-
-        log(f"OTP timed out after {timeout}s.", prefix=pname)
-        return False
+        self.stats.increment("otp_timeout")
+        log("OTP timed out; no salvageable code.", prefix=pname)
+        return "timeout", None
 
     # -- Orchestration Run Method --------------------------------------------
 
@@ -604,13 +944,31 @@ class ParallelAutomationCoordinator:
         self.stop_requested.clear()
         self.target_found_event.clear()
         self.total_attempts = 0
+        self.bot_at_number_prompt = False
+        self.bot_change_attempts = 0
 
         log("=" * 60)
         log("STARTING PARALLEL MEESHO OTP AUTOMATION")
         log(f"Active Providers: {', '.join(c.name.upper() for c in self.clients)}")
+
+        # Start the PRIMES userbot (optional; falls back to manual trigger).
+        if self.bot.enabled:
+            started = self.bot.start()
+            if started and self.bot.ready:
+                log(f"PRIMES bot automation ENABLED for {self.bot.bot_username}")
+            else:
+                log(f"PRIMES bot automation unavailable ({self.bot.start_error}); using manual trigger flow.")
+                if not self._bot_warned:
+                    self._bot_warned = True
+                    self.notify.alert(
+                        "PRIMES bot automation inactive",
+                        f"{self.bot.start_error}\n\nFalling back to the manual OTP trigger flow.\n"
+                        "Run login_userbot.py and check meesho_bot config to enable full automation."
+                    )
+        use_bot = self.bot.ready
+        log(f"PRIMES bot flow: {'AUTO' if use_bot else 'MANUAL TRIGGER'}")
         log("=" * 60)
 
-        # Initial Balances
         for client in self.clients:
             try:
                 bal = client.get_balance()
@@ -618,18 +976,14 @@ class ParallelAutomationCoordinator:
             except Exception as exc:
                 log(f"[{client.name.upper()}] Warning: Balance fetch failed: {exc}")
 
-        # Spawn worker threads
         workers = []
         for client in self.clients:
             t = threading.Thread(target=self.worker_loop, args=(client,), name=f"Worker-{client.name}", daemon=True)
             workers.append(t)
             t.start()
 
-        max_attempts = self.settings.get("max_attempts", 200)
-
         try:
             while not self.stop_requested.is_set():
-                # Check if all worker threads have stopped
                 alive_workers = [t for t in workers if t.is_alive()]
                 if not alive_workers and not self.target_found_event.is_set():
                     all_reached_max = all(
@@ -642,97 +996,168 @@ class ParallelAutomationCoordinator:
                             for c in self.clients
                         )
                         log(f"All workers reached configured max attempts ({summary_att}).")
-                        self.notify.alert(
-                            "Automation Finished",
-                            f"All workers finished their max attempts ({summary_att}) without finding target."
-                        )
+                        self.notify.alert("Automation Finished",
+                                          f"All workers finished their max attempts ({summary_att}).\n\n"
+                                          f"{self.stats.summary()}")
                     else:
                         log("All worker threads have stopped.")
                         self.notify.alert(
                             "⚠️ All OTP Workers Stopped",
-                            "All OTP worker threads have stopped (e.g. insufficient balance or fatal errors).\n\n"
-                            "Please recharge your account.\n"
-                            "Once recharged:\n"
-                            "• Send /balance to check new balance\n"
-                            "• Send /run to restart search"
+                            "All worker threads have stopped (insufficient balance, refund mismatch, or fatal errors).\n\n"
+                            "• Send /balance to check balances\n• Send /run to restart"
                         )
                     break
 
-                # Wait for a worker to find a target number
                 if self.target_found_event.wait(timeout=1.0):
                     with self.active_target_lock:
                         target = self.active_target
-
                     if not target:
                         continue
 
-                    log(f"\n>>> PROCESSING TARGET NUMBER: {target.clean_number} ({target.provider_name.upper()}) <<<\n")
-
-                    # Manual trigger gate
-                    if self.settings.get("require_manual_trigger", True):
-                        decision = self.wait_for_manual_trigger(target)
-
-                        if decision == "skip":
-                            log(f"User skipped {target.clean_number}. Cancelling and continuing search...")
-                            self.notify.send(
-                                "Number Skipped",
-                                f"⏭ Number {target.clean_number} was skipped.\nContinuing search for next number..."
-                            )
-                            self.handle_cancellation(target.client, target.activation_id, target.clean_number, "Skipped by user")
-                            with self.active_target_lock:
-                                self.active_target = None
-                            self.target_found_event.clear()
-                            continue
-
-                        if decision == "timeout":
-                            log(f"Trigger timed out for {target.clean_number}. Cancelling...")
-                            self.notify.alert("Trigger Timed Out", f"No trigger confirmation for {target.clean_number}.\nCancelling and continuing search...")
-                            self.handle_cancellation(target.client, target.activation_id, target.clean_number, "Manual trigger timed out")
-                            with self.active_target_lock:
-                                self.active_target = None
-                            self.target_found_event.clear()
-                            continue
-
-                        log("Trigger confirmed. Waiting for OTP...")
-                        self.state.save({
-                            "status": "TRIGGER_CONFIRMED",
-                            "provider": target.provider_name,
-                            "activation_id": target.activation_id,
-                            "number": target.clean_number,
-                            "confirmed_at": now()
-                        })
-                        self.notify.send(
-                            "Trigger Confirmed",
-                            f"✅ OTP Triggered for {target.clean_number} ({target.provider_name.upper()}).\nWaiting for SMS code..."
-                        )
-                    else:
-                        self.notify.alert("Target Number Found", f"Number: {target.clean_number}\nProvider: {target.provider_name}")
-
-                    # Wait for OTP SMS
-                    otp_success = self.wait_for_otp(target)
-
-                    if otp_success:
-                        log("Process completed successfully!")
-                        self.stop_requested.set()
+                    self.stats.increment("targets_found")
+                    log(f"\n>>> PROCESSING TARGET: {target.clean_number} ({target.provider_name.upper()}) <<<\n")
+                    cont = self._process_target(target, use_bot)
+                    if cont == "stop":
                         break
-                    else:
-                        log(f"OTP failed or timed out for {target.clean_number}. Cancelling...")
-                        self.notify.alert(
-                            f"⚠️ [{target.provider_name.upper()}] OTP Timed Out",
-                            f"OTP was not received for {target.clean_number}.\nNumber cancelled for refund. Continuing search..."
-                        )
-                        self.handle_cancellation(target.client, target.activation_id, target.clean_number, "OTP timeout")
-                        with self.active_target_lock:
-                            self.active_target = None
-                        self.target_found_event.clear()
-                        continue
 
         finally:
             self.stop_requested.set()
             for t in workers:
                 t.join(timeout=2.0)
+            if self.bot.ready:
+                self.bot.stop()
             self.is_running = False
             log("Automation run finished.")
+
+    def _clear_target(self):
+        with self.active_target_lock:
+            self.active_target = None
+        self.target_found_event.clear()
+
+    def _process_target(self, target, use_bot):
+        """
+        Drive one found number through trigger -> OTP -> link/recovery.
+        Returns "continue" (search again) or "stop".
+        """
+        # --- Step 1: trigger the OTP (auto via bot, or manual gate) --------
+        if use_bot:
+            res = self._bot_send_number(target, from_prompt=self.bot_at_number_prompt)
+            if res is None:
+                self._clear_target()
+                return "continue" if not self.stop_requested.is_set() else "stop"
+        else:
+            if self.settings.get("require_manual_trigger", True):
+                decision = self.wait_for_manual_trigger(target)
+                if decision == "skip":
+                    self.notify.send("Number Skipped",
+                                     f"⏭ Number {target.clean_number} skipped; continuing search...")
+                    self.handle_cancellation(target.client, target.activation_id, target.clean_number, "Skipped by user")
+                    self._clear_target()
+                    return "continue" if not self.stop_requested.is_set() else "stop"
+                if decision == "timeout":
+                    self.notify.alert("Trigger Timed Out",
+                                      f"No trigger confirmation for {target.clean_number}; cancelling.")
+                    self.handle_cancellation(target.client, target.activation_id, target.clean_number,
+                                             "Manual trigger timed out")
+                    self._clear_target()
+                    return "continue" if not self.stop_requested.is_set() else "stop"
+                self.notify.send("Trigger Confirmed",
+                                 f"✅ OTP triggered for {target.clean_number}; waiting for SMS...")
+            else:
+                self.notify.alert("Target Number Found",
+                                  f"Number: {target.clean_number}\nProvider: {target.provider_name}")
+
+        # --- Step 2: wait for the OTP from the provider ---------------------
+        kind, status_res = self.wait_for_otp(target)
+        pname = target.provider_name.upper()
+
+        if kind in ("ok", "late"):
+            sms = status_res.get("sms", "")
+            code = status_res.get("code") or sms
+            self.stats.increment("otp_received")
+
+            if use_bot:
+                bot_status = self._bot_submit_code(target, code, sms, late=(kind == "late"))
+                if bot_status == "linked":
+                    if self.settings.get("stop_after_success", False):
+                        log("Account linked and stop_after_success=true; stopping.")
+                        self.stop_requested.set()
+                        return "stop"
+                    log("Account linked. Resuming search for next number...")
+                    self._clear_target()
+                    return "continue"
+                # wrong / expired / blocked / unknown after code delivery: the
+                # SMS was consumed, so the charge legitimately stands (no refund).
+                log(f"Bot result '{bot_status}' for {target.clean_number}; recovering with new number.")
+                self._recover_change_number(target, f"bot_{bot_status}", expect_refund=False)
+                self._clear_target()
+                return "continue" if not self.stop_requested.is_set() else "stop"
+
+            # Manual mode: surface the OTP and finish (historical behavior).
+            self.notify.otp_result(code, target.clean_number, sms, provider_name=target.provider_name)
+            if self.settings.get("auto_finish_activation", True):
+                try:
+                    target.client.finish(target.activation_id)
+                except Exception as exc:
+                    log(f"Note: could not finish activation: {exc}")
+            try:
+                self._note_balance(target.provider_name, target.client.get_balance())
+            except Exception:
+                pass
+            self.stop_requested.set()
+            return "stop"
+
+        if kind == "cancelled":
+            self.notify.alert(
+                f"⚠️ [{pname}] activation cancelled",
+                f"Activation {target.activation_id} ({target.clean_number}) was cancelled remotely.\n"
+                "Checking refund and continuing..."
+            )
+            self.handle_cancellation(target.client, target.activation_id, target.clean_number,
+                                     "Activation cancelled remotely")
+            self._clear_target()
+            return "continue" if not self.stop_requested.is_set() else "stop"
+
+        # timeout
+        if use_bot:
+            self._recover_change_number(target, "otp_timeout")
+        else:
+            self.notify.alert(
+                f"⚠️ [{pname}] OTP Timed Out",
+                f"No OTP for {target.clean_number}. Cancelling for refund and continuing..."
+            )
+            self.handle_cancellation(target.client, target.activation_id, target.clean_number, "OTP timeout")
+        self._clear_target()
+        return "continue" if not self.stop_requested.is_set() else "stop"
+
+    def _recover_change_number(self, target, reason, expect_refund=True):
+        """
+        OTP missing/rejected recovery: tap Change Number in the PRIMES bot,
+        cancel the provider activation (verifying the refund when the SMS was
+        not delivered), then let workers hunt the next number (which is sent
+        straight to the waiting bot).
+        """
+        pname = target.provider_name.upper()
+        prompt_ready = False
+        if self.bot.ready:
+            prompt_ready = self._bot_prepare_change_number(target)
+            self.notify.send(
+                "🔄 Changing number",
+                (f"{target.clean_number} ({reason}). The bot is waiting for the replacement number."
+                 if prompt_ready else
+                 f"{target.clean_number} ({reason}). The bot flow will restart from the menu.")
+            )
+        log(f"Cancelling {target.activation_id} for recovery ({reason}, refund expected: {expect_refund})...",
+            prefix=pname)
+        result = self.handle_cancellation(
+            target.client, target.activation_id, target.clean_number,
+            f"Recovery: {reason}", expect_refund=expect_refund
+        )
+        if result.get("salvaged"):
+            # Late code arrived - do not leave the bot waiting for a replacement.
+            self.bot_at_number_prompt = False
+        # Otherwise the flag was already set by _bot_prepare_change_number
+        # (True while the bot shows the number prompt, False for a full menu restart).
 
 
 def load_config():
@@ -747,8 +1172,10 @@ def load_config():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Meesho OTP Automation with Dual Parallel Clients.")
-    parser.add_argument("--provider", choices=["both", "all", "tempora", "otpdoctor", "otpcart", "vsimpro"], help="Override active OTP provider")
+    parser = argparse.ArgumentParser(description="Meesho OTP automation with parallel provider clients.")
+    parser.add_argument("--provider",
+                        help="Provider(s): tempora, vsimpro, otpdoctor, otpcart, 'all', or comma-combinations "
+                             "e.g. 'tempora,vsimpro'")
     parser.add_argument("--balance", action="store_true", help="Print live balances for all providers and exit")
     parser.add_argument("--daemon", action="store_true", help="Keep Telegram command listener alive after runs")
 
@@ -766,10 +1193,8 @@ def main():
         print(coordinator.get_balances_summary())
         return
 
-    # Start run
     coordinator.run()
 
-    # If Telegram is configured, keep a lightweight listener alive for /run commands
     if coordinator.notify.telegram.configured:
         log("Listening for Telegram commands (/run, /status, /balance, /stop). Press Ctrl+C to exit.")
         try:

@@ -1,2 +1,12 @@
 __pycache__/
 *.pyc
+
+# Userbot session grants full access to the Telegram account - never commit it.
+userbot.session.txt
+*.session
+*.session-journal
+
+# Local runtime stats
+stats.json
+stats.tmp
+.signals/
