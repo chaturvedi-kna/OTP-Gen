@@ -1,5 +1,5 @@
 {
-  "active_otp_provider": "tempora",
+  "active_otp_provider": "tempora,vsimpro",
 
   "otpcart": {
     "enabled": true,
@@ -53,6 +53,29 @@
     "service": "meesho"
   },
 
+  "balance_guard": {
+    "enabled": true,
+    "tolerance": 0.5,
+    "refund_wait_seconds": 90,
+    "poll_interval_seconds": 3,
+    "min_balance": 5
+  },
+
+  "meesho_bot": {
+    "enabled": false,
+    "api_id": 0,
+    "api_hash": "",
+    "session_file": "userbot.session.txt",
+    "bot_username": "",
+    "login_mode": "Normal",
+    "target_upi_price": 47,
+    "max_offer_rerolls": 30,
+    "max_change_number": 5,
+    "step_timeout_seconds": 60,
+    "poll_interval_seconds": 1.2,
+    "human_delay_seconds": [1.0, 2.5]
+  },
+
   "termux": {
     "enabled": true
   },
@@ -75,6 +98,11 @@
     "trigger_poll_interval_seconds": 2,
     "otp_timeout_seconds": 180,
     "otp_poll_interval_seconds": 3,
-    "auto_finish_activation": true
+    "auto_finish_activation": true,
+    "stop_after_success": false,
+    "timeout_salvage_probes": 3,
+    "timeout_salvage_delay": 2.0,
+    "cancel_salvage_probes": 2,
+    "cancel_salvage_delay": 1.5
   }
 }
