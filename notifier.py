@@ -181,6 +181,7 @@ class TelegramBackend:
         self.balance_callback = None
         self.run_callback = None
         self.stop_callback = None
+        self.referral_callback = None
 
     @property
     def configured(self):
@@ -427,7 +428,7 @@ class TelegramBackend:
 
             # Handle bot commands (/status, /run, /stop, /balance, /start)
             if raw_text.startswith("/"):
-                cmd = token.split()[0]
+                cmd = token.split()[0].split("@", 1)[0]
                 if cmd == "status" and self.status_callback:
                     status_text = self.status_callback()
                     self.send("Tool Status", status_text)
@@ -444,6 +445,17 @@ class TelegramBackend:
                     self.stop_callback()
                     self.send("Automation Stopping", "⏹ Stopping active search.")
                     continue
+                elif cmd == "referral" and self.referral_callback:
+                    # /referral <link> - save; /referral off - clear;
+                    # /referral alone - show the current setting.
+                    parts = raw_text.split(None, 1)
+                    argument = parts[1].strip() if len(parts) > 1 else ""
+                    try:
+                        reply = self.referral_callback(argument)
+                    except Exception as exc:
+                        reply = f"❌ Referral command failed: {exc}"
+                    self.send("Referral Link", reply or "Referral command handled.")
+                    continue
                 elif cmd == "start":
                     self.send(
                         "Meesho Automation Bot",
@@ -451,6 +463,8 @@ class TelegramBackend:
                         "▶️ /run - Start searching for fresh numbers\n"
                         "ℹ️ /status - Check current tool status & progress\n"
                         "💰 /balance - Check live balances on all providers\n"
+                        "🎁 /referral <link> - Save the Meesho referral link "
+                        "(/referral off to clear, /referral to show)\n"
                         "⏹ /stop - Stop running search"
                     )
                     continue
@@ -501,12 +515,17 @@ class Notifier:
 
         SIGNAL_DIR.mkdir(exist_ok=True)
 
-    def set_command_callbacks(self, status_cb=None, balance_cb=None, run_cb=None, stop_cb=None):
-        """Attach callbacks for interactive Telegram commands (/status, /balance, /run, /stop)."""
+    def set_command_callbacks(self, status_cb=None, balance_cb=None, run_cb=None,
+                              stop_cb=None, referral_cb=None):
+        """
+        Attach callbacks for interactive Telegram commands (/status, /balance,
+        /run, /stop, /referral <link>).
+        """
         self.telegram.status_callback = status_cb
         self.telegram.balance_callback = balance_cb
         self.telegram.run_callback = run_cb
         self.telegram.stop_callback = stop_cb
+        self.telegram.referral_callback = referral_cb
 
     def send(self, title, message, priority="default", notif_id=NOTIF_ID_STATUS,
              termux_buttons=None, telegram_buttons=None, ongoing=False, silent=False):

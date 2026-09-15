@@ -27,6 +27,8 @@ COUNTERS = {
     "critical_stops": 0,       # safety-gated full stops
     "offer_rerolls": 0,        # "Try Another Offer" taps
     "late_otp_salvaged": 0,    # OTP found during/after the cancel race
+    "referral_pasted": 0,      # referral link pasted at the bot's referral step
+    "referral_skipped": 0,     # referral step answered with the bot's skip option
 }
 
 
