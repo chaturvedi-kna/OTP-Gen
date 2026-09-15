@@ -14,8 +14,10 @@ Flow automated (from the recorded screens + screenshot):
             otherwise tap the bot's own "🚫 I don't have a refer code" /
             "Don't have one" option - never Cancel, never a silent stop
          -> [Normal] -> offer screen: reroll [Try Another Offer] until UPI <=
-            target price
-         -> send 10-digit number -> "OTP on its way" screen
+            target price (some bot revisions show a three-button "Try Again"
+            variant instead of an offer - tapped the same way)
+         -> send 10-digit number -> brief "⏳ Sending your OTP…" screen ->
+            "OTP on its way" screen
          -> (coordinator polls the OTP provider) -> send OTP code
          -> "Account linked!" (parse User ID / account #)
 Recovery:
@@ -101,6 +103,9 @@ S_LOGIN_MODE = "login_mode"
 S_REFERRAL = "referral"
 S_OFFER = "offer"
 S_OTP_WAIT = "otp_wait"
+# The brief "⏳ Sending your OTP…" screen the bot shows between the number
+# being sent and the "OTP on its way" screen: transient, keep waiting.
+S_SENDING_OTP = "otp_sending"
 S_LINKED = "linked"
 S_WRONG_OTP = "wrong_otp"
 S_EXPIRED = "otp_expired"
@@ -137,6 +142,12 @@ REFERRAL_ERROR_HINTS = (
     "expired", "already used", "couldn't", "could not", "wrong link",
     "wrong code", "try again",
 )
+
+# A dedicated "Try Again" button (some bot revisions show a three-button
+# offer variant with it instead of "Try Another Offer"). Matched on the whole
+# normalised label, so prose like "please try again" or an option such as
+# "Try Again Later" never counts.
+_REROLL_TRY_AGAIN_RE = re.compile(r"^try again[\s!?.]*$")
 # "✅ Referral link saved!" style confirmations. They mention a referral link
 # but ask for nothing, so they must not be answered again. The negations keep
 # the actual prompt ("You haven't saved a referral link yet.") out.
@@ -199,6 +210,24 @@ class Screen:
 
     def has_button(self, *needles):
         return self.find_button(*needles) is not None
+
+    def reroll_button(self):
+        """
+        (row, col, label) of the button that rerolls the offer.
+
+        Normally "Try Another Offer". Some bot revisions instead show a
+        three-button variant with no price on the screen whose reroll button
+        is "Try Again" - it must be tapped exactly the same way. Only a
+        dedicated "Try Again" button label matches, so other copy is ignored.
+        """
+        hit = self.find_button("try another offer")
+        if hit:
+            return hit
+        for r, row in enumerate(self.buttons):
+            for c, label in enumerate(row):
+                if _REROLL_TRY_AGAIN_RE.match(normalize_label(label)):
+                    return r, c, label
+        return None
 
     # -- referral screen ---------------------------------------------------
 
@@ -344,6 +373,11 @@ class Screen:
         if ("otp on its way" in t or "we've sent a code" in t
                 or "sent a code to" in t or "type it here when it arrives" in t):
             return S_OTP_WAIT
+        # Transient: shown right after the number is sent, before the
+        # "OTP on its way" screen. Checked after S_OTP_WAIT so a screen that
+        # mentions both still wins as the real OTP prompt.
+        if "sending your otp" in t or "sending otp" in t:
+            return S_SENDING_OTP
         # Menu / login-mode / offer screens claim priority over the referral
         # check: only the dedicated promotion screen may classify as referral.
         if self.has_button("try another offer") or (
@@ -871,6 +905,12 @@ class MeeshoBotClient:
                     "stage": "blocked" if state == S_BLOCKED else "otp_sent",
                 })
                 return result
+            if state == S_SENDING_OTP:
+                raise MeeshoBotUnknownScreen(
+                    "Bot is still on 'Sending your OTP…' for a previous "
+                    "number - the replacement number was NOT typed",
+                    screen.text, screen.button_labels,
+                )
             if state != S_OFFER:
                 raise MeeshoBotUnknownScreen(
                     "Expected the number prompt before sending the replacement number",
@@ -907,8 +947,12 @@ class MeeshoBotClient:
             self._log("[MEESHO-BOT] Tapping the 'Normal' login mode.")
             screen = await self._click(screen, "normal")
 
-        # Offer screen + reroll until UPI price target is met
-        screen = await self._settle_offer(screen)
+        # Offer screen + reroll until UPI price target is met. The reroll
+        # button is normally "Try Another Offer"; some bot revisions show a
+        # three-button "Try Again" variant instead, which is tapped the same
+        # way. Variant screens that appear while waiting for an offer are
+        # also tapped inside _settle_offer (bounded by the reroll budget).
+        screen = await self._settle_offer(screen, self.max_offer_rerolls)
         while True:
             state = screen.classify()
             if state in (S_BLOCKED, S_LINKED, S_OTP_WAIT, S_WRONG_OTP, S_EXPIRED):
@@ -922,8 +966,18 @@ class MeeshoBotClient:
                     f"UPI price never reached ₹{self.target_upi_price} after {rerolls} rerolls",
                     screen.text, screen.button_labels,
                 )
-            screen = await self._click(screen, "try another offer")
-            screen = await self._settle_offer(screen)
+            reroll = screen.reroll_button()
+            if reroll is None:
+                raise MeeshoBotUnknownScreen(
+                    "Offer screen has no reroll button (expected 'Try Another "
+                    "Offer' or 'Try Again')",
+                    screen.text, screen.button_labels,
+                )
+            self._log(f"[MEESHO-BOT] Reroll #{rerolls + 1} "
+                      f"(UPI ₹{upi if upi is not None else 'n/a'} vs target "
+                      f"₹{self.target_upi_price}): tapping '{reroll[2]}'.")
+            screen = await self._click(screen, reroll[2])
+            screen = await self._settle_offer(screen, self.max_offer_rerolls)
             rerolls += 1
 
         result["rerolls"] = rerolls
@@ -941,15 +995,29 @@ class MeeshoBotClient:
                 "Expected offer/number-prompt screen", screen.text, screen.button_labels
             )
 
-        # Send the 10-digit number.
+        # Send the 10-digit number. The bot briefly shows "⏳ Sending your
+        # OTP…" between the number and the "OTP on its way" screen: settle
+        # through that transient state instead of erroring on it (the Change
+        # Number recovery path already works this way).
         self._log(f"[MEESHO-BOT] Offer accepted at UPI ₹{result['upi']} "
                   f"({rerolls} reroll(s)); sending number {number}.")
         screen = await self._send_text(str(number))
+        screen = await self._settle(
+            screen, (S_OTP_WAIT, S_BLOCKED, S_LINKED, S_WRONG_OTP, S_EXPIRED),
+        )
         state = screen.classify()
         if state == S_BLOCKED:
             result["stage"] = "blocked"
             result["message"] = screen.text
             return result
+        if state == S_SENDING_OTP:
+            raise MeeshoBotUnknownScreen(
+                "Bot is stuck on 'Sending your OTP…' - the 'OTP on its way' "
+                "screen never appeared. The number WAS submitted to the bot, "
+                "so the SMS may still arrive (the refund tally will flag it "
+                "if it does).",
+                screen.text, screen.button_labels,
+            )
         if state != S_OTP_WAIT:
             raise MeeshoBotUnknownScreen(
                 f"Expected 'OTP on its way' after sending number, got {state}",
@@ -960,16 +1028,47 @@ class MeeshoBotClient:
         result["message"] = screen.text
         return result
 
-    async def _settle_offer(self, screen):
+    async def _settle_offer(self, screen, extra_taps=0):
         """
-        After a click that should lead to an offer, wait for UPI text, dealing
-        with a referral prompt if the bot re-offers it before the number is
-        entered (Cancel/Change Number reroutes can land back on it).
+        After a click that should lead to an offer, wait for the offer screen.
+        Handles two interruptions:
+          * the referral prompt the bot may re-offer mid-flow (via _settle);
+          * the three-button "Try Again" variant some bot revisions show
+            instead of an offer (no price on the screen): it waits for a tap,
+            so it is tapped like "Try Another Offer" and waited on again -
+            bounded by extra_taps so a stuck bot cannot spin the flow forever.
+        Returns the settled screen; callers decide whether it is an error.
         """
-        return await self._settle(
-            screen,
-            (S_OFFER, S_BLOCKED, S_LINKED, S_OTP_WAIT, S_LOGIN_MODE, S_LINK_CHOICE),
-        )
+        states = (S_OFFER, S_BLOCKED, S_LINKED, S_OTP_WAIT, S_LOGIN_MODE, S_LINK_CHOICE)
+        taps = 0
+        while True:
+            if (screen.classify() not in states
+                    and screen.classify() != S_REFERRAL
+                    and screen.reroll_button() is not None):
+                # A non-offer screen that offers to reroll is the "Try Again"
+                # variant: tapping it now is faster (and more correct) than
+                # waiting out the full step timeout for a screen that will
+                # not change until it is tapped.
+                if taps >= extra_taps:
+                    return screen
+                label = screen.reroll_button()[2]
+                self._log(f"[MEESHO-BOT] Offer variant without a price: "
+                          f"tapping '{label}' (variant tap "
+                          f"{taps + 1}/{extra_taps}).")
+                screen = await self._click(screen, label)
+                taps += 1
+                continue
+            screen = await self._settle(screen, states)
+            if screen.classify() in states:
+                return screen
+            reroll = (None if screen.classify() == S_REFERRAL
+                      else screen.reroll_button())
+            if reroll is None or taps >= extra_taps:
+                return screen  # let the caller decide what to do with it
+            self._log(f"[MEESHO-BOT] Offer variant without a price: tapping "
+                      f"'{reroll[2]}' (variant tap {taps + 1}/{extra_taps}).")
+            screen = await self._click(screen, reroll[2])
+            taps += 1
 
     async def _a_submit_otp(self, code):
         # The bot can re-ask for a referral link after the number was sent
@@ -1023,7 +1122,7 @@ class MeeshoBotClient:
             pass  # already at the number prompt
         elif screen.has_button("change number"):
             screen = await self._click(screen, "change number")
-            screen = await self._settle_offer(screen)
+            screen = await self._settle_offer(screen, self.max_offer_rerolls)
         else:
             # Unexpected place: rebuild a full flow instead.
             screen = await self._cancel_to_menu()
@@ -1042,12 +1141,19 @@ class MeeshoBotClient:
 
         screen = await self._send_text(str(new_number))
         # A re-offered referral prompt here must never swallow the replacement
-        # number: answer it and wait for the OTP-wait screen instead.
+        # number: answer it and wait for the OTP-wait screen instead (the
+        # "⏳ Sending your OTP…" transient settles through as well).
         screen = await self._settle(
             screen, (S_OTP_WAIT, S_BLOCKED, S_LINKED, S_WRONG_OTP, S_EXPIRED),
         )
         if screen.classify() == S_BLOCKED:
             return {"stage": "blocked", "message": screen.text}
+        if screen.classify() == S_SENDING_OTP:
+            raise MeeshoBotUnknownScreen(
+                "Bot is stuck on 'Sending your OTP…' after the replacement "
+                "number - the 'OTP on its way' screen never appeared",
+                screen.text, screen.button_labels,
+            )
         if screen.classify() != S_OTP_WAIT:
             raise MeeshoBotUnknownScreen(
                 "Expected OTP-on-its-way after new number",

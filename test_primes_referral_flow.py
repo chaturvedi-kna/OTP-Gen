@@ -21,6 +21,7 @@ from meesho_bot_client import (
     Screen,
     S_MENU,
     S_REFERRAL,
+    S_SENDING_OTP,
 )
 
 
@@ -88,6 +89,29 @@ OFFER_45 = Screen(
     [["🔄 Try Another Offer"]],
 )
 
+# The three-button variant some bot revisions show instead of an offer
+# ("⚠️ Failed to fetch offer"), transcribed exactly from the screenshot.
+# NOTE: it still carries price lines (Bucket · ₹135, UPI · ₹83) with
+# "Offer · Null" - a decoy price that must NEVER be accepted as an offer.
+# The flow must tap "Try Again" exactly like "Try Another Offer", and must
+# never tap "Continue without offer" or "Cancel".
+OFFER_RETRY = Screen(
+    "⚠️ Failed to fetch offer.\n\n"
+    "Couldn't load your first-order offer right now. Tap 🔄 Try Again to retry, "
+    "or continue without it.\n\n"
+    "📊 Offer details\n• Bucket · ₹135\n• Offer · Null\n\n"
+    "🛍️ Sattu 1Kg | Sattu Drink Mix (100% Natural)\n• Original · ₹454\n"
+    "• Final · ₹118\n• UPI · ₹83",
+    [["🔄 Try Again"], ["➡️ Continue without offer"], ["❌ Cancel"]],
+)
+
+# Transient screens the bot shows while working:
+#   "Setting things up..." - after a tap (Normal / Try Another Offer /
+#   Try Again), before the offer appears;
+#   "Sending your OTP..." - after the number is sent, before OTP on its way.
+SETTING_UP = Screen("⚙️ Setting things up...\n\nFinding the best offer for you.")
+SENDING_OTP = Screen("⏳ Sending your OTP…")
+
 OTP_WAIT = Screen(
     "✅ OTP on its way!\n\nWe've sent a code to 9xxxxxxxxx. Type it here when it arrives.",
     [["🔄 Change Number"]],
@@ -138,7 +162,9 @@ class FakeBot:
     """
 
     def __init__(self, referral_link="", referral_script="save",
-                 offer_prices=(60, 45), referral_reask=False):
+                 offer_prices=(60, 45), referral_reask=False,
+                 retry_after=None, variant_first=False,
+                 otp_transition="instant", setup_interstitial=False):
         self.tapped = []
         self.taps = self.tapped  # alias used by FakeMessage
         self.messages = []
@@ -152,6 +178,18 @@ class FakeBot:
         self.sent_numbers = []
         self.sent_codes = []
         self.state = "menu"
+        # "Try Again" variant: shown instead of the offer after the
+        # `retry_after`-th "Try Another Offer" tap (1-based), or instead of
+        # the first offer right after tapping Normal (variant_first).
+        self.retry_after = retry_after
+        self.variant_first = variant_first
+        self.reroll_count = 0
+        # otp_transition: "instant" (directly to OTP on its way), "delayed"
+        # (transient "Sending your OTP…" first) or "stuck" (transient forever).
+        self.otp_transition = otp_transition
+        self._pending_otp = 0  # get_messages polls that still show the transient
+        self._pending_offer = None  # "setup" = show the offer on the next poll
+        self.setup_interstitial = setup_interstitial
         self._push(MAIN_MENU)
 
     # -- helpers ----------------------------------------------------------
@@ -201,13 +239,31 @@ class FakeBot:
             self._edit_last(LOGIN_MODE)
         elif label == "Normal" and self.state == "login_mode":
             self.state = "offer"
-            self._edit_last(self._offer_screen())
+            if self.variant_first:
+                self.variant_first = False
+                self._edit_last(OFFER_RETRY)
+            else:
+                self._edit_last(self._offer_screen())
         elif "Change Number" in label:
             self.state = "offer"
             self._edit_last(self._offer_screen())
         elif "Try Another Offer" in label:
+            self.reroll_count += 1
             if self.offer_prices:
                 self.offer_prices.pop(0)
+            if self.retry_after == self.reroll_count:
+                self.retry_after = None
+                self._edit_last(OFFER_RETRY)
+                return
+            if self.setup_interstitial:
+                self._pending_offer = "setup"
+                self._edit_last(SETTING_UP)
+                return
+            self._edit_last(self._offer_screen())
+        elif "Try Again" in label:
+            # The three-button variant: the tap rerolls; the next screen is
+            # the offer itself (the price was consumed when the variant was
+            # shown / the first offer is just delayed).
             self._edit_last(self._offer_screen())
         elif label == "Cancel":
             self.state = "menu"
@@ -246,6 +302,17 @@ class FakeBot:
             if stripped.startswith("9999"):
                 self.state = "blocked"
                 self._push(BLOCKED)
+            elif self.otp_transition == "stuck":
+                # Stays on the transient forever: the flow must time out with
+                # a clear "stuck on 'Sending your OTP…'" error.
+                self.state = "sending_otp"
+                self._push(SENDING_OTP)
+            elif self.otp_transition == "delayed":
+                # A couple of polls see the transient, the next shows
+                # "OTP on its way" - the flow must settle through it.
+                self.state = "sending_otp"
+                self._push(SENDING_OTP)
+                self._pending_otp = 2
             else:
                 self.state = "otp_wait"
                 self._push(OTP_WAIT)
@@ -266,7 +333,19 @@ class FakeTelegramClient:
         self.bot = bot
 
     async def get_messages(self, entity, limit=6):
-        return list(reversed(self.bot.messages[-limit:]))
+        # Simulate the bot's delayed in-place edits between a transient
+        # screen and the real one (transient seen for a couple of polls,
+        # real screen after).
+        b = self.bot
+        if getattr(b, "_pending_otp", 0) > 0:
+            b._pending_otp -= 1
+            if b._pending_otp == 0:
+                b.state = "otp_wait"
+                b._edit_last(OTP_WAIT)
+        if getattr(b, "_pending_offer", None) == "setup":
+            b._pending_offer = None
+            b._edit_last(b._offer_screen())
+        return list(reversed(b.messages[-limit:]))
 
     async def send_message(self, entity, text):
         await self.bot.on_message(text)
@@ -274,7 +353,9 @@ class FakeTelegramClient:
 
 
 def build_client(referral_link="", referral_script="save",
-                 referral_failure_action="stop", **kwargs):
+                 referral_failure_action="stop", retry_after=None,
+                 variant_first=False, otp_transition="instant",
+                 setup_interstitial=False, **kwargs):
     config = {
         "meesho_bot": {
             "enabled": True,
@@ -292,7 +373,10 @@ def build_client(referral_link="", referral_script="save",
             **kwargs,
         }
     }
-    bot = FakeBot(referral_link=referral_link, referral_script=referral_script)
+    bot = FakeBot(referral_link=referral_link, referral_script=referral_script,
+                  retry_after=retry_after, variant_first=variant_first,
+                  otp_transition=otp_transition,
+                  setup_interstitial=setup_interstitial)
     client = MeeshoBotClient(config, log_fn=lambda *_: None)
     client._client = FakeTelegramClient(bot)
     client._bot_entity = "@primesbot"
@@ -626,6 +710,114 @@ def scenario_change_number_with_referral():
           f"res={res3} sent={bot.sent_numbers}")
 
 
+def scenario_reroll_button_parsing():
+    s = Screen("UPI \u00b7 \u20b945", [["\U0001f504 Try Another Offer"]])
+    check("reroll: 'Try Another Offer' is the reroll button",
+          s.reroll_button()[2] == "\U0001f504 Try Another Offer", s.reroll_button())
+
+    variant = Screen("Couldn't find an offer right now.",
+                     [["\U0001f504 Try Again", "Main Menu", "Cancel"]])
+    check("reroll: variant classifies as unknown (no price on it)",
+          variant.classify() == "unknown", variant.classify())
+    check("reroll: variant's 'Try Again' is the reroll button",
+          variant.reroll_button()[2] == "\U0001f504 Try Again", variant.reroll_button())
+
+    check("reroll: 'Try Again Later' is NOT a reroll button",
+          Screen("x", [["Try Again Later"]]).reroll_button() is None)
+    check("reroll: 'please try again' prose is NOT a reroll button",
+          Screen("Please try again later.", [["Contact Support"]]).reroll_button() is None)
+    check("reroll: no buttons -> no reroll button",
+          Screen("Something went wrong.").reroll_button() is None)
+
+    check("real variant: never classified as an offer",
+          OFFER_RETRY.classify() == "unknown", OFFER_RETRY.classify())
+    check("real variant: decoy 'UPI \u00b7 \u20b983' parses but must not be accepted",
+          OFFER_RETRY.upi_price == 83.0, OFFER_RETRY.upi_price)
+    check("real variant: reroll button is 'Try Again'",
+          OFFER_RETRY.reroll_button()[2] == "\U0001f504 Try Again",
+          OFFER_RETRY.reroll_button())
+    check("real variant: 'Continue without offer' is present but is NOT the reroll",
+          OFFER_RETRY.find_button("continue without") is not None
+          and OFFER_RETRY.reroll_button()[2] == "\U0001f504 Try Again")
+    check("real variant: not mistaken for a referral screen",
+          not OFFER_RETRY.is_referral, OFFER_RETRY.is_referral)
+
+    check("transient: 'Sending your OTP\u2026' has its own state",
+          SENDING_OTP.classify() == S_SENDING_OTP, SENDING_OTP.classify())
+    check("transient: 'Setting things up\u2026' stays unknown",
+          SETTING_UP.classify() == "unknown", SETTING_UP.classify())
+
+
+def scenario_try_again_variant():
+    """
+    The three-button 'Try Again' variant appears mid-reroll: it must be tapped
+    like 'Try Another Offer' and the flow continues to the next offer.
+    """
+    client, bot = build_client(referral_script="absent", retry_after=1)
+    res = client.prepare_login("9876543210")
+    check("variant: flow reaches OTP screen", res["stage"] == "otp_sent", res)
+    check("variant: 'Try Again' was tapped", "\U0001f504 Try Again" in bot.tapped, bot.tapped)
+    check("variant: 'Try Another Offer' tapped once",
+          bot.tapped.count("\U0001f504 Try Another Offer") == 1, bot.tapped)
+    check("variant: landed on the \u20b945 offer", res["upi"] == 45.0, res)
+    check("variant: rerolls counted", res["rerolls"] == 1, res)
+    check("variant: number sent once", bot.sent_numbers == ["9876543210"], bot.sent_numbers)
+    check("variant: 'Continue without offer' never tapped",
+          not any("Continue without" in t for t in bot.tapped), bot.tapped)
+    check("variant: 'Cancel' never tapped",
+          not any(t == "Cancel" or "❌ Cancel" in t for t in bot.tapped), bot.tapped)
+    check("variant: decoy ₹83 price never accepted", res["upi"] != 83.0, res)
+
+
+def scenario_try_again_variant_first():
+    """The variant shows up right after tapping Normal, in place of the offer."""
+    client, bot = build_client(referral_script="absent", variant_first=True)
+    res = client.prepare_login("9876543210")
+    check("variant first: flow reaches OTP screen", res["stage"] == "otp_sent", res)
+    check("variant first: 'Try Again' tapped before any number",
+          "\U0001f504 Try Again" in bot.tapped and bot.sent_numbers == ["9876543210"],
+          f"tapped={bot.tapped} sent={bot.sent_numbers}")
+    check("variant first: price target still enforced", res["upi"] == 45.0, res)
+    check("variant first: 'Continue without offer' never tapped",
+          not any("Continue without" in t for t in bot.tapped), bot.tapped)
+
+
+def scenario_sending_otp_transient():
+    """'\u23f3 Sending your OTP\u2026' between the number and 'OTP on its way' is settled."""
+    client, bot = build_client(referral_script="absent", otp_transition="delayed")
+    res = client.prepare_login("9876543210")
+    check("sending-otp transient: flow reaches OTP screen", res["stage"] == "otp_sent", res)
+    check("sending-otp transient: number sent exactly once",
+          bot.sent_numbers == ["9876543210"], bot.sent_numbers)
+    check("sending-otp transient: offer accepted at target", res["upi"] == 45.0, res)
+
+
+def scenario_sending_otp_stuck():
+    """A bot that never leaves 'Sending your OTP\u2026' must fail loudly (bounded)."""
+    client, bot = build_client(referral_script="absent", otp_transition="stuck",
+                               step_timeout_seconds=1)
+    try:
+        client.prepare_login("9876543210")
+        check("sending-otp stuck: raises", False, "no exception")
+    except MeeshoBotUnknownScreen as exc:
+        check("sending-otp stuck: raises", True)
+        check("sending-otp stuck: error names the stuck screen",
+              "Sending your OTP" in str(exc), str(exc))
+        check("sending-otp stuck: screen text attached",
+              "Sending your OTP" in exc.screen_text, exc.screen_text)
+        check("sending-otp stuck: says the number WAS submitted",
+              "WAS submitted" in str(exc), str(exc))
+
+
+def scenario_setup_interstitial():
+    """'Setting things up\u2026' between a reroll tap and the offer is waited out."""
+    client, bot = build_client(referral_script="absent", setup_interstitial=True)
+    res = client.prepare_login("9876543210")
+    check("setup interstitial: flow reaches OTP screen", res["stage"] == "otp_sent", res)
+    check("setup interstitial: offer rerolled to target",
+          res["rerolls"] == 1 and res["upi"] == 45.0, res)
+
+
 def scenario_screen_parsing():
     s = REFERRAL_SET
     check("screenshot screen classified as referral", s.classify() == S_REFERRAL, s.classify())
@@ -641,7 +833,13 @@ def scenario_screen_parsing():
 
 def main():
     print("=== PRIMES referral-flow replay ===\n")
+    scenario_reroll_button_parsing()
     scenario_screen_parsing()
+    scenario_try_again_variant()
+    scenario_try_again_variant_first()
+    scenario_setup_interstitial()
+    scenario_sending_otp_transient()
+    scenario_sending_otp_stuck()
     scenario_with_link()
     scenario_two_screens_like_screenshot()
     scenario_acknowledgement_screen()

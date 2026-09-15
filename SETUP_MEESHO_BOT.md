@@ -20,8 +20,15 @@ When disabled or not configured, the tool behaves exactly as before (manual
    or the OTP code typed into it
 3. **Normal** login mode
 4. Reads the offer's `UPI · ₹` price and taps **Try Another Offer** until
-   UPI ≤ `target_upi_price` (default ₹47; configurable), before any number is spent
-5. Sends the found (unregistered) 10-digit number → the bot triggers the OTP
+   UPI ≤ `target_upi_price` (default ₹47; configurable), before any number is spent.
+   Some bot revisions show a three-button **Try Again** variant in place of the
+   offer instead of an offer with a price — it is tapped exactly the same way
+   (and also whenever it appears while waiting for an offer). The transient
+   "Setting things up…" screen the bot shows between a tap and the offer is
+   simply waited out
+5. Sends the found (unregistered) 10-digit number → the bot briefly shows
+   "⏳ Sending your OTP…" before the "OTP on its way" screen; that transient
+   is waited out, so it never cancels the number
 6. Polls the OTP provider (tempora/vsimpro) exactly as before
 7. Sends the OTP to the bot; on **Account linked** records User ID / account #,
    sends a 🎉 Telegram notification, and finishes the provider activation
