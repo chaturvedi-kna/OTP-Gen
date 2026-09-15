@@ -13,6 +13,7 @@ import os
 import sys
 import threading
 import time
+import traceback
 from datetime import datetime, timezone
 
 # Ensure UTF-8 output when possible on Windows consoles
@@ -47,6 +48,7 @@ from meesho_bot_client import (
     MeeshoBotClient,
     MeeshoBotError,
     MeeshoBotReferralError,
+    MeeshoBotTimeout,
     MeeshoBotUnknownScreen,
 )
 from notifier import Notifier
@@ -768,6 +770,30 @@ class ParallelAutomationCoordinator:
             self.handle_cancellation(context.client, context.activation_id, number,
                                      "PRIMES bot unexpected screen", expect_refund=True)
             return None
+        except MeeshoBotTimeout as exc:
+            # The Telegram side stopped responding mid-flow (hang watchdog /
+            # hard cap): the number may or may not have been submitted,
+            # depending on where it hung - the refund tally will flag it if
+            # the SMS had already gone out. Never crash the automation.
+            log(f"PRIMES bot flow timed out: {exc}", prefix=pname)
+            self.notify.alert(
+                f"⏱️ [{pname}] PRIMES bot flow timed out",
+                f"Number: {number}\n{exc}\n\n"
+                "Cancelling this number and resetting the bot flow. If the "
+                "number had already reached Meesho (SMS delivered), the refund "
+                "tally will flag it.\n"
+                f"Referral step: {self.bot.referral_summary}"
+            )
+            try:
+                self.bot.cancel_flow()
+            except Exception as exc2:
+                log(f"Reset of the bot flow failed ({exc2}); a manual /start may be needed.",
+                    prefix=pname)
+            self.bot_at_number_prompt = False
+            self.bot_change_attempts = 0
+            self.handle_cancellation(context.client, context.activation_id, number,
+                                     "PRIMES bot flow timed out", expect_refund=True)
+            return None
         except MeeshoBotError as exc:
             log(f"PRIMES bot error: {exc}", prefix=pname)
             self.notify.alert(f"⚠️ [{pname}] PRIMES bot error", f"{exc}\nCancelling this number.")
@@ -855,6 +881,17 @@ class ParallelAutomationCoordinator:
                 f"Number: {context.clean_number}\nCode: `{code}`\n\n"
                 f"{exc}\n\nUnexpected screen:\n{exc.screen_text[:600]}\n\n"
                 f"{buttons_line}Submit/verify manually if needed."
+            )
+            return "unknown"
+        except MeeshoBotTimeout as exc:
+            # The bot stopped responding while the code was being submitted /
+            # verified. The code may or may not have reached the bot - check
+            # it manually; the SMS was delivered, so the charge stands.
+            self.notify.alert(
+                f"⏱️ [{pname}] PRIMES bot timed out after OTP",
+                f"Number: {context.clean_number}\nCode: `{code}`\n\n{exc}\n\n"
+                "The code may or may not have reached the bot - check it "
+                "manually while it is still valid. Will change number and retry."
             )
             return "unknown"
         except MeeshoBotError as exc:
@@ -1172,7 +1209,40 @@ class ParallelAutomationCoordinator:
 
                     self.stats.increment("targets_found")
                     log(f"\n>>> PROCESSING TARGET: {target.clean_number} ({target.provider_name.upper()}) <<<\n")
-                    cont = self._process_target(target, use_bot)
+                    try:
+                        cont = self._process_target(target, use_bot)
+                    except Exception as exc:
+                        # Last-resort net: nothing may ever crash the whole
+                        # automation run again (a bare TimeoutError from the
+                        # userbot once did). Report, cancel the activation
+                        # with a refund tally, reset the bot, keep going.
+                        pname = target.provider_name.upper()
+                        log(f"Unexpected error while processing {target.clean_number}: {exc}",
+                            prefix=pname)
+                        log(traceback.format_exc(), prefix=pname)
+                        self.notify.alert(
+                            f"🛑 [{pname}] Unexpected error - target skipped",
+                            f"Number: {target.clean_number}\nError: {exc}\n\n"
+                            "The activation is cancelled and the refund tally checked; "
+                            "the search continues with the next number."
+                        )
+                        if use_bot:
+                            try:
+                                self.bot.cancel_flow()
+                            except Exception:
+                                pass
+                            self.bot_at_number_prompt = False
+                            self.bot_change_attempts = 0
+                        try:
+                            self.handle_cancellation(
+                                target.client, target.activation_id, target.clean_number,
+                                f"Unexpected error: {exc}", expect_refund=True,
+                            )
+                        except Exception as exc2:
+                            log(f"Cancellation after the unexpected error failed too: {exc2}",
+                                prefix=pname)
+                        self._clear_target()
+                        cont = "continue"
                     if cont == "stop":
                         break
 

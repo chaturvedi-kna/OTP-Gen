@@ -19,10 +19,18 @@ Flow automated (from the recorded screens + screenshot):
          -> send 10-digit number -> brief "⏳ Sending your OTP…" screen ->
             "OTP on its way" screen
          -> (coordinator polls the OTP provider) -> send OTP code
-         -> "Account linked!" (parse User ID / account #)
+         -> brief "🔎 Verifying your code…" screen -> "Account linked!"
+            (parse User ID / account #)
 Recovery:
   OTP missing/wrong/expired/blocked -> [Change Number] -> send the next number
   (the bot keeps the current offer screen), instead of redoing the whole menu.
+
+Timeouts: every step (screen poll, tap, settle) has its own budget
+(step_timeout_seconds), and _run() additionally aborts a whole flow with a
+MeeshoBotTimeout when it stops making progress for flow_timeout_seconds
+(default auto) - a hung Telegram call. Flows that keep making progress (e.g.
+long offer-reroll sessions) are never killed by a blanket wall-clock cap
+anymore; the aborted coroutine is cancelled on its loop so no task leaks.
 
 One-time setup: run `python login_userbot.py` to create the StringSession file.
 
@@ -67,6 +75,18 @@ class MeeshoBotReferralError(MeeshoBotUnknownScreen):
     """
 
 
+class MeeshoBotTimeout(MeeshoBotError):
+    """
+    A bot flow was aborted because the Telegram side stopped responding.
+
+    Raised by _run() when a coroutine exceeds a hard deadline (stop()/diagnostics)
+    or stops making progress for flow_timeout_seconds (a hung Telethon call).
+    This is a MeeshoBotError, so the coordinator's existing handlers turn it
+    into an alert + number cancellation instead of an unhandled crash, and the
+    aborted coroutine is cancelled on its loop so no task is left pending.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Screen model / parsing (pure - no Telethon dependency, fully unit-testable)
 # ---------------------------------------------------------------------------
@@ -106,6 +126,10 @@ S_OTP_WAIT = "otp_wait"
 # The brief "⏳ Sending your OTP…" screen the bot shows between the number
 # being sent and the "OTP on its way" screen: transient, keep waiting.
 S_SENDING_OTP = "otp_sending"
+# The brief "🔎 Verifying your code…" screen the bot shows right after the OTP
+# code is submitted, before "Account linked!" (or a wrong-code error) appears:
+# transient, keep waiting - never report it as the flow's outcome.
+S_VERIFYING = "verifying"
 S_LINKED = "linked"
 S_WRONG_OTP = "wrong_otp"
 S_EXPIRED = "otp_expired"
@@ -378,6 +402,15 @@ class Screen:
         # mentions both still wins as the real OTP prompt.
         if "sending your otp" in t or "sending otp" in t:
             return S_SENDING_OTP
+        # Transient: shown right after the OTP code is submitted, before the
+        # "Account linked!" (or code-error) screen appears. Matched on the
+        # "-ing" form together with a code/otp word, so failure copy
+        # ("verification failed", "could not verify your code") never lands
+        # here - it falls through to the error screens below.
+        if ("verifying" in t and ("code" in t or "otp" in t)) or (
+            t.startswith("checking your code") or t.startswith("confirming your code")
+        ):
+            return S_VERIFYING
         # Menu / login-mode / offer screens claim priority over the referral
         # check: only the dedicated promotion screen may classify as referral.
         if self.has_button("try another offer") or (
@@ -430,6 +463,14 @@ class MeeshoBotClient:
         self.max_change_number = int(conf.get("max_change_number", 5))
         self.step_timeout = float(conf.get("step_timeout_seconds", 60))
         self.poll_interval = float(conf.get("poll_interval_seconds", 1.2))
+        # Hang watchdog for a whole bot flow. A flow is aborted only when it
+        # stops making progress for this long (a single Telethon request may
+        # legitimately be slow, but every screen poll / tap / settle step that
+        # completes resets the clock). 0 = auto: max(180, 4 x step_timeout).
+        # Without this, a full prepare_login with many offer rerolls could
+        # legitimately run for many minutes - the old blanket cap of
+        # step_timeout + 30 killed healthy flows mid-reroll.
+        self.flow_timeout_seconds = float(conf.get("flow_timeout_seconds", 0) or 0)
         delays = conf.get("human_delay_seconds", [1.0, 2.5])
         try:
             self.delay_min = float(delays[0])
@@ -464,6 +505,13 @@ class MeeshoBotClient:
         self._thread = None
         self._bot_entity = None
         self._start_error = None
+
+        # Cross-thread bookkeeping for _run's hang watchdog: the loop thread
+        # bumps _last_progress whenever a step completes, and records what the
+        # in-flight flow was doing in _step_note so a timeout alert can say
+        # whether e.g. the number/code had already been sent.
+        self._last_progress = time.time()
+        self._step_note = ""
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -514,6 +562,31 @@ class MeeshoBotClient:
                 return f.read().strip()
         except Exception:
             return ""
+
+    # -- hang watchdog --------------------------------------------------------
+
+    @property
+    def stall_timeout(self):
+        """Seconds without any bot-screen progress before a flow is aborted."""
+        if self.flow_timeout_seconds > 0:
+            return self.flow_timeout_seconds
+        # Generous on purpose: this must never fire on a healthy (if slow)
+        # flow - the flow's own per-step budgets bound those. It exists to
+        # catch a truly hung Telegram call (no poll, tap or settle finishing).
+        return max(180.0, 4.0 * self.step_timeout)
+
+    def _progress(self):
+        """
+        Heartbeat from the loop thread: any completed step (screen fetch,
+        poll, tap, message send) keeps the running flow alive. Called from
+        coordinator threads it (re)arms the watchdog for a new _run() call.
+        """
+        self._last_progress = time.time()
+
+    def _note(self, what):
+        """Record what the in-flight flow is doing, for timeout alerts."""
+        self._step_note = what
+
 
     def _human_delay(self):
         if self.delay_max <= 0:
@@ -587,6 +660,15 @@ class MeeshoBotClient:
                 await self._client.disconnect()
             except Exception:
                 pass
+            # Abort any step still in flight (e.g. one that hit the watchdog)
+            # so no task is left pending when the loop stops ("Task was
+            # destroyed but it is pending!").
+            pending = [t for t in asyncio.all_tasks()
+                       if t is not asyncio.current_task()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
 
         try:
             self._run(_disconnect(), timeout=10)
@@ -596,21 +678,105 @@ class MeeshoBotClient:
             self._loop.call_soon_threadsafe(self._loop.stop)
         except Exception:
             pass
+        # Mark the client stopped: .ready turns False and a later start()
+        # builds a fresh loop/thread/session instead of reusing a closed loop.
+        self._client = None
 
     def _run_loop(self):
         asyncio.set_event_loop(self._loop)
-        self._loop.run_forever()
+        try:
+            self._loop.run_forever()
+        finally:
+            # Close the loop in its own thread once it stops: an unclosed
+            # loop raises "Invalid file descriptor" noise from __del__ when
+            # the process (or a test run) tears down.
+            try:
+                self._loop.close()
+            except Exception:
+                pass
 
     def _run(self, coro, timeout=None):
+        """
+        Run `coro` on the userbot loop from a coordinator thread and wait.
+
+        `timeout` is an optional hard wall-clock cap (used by stop() and the
+        diagnostics). Without one there is NO total cap: a full
+        prepare_login with up to max_offer_rerolls rerolls legitimately takes
+        longer than one step, so the old blanket cap of step_timeout + 30
+        aborted healthy flows mid-reroll with a bare TimeoutError that crashed
+        the whole automation. Instead, a watchdog aborts the call when the
+        coroutine stops making progress for stall_timeout seconds (a hung
+        Telethon call / dead connection) - every completed poll, tap or
+        settle resets that clock.
+
+        On abort the coroutine is cancelled on its loop (so it cannot leak as
+        a pending task) and a MeeshoBotTimeout is raised - a MeeshoBotError,
+        which the coordinator handles like any other bot failure.
+        """
         if self._loop is None:
             raise MeeshoBotError("userbot event loop not started")
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return future.result(timeout=timeout or self.step_timeout + 30)
+        self._progress()
+        deadline = (time.time() + timeout) if timeout else None
+        stall = self.stall_timeout
+        # Poll in short slices so the watchdog is checked between them.
+        slice_wait = max(0.1, min(2.0, stall / 4.0))
+
+        while True:
+            wait = slice_wait
+            if deadline is not None:
+                wait = min(wait, max(0.05, deadline - time.time()))
+            try:
+                return future.result(timeout=wait)
+            except TimeoutError:
+                if future.done():
+                    # The future finished in the race window right at the
+                    # slice boundary: return its value, or - if the coroutine
+                    # itself failed with a timeout (e.g. a Telethon request
+                    # timeout) - surface that as a bot failure, never as a
+                    # bare TimeoutError that crashes the coordinator.
+                    try:
+                        return future.result()
+                    except TimeoutError:
+                        raise MeeshoBotTimeout(
+                            f"PRIMES bot flow "
+                            f"'{(getattr(coro, '__name__', '') or 'bot step').replace('_a_', '', 1)}' "
+                            f"failed with a Telegram timeout"
+                            f"{' (stage: ' + self._step_note + ')' if self._step_note else ''}."
+                        )
+                # else: just the slice elapsing - check the deadlines below.
+
+            now = time.time()
+            hard = deadline is not None and now >= deadline
+            stalled = now - self._last_progress >= stall
+            if not (hard or stalled):
+                continue
+
+            op = (getattr(coro, "__name__", "") or "bot step").replace("_a_", "", 1)
+            note = f" (stage: {self._step_note})" if self._step_note else ""
+            reason = (
+                f"hard {timeout:.0f}s limit reached" if hard
+                else f"no screen/tap progress for {now - self._last_progress:.0f}s "
+                     f"(watchdog {stall:.0f}s)"
+            )
+            message = (f"PRIMES bot flow '{op}' aborted: {reason}{note}. The "
+                       f"Telegram side stopped responding mid-flow, so the "
+                       f"number/code state is unknown - check the bot manually.")
+            if future.cancel():
+                # run_coroutine_threadsafe chains this cancel onto the asyncio
+                # task, so the coroutine unwinds on its loop instead of
+                # lingering as a pending task until the loop is torn down.
+                raise MeeshoBotTimeout(message)
+            # It finished inside the race window right at the deadline: its
+            # real result (or error, e.g. an unknown screen with its text and
+            # buttons) is more informative than the timeout.
+            return future.result(timeout=1.0)
 
     # -- low-level Telethon helpers ----------------------------------------
 
     async def _latest_screen(self, limit=6):
         messages = await self._client.get_messages(self._bot_entity, limit=limit)
+        self._progress()
         for message in messages:
             if getattr(message, "text", None):
                 return Screen.from_telethon(message)
@@ -619,6 +785,7 @@ class MeeshoBotClient:
     async def _signatures(self, limit=6):
         signatures = set()
         messages = await self._client.get_messages(self._bot_entity, limit=limit)
+        self._progress()
         for m in messages:
             signatures.add((m.id, str(getattr(m, "edit_date", None)), (m.text or "")[:32]))
         return signatures
@@ -636,7 +803,9 @@ class MeeshoBotClient:
             try:
                 messages = await self._client.get_messages(self._bot_entity, limit=4)
             except Exception:
+                self._progress()
                 continue
+            self._progress()
             for m in messages:
                 text = getattr(m, "text", None)
                 if not text:
@@ -674,12 +843,14 @@ class MeeshoBotClient:
 
         before = await self._signatures()
         await target_msg.click(i=row, j=col)
+        self._progress()
         self._human_delay()
         return await self._wait_new_screen(before)
 
     async def _send_text(self, text, timeout=None):
         before = await self._signatures()
         await self._client.send_message(self._bot_entity, str(text))
+        self._progress()
         self._human_delay()
         return await self._wait_new_screen(before, timeout=timeout)
 
@@ -847,6 +1018,7 @@ class MeeshoBotClient:
         deadline = time.time() + timeout
         current = screen
         while True:
+            self._progress()
             if current.classify() == S_REFERRAL:
                 if current.referral_acknowledged:
                     # Confirmation, not a question: dismiss it if it has its own
@@ -876,6 +1048,8 @@ class MeeshoBotClient:
         """
         rerolls = 0
         result = {"rerolls": 0, "upi": None}
+        self._note("starting the login flow" if not continue_from_prompt
+                   else "resuming at the number prompt")
 
         # Referral budget is per login: one link paste, plus a couple of
         # interruptions, then the bot's own skip option is used.
@@ -954,6 +1128,9 @@ class MeeshoBotClient:
         # also tapped inside _settle_offer (bounded by the reroll budget).
         screen = await self._settle_offer(screen, self.max_offer_rerolls)
         while True:
+            self._progress()
+            self._note(f"rolling offers for a UPI price ≤ ₹{self.target_upi_price} "
+                       f"({rerolls}/{self.max_offer_rerolls} rerolls used)")
             state = screen.classify()
             if state in (S_BLOCKED, S_LINKED, S_OTP_WAIT, S_WRONG_OTP, S_EXPIRED):
                 break
@@ -1001,7 +1178,9 @@ class MeeshoBotClient:
         # Number recovery path already works this way).
         self._log(f"[MEESHO-BOT] Offer accepted at UPI ₹{result['upi']} "
                   f"({rerolls} reroll(s)); sending number {number}.")
+        self._note(f"sending number {number} to the bot")
         screen = await self._send_text(str(number))
+        self._note(f"number {number} was sent; waiting for the 'OTP on its way' screen")
         screen = await self._settle(
             screen, (S_OTP_WAIT, S_BLOCKED, S_LINKED, S_WRONG_OTP, S_EXPIRED),
         )
@@ -1075,6 +1254,7 @@ class MeeshoBotClient:
         # (observed: it reposts the prompt). Answer it, but never type the code
         # into a referral field - if the bot is no longer waiting for the code,
         # that has to be reported, not papered over.
+        self._note(f"checking the bot screen before submitting code {code}")
         screen = await self._latest_screen()
         if screen.classify() == S_REFERRAL and not screen.referral_acknowledged:
             self._log("[MEESHO-BOT] Referral screen on screen before code submission; "
@@ -1097,8 +1277,38 @@ class MeeshoBotClient:
                     screen.text, screen.button_labels,
                 )
 
+        self._note(f"submitting code {code} to the bot")
         screen = await self._send_text(str(code))
+        self._note(f"code {code} was sent; waiting for the verification outcome")
+
+        # The bot first shows a transient "🔎 Verifying your code…" screen (or
+        # an edit of the prompt) before the real outcome appears: settle
+        # through it to the linked / wrong / expired / blocked screen instead
+        # of reporting the transient itself as an unknown result.
+        try:
+            screen = await self._settle(
+                screen,
+                (S_LINKED, S_WRONG_OTP, S_EXPIRED, S_BLOCKED, S_OTP_WAIT,
+                 S_OFFER, S_MENU),
+            )
+        except MeeshoBotReferralError as exc:
+            # The referral step interrupted the verification AFTER the code
+            # was already sent: the outcome is unknown, and the alert must say
+            # the code WAS submitted (the pre-send wording would be wrong).
+            raise MeeshoBotReferralError(
+                f"The referral step interrupted the code verification ({exc}); "
+                f"code {code} WAS submitted - check the bot for the outcome",
+                exc.screen_text, exc.buttons,
+            ) from exc
+
         state = screen.classify()
+        if state == S_VERIFYING:
+            raise MeeshoBotUnknownScreen(
+                "Bot is stuck on 'Verifying your code…' - the linked/error "
+                "screen never appeared. The code WAS submitted, so the login "
+                "may still complete; check the bot manually.",
+                screen.text, screen.button_labels,
+            )
         result = {"status": state, "screen": screen.text}
         if state == S_LINKED:
             result.update({
@@ -1115,6 +1325,7 @@ class MeeshoBotClient:
         replacement number, returning once the bot shows OTP-on-its-way again.
         Without a number, returns once the number-prompt/offer screen is shown.
         """
+        self._note("tapping Change Number")
         screen = await self._latest_screen()
         state = screen.classify()
 
@@ -1139,7 +1350,10 @@ class MeeshoBotClient:
         if new_number is None:
             return {"stage": "prompt", "screen": screen.text, "upi": screen.upi_price}
 
+        self._note(f"sending replacement number {new_number} to the bot")
         screen = await self._send_text(str(new_number))
+        self._note(f"replacement number {new_number} was sent; waiting for the "
+                   f"'OTP on its way' screen")
         # A re-offered referral prompt here must never swallow the replacement
         # number: answer it and wait for the OTP-wait screen instead (the
         # "⏳ Sending your OTP…" transient settles through as well).

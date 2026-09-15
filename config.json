@@ -76,6 +76,7 @@
     "max_offer_rerolls": 30,
     "max_change_number": 5,
     "step_timeout_seconds": 60,
+    "flow_timeout_seconds": 0,
     "poll_interval_seconds": 1.2,
     "human_delay_seconds": [1.0, 2.5]
   },

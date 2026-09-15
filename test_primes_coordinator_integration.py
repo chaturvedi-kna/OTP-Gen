@@ -64,6 +64,7 @@ import main as m  # noqa: E402
 from meesho_bot_client import (  # noqa: E402
     MeeshoBotClient,
     MeeshoBotReferralError,
+    MeeshoBotTimeout,
     MeeshoBotUnknownScreen,
 )
 
@@ -290,6 +291,62 @@ def test_referral_failure_stops_and_refunds():
           coordinator.bot.calls)
 
 
+def test_flow_timeout_cancels_and_continues():
+    """
+    A hung PRIMES flow (MeeshoBotTimeout) must never crash the automation:
+    alert, cancel the number with the refund expected, reset the bot flow,
+    and keep running.
+    """
+    coordinator, sent, cancellations = build_coordinator()
+    error = MeeshoBotTimeout(
+        "PRIMES bot flow 'prepare_login' aborted: no screen/tap progress for "
+        "240s (watchdog 240s) (stage: rolling offers for a UPI price ≤ ₹47 "
+        "(3/40 rerolls used)). The Telegram side stopped responding mid-flow."
+    )
+    coordinator.bot = FakeUserbot(error=error)
+    context = FakeNumberContext()
+    res = coordinator._bot_send_number(context, from_prompt=False)
+
+    check("timeout: returns None so the worker moves on", res is None, res)
+    title, message = sent[-1]
+    check("timeout: alert says the flow timed out", "timed out" in title.lower(), title)
+    check("timeout: alert includes the hung stage",
+          "rolling offers" in message, message)
+    check("timeout: automation NOT stopped", not coordinator.stop_requested.is_set())
+    check("timeout: number cancelled with refund expected",
+          cancellations and cancellations[-1][1] is True, cancellations)
+    check("timeout: bot flow reset", ("cancel_flow",) in coordinator.bot.calls,
+          coordinator.bot.calls)
+    check("timeout: number-prompt flag cleared",
+          coordinator.bot_at_number_prompt is False)
+
+
+def test_code_timeout_reports_code_state():
+    """
+    A timeout while the OTP is being submitted/verified must surface as
+    'unknown' (recovery follows, charge stands) with an alert that says the
+    code may already have reached the bot.
+    """
+    coordinator, sent, cancellations = build_coordinator()
+    error = MeeshoBotTimeout(
+        "PRIMES bot flow 'submit_otp' aborted: no screen/tap progress for "
+        "240s (watchdog 240s) (stage: code 111111 sent; waiting for the "
+        "verification outcome). The Telegram side stopped responding mid-flow."
+    )
+    coordinator.bot = FakeUserbot(error=error)
+    context = FakeNumberContext()
+    status = coordinator._bot_submit_code(context, "111111", "111111 is your code")
+
+    check("code timeout: reported as unknown", status == "unknown", status)
+    title, message = sent[-1]
+    check("code timeout: alert says timed out after OTP",
+          "timed out" in title.lower() and "otp" in title.lower(), title)
+    check("code timeout: alert says the code may have reached the bot",
+          "may or may not have reached" in message, message)
+    check("code timeout: alert includes the code", "`111111`" in message, message)
+    check("code timeout: automation NOT stopped", not coordinator.stop_requested.is_set())
+
+
 def test_referral_screen_absent_continues():
     """
     Point 1: when the bot does not show the referral screen, the flow proceeds
@@ -389,6 +446,8 @@ def main():
     test_referral_command_sets_and_clears_link()
     test_telegram_referral_command_wiring()
     test_unexpected_screen_alert_and_refund()
+    test_flow_timeout_cancels_and_continues()
+    test_code_timeout_reports_code_state()
     test_code_not_submitted_after_referral_interrupt()
     test_startup_logs_referral_config()
     print()

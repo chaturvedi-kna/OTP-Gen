@@ -12,16 +12,21 @@ navigation, referral handling and OTP submission paths are exercised end to end.
 
 import asyncio
 import sys
+import threading
 import time
 
 from meesho_bot_client import (
     MeeshoBotClient,
+    MeeshoBotError,
     MeeshoBotReferralError,
+    MeeshoBotTimeout,
     MeeshoBotUnknownScreen,
     Screen,
     S_MENU,
     S_REFERRAL,
     S_SENDING_OTP,
+    S_VERIFYING,
+    S_WRONG_OTP,
 )
 
 
@@ -108,9 +113,12 @@ OFFER_RETRY = Screen(
 # Transient screens the bot shows while working:
 #   "Setting things up..." - after a tap (Normal / Try Another Offer /
 #   Try Again), before the offer appears;
-#   "Sending your OTP..." - after the number is sent, before OTP on its way.
+#   "Sending your OTP..." - after the number is sent, before OTP on its way;
+#   "Verifying your code..." - after the code is sent, before the linked
+#   screen (or a wrong-code error) appears.
 SETTING_UP = Screen("⚙️ Setting things up...\n\nFinding the best offer for you.")
 SENDING_OTP = Screen("⏳ Sending your OTP…")
+VERIFYING = Screen("🔎 Verifying your code...")
 
 OTP_WAIT = Screen(
     "✅ OTP on its way!\n\nWe've sent a code to 9xxxxxxxxx. Type it here when it arrives.",
@@ -164,7 +172,8 @@ class FakeBot:
     def __init__(self, referral_link="", referral_script="save",
                  offer_prices=(60, 45), referral_reask=False,
                  retry_after=None, variant_first=False,
-                 otp_transition="instant", setup_interstitial=False):
+                 otp_transition="instant", setup_interstitial=False,
+                 code_transition="instant"):
         self.tapped = []
         self.taps = self.tapped  # alias used by FakeMessage
         self.messages = []
@@ -188,6 +197,11 @@ class FakeBot:
         # (transient "Sending your OTP…" first) or "stuck" (transient forever).
         self.otp_transition = otp_transition
         self._pending_otp = 0  # get_messages polls that still show the transient
+        # code_transition: "instant" (code -> directly to the outcome),
+        # "verifying" (transient "🔎 Verifying your code…" first, seen for a
+        # couple of polls) or "stuck_verify" (transient forever).
+        self.code_transition = code_transition
+        self._pending_linked = 0  # polls that still show the verifying transient
         self._pending_offer = None  # "setup" = show the offer on the next poll
         self.setup_interstitial = setup_interstitial
         self._push(MAIN_MENU)
@@ -320,6 +334,19 @@ class FakeBot:
         if stripped.isdigit() and len(stripped) <= 6:
             self.sent_codes.append(stripped)
             if stripped == "111111":
+                if self.code_transition == "verifying":
+                    # A couple of polls see the transient, the next shows
+                    # "Account linked!" - the flow must settle through it.
+                    self.state = "verifying"
+                    self._edit_last(VERIFYING)
+                    self._pending_linked = 2
+                    return
+                if self.code_transition == "stuck_verify":
+                    # Stays on the transient forever: the flow must fail with
+                    # a clear "stuck on 'Verifying your code…'" error.
+                    self.state = "verifying"
+                    self._edit_last(VERIFYING)
+                    return
                 self.state = "linked"
                 self._push(LINKED)
             else:
@@ -342,6 +369,11 @@ class FakeTelegramClient:
             if b._pending_otp == 0:
                 b.state = "otp_wait"
                 b._edit_last(OTP_WAIT)
+        if getattr(b, "_pending_linked", 0) > 0:
+            b._pending_linked -= 1
+            if b._pending_linked == 0:
+                b.state = "linked"
+                b._edit_last(LINKED)
         if getattr(b, "_pending_offer", None) == "setup":
             b._pending_offer = None
             b._edit_last(b._offer_screen())
@@ -355,7 +387,7 @@ class FakeTelegramClient:
 def build_client(referral_link="", referral_script="save",
                  referral_failure_action="stop", retry_after=None,
                  variant_first=False, otp_transition="instant",
-                 setup_interstitial=False, **kwargs):
+                 setup_interstitial=False, code_transition="instant", **kwargs):
     config = {
         "meesho_bot": {
             "enabled": True,
@@ -376,7 +408,8 @@ def build_client(referral_link="", referral_script="save",
     bot = FakeBot(referral_link=referral_link, referral_script=referral_script,
                   retry_after=retry_after, variant_first=variant_first,
                   otp_transition=otp_transition,
-                  setup_interstitial=setup_interstitial)
+                  setup_interstitial=setup_interstitial,
+                  code_transition=code_transition)
     client = MeeshoBotClient(config, log_fn=lambda *_: None)
     client._client = FakeTelegramClient(bot)
     client._bot_entity = "@primesbot"
@@ -746,6 +779,15 @@ def scenario_reroll_button_parsing():
           SENDING_OTP.classify() == S_SENDING_OTP, SENDING_OTP.classify())
     check("transient: 'Setting things up\u2026' stays unknown",
           SETTING_UP.classify() == "unknown", SETTING_UP.classify())
+    check("transient: 'Verifying your code\u2026' has its own state",
+          VERIFYING.classify() == S_VERIFYING, VERIFYING.classify())
+    check("transient: 'Verifying your OTP' also matches",
+          Screen("Please wait, verifying your OTP\u2026").classify() == S_VERIFYING,
+          Screen("Please wait, verifying your OTP\u2026").classify())
+    check("transient: verification failure copy is NOT the verifying transient",
+          Screen("\u274c Verification failed. Wrong code, please try again.").classify()
+          == S_WRONG_OTP,
+          Screen("\u274c Verification failed. Wrong code, please try again.").classify())
 
 
 def scenario_try_again_variant():
@@ -818,6 +860,117 @@ def scenario_setup_interstitial():
           res["rerolls"] == 1 and res["upi"] == 45.0, res)
 
 
+def scenario_verifying_transient():
+    """
+    '🔎 Verifying your code...' shown after the code is submitted (before
+    'Account linked!') must be settled through - reporting it as an unknown
+    result made the coordinator throw away successful logins.
+    """
+    client, bot = build_client(referral_script="absent", code_transition="verifying")
+    client.prepare_login("9876543210")
+    res = client.submit_otp("111111")
+    check("verifying transient: reported as linked, not unknown",
+          res["status"] == "linked", res)
+    check("verifying transient: user id parsed", res.get("user_id") == "123456789", res)
+    check("verifying transient: account number parsed",
+          res.get("account_number") == "4242", res)
+    check("verifying transient: code sent exactly once",
+          bot.sent_codes == ["111111"], bot.sent_codes)
+
+
+def scenario_verifying_wrong_code_after_transient():
+    """The transient must not swallow a wrong-code outcome either."""
+    client, bot = build_client(referral_script="absent")
+    client.prepare_login("9876543210")
+    res = client.submit_otp("222222")
+    check("verifying (wrong code): status is wrong_otp, not unknown",
+          res["status"] == "wrong_otp", res)
+
+
+def scenario_verifying_stuck():
+    """
+    A bot that never leaves 'Verifying your code\u2026' must fail loudly, stating
+    that the code WAS submitted (so it can be checked/salvaged manually).
+    """
+    client, bot = build_client(referral_script="absent", code_transition="stuck_verify",
+                               step_timeout_seconds=1)
+    client.prepare_login("9876543210")
+    try:
+        client.submit_otp("111111")
+        check("verifying stuck: raises", False, "no exception")
+    except MeeshoBotUnknownScreen as exc:
+        check("verifying stuck: raises", True)
+        check("verifying stuck: error names the stuck screen",
+              "Verifying your code" in str(exc), str(exc))
+        check("verifying stuck: says the code WAS submitted",
+              "WAS submitted" in str(exc), str(exc))
+        check("verifying stuck: screen text attached",
+              "Verifying your code" in exc.screen_text, exc.screen_text)
+
+
+def scenario_flow_watchdog():
+    """
+    A flow whose Telegram calls hang forever must abort with MeeshoBotTimeout
+    (a MeeshoBotError, so the coordinator handles it) instead of blocking the
+    coordinator thread forever or crashing it with a bare TimeoutError. The
+    aborted coroutine is cancelled - no leaked pending task - and the loop
+    stays usable for the next flow.
+    """
+    config = {
+        "meesho_bot": {
+            "enabled": True,
+            "api_id": 1,
+            "api_hash": "x",
+            "session_file": "userbot.session.txt",
+            "bot_username": "@primesbot",
+            "target_upi_price": 47,
+            "max_offer_rerolls": 5,
+            "step_timeout_seconds": 5,
+            "poll_interval_seconds": 0.01,
+            "human_delay_seconds": [0, 0],
+            "flow_timeout_seconds": 1.0,
+        }
+    }
+    client = MeeshoBotClient(config, log_fn=lambda *_: None)
+
+    class HangingClient:
+        # Every screen fetch hangs: the flow can never make progress.
+        async def get_messages(self, entity, limit=6):
+            await asyncio.sleep(30)
+
+    client._client = HangingClient()
+    client._bot_entity = "@primesbot"
+    client._loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=client._run_loop, daemon=True)
+    thread.start()
+
+    started = time.time()
+    try:
+        try:
+            client.prepare_login("9876543210")
+            check("watchdog: raises MeeshoBotTimeout", False, "no exception")
+        except MeeshoBotTimeout as exc:
+            elapsed = time.time() - started
+            check("watchdog: raises MeeshoBotTimeout", True)
+            check("watchdog: aborts near the no-progress budget (not step_timeout+30)",
+                  elapsed < 8, f"{elapsed:.1f}s")
+            check("watchdog: message names the aborted flow",
+                  "prepare_login" in str(exc), str(exc))
+            check("watchdog: it is a MeeshoBotError the coordinator already handles",
+                  isinstance(exc, MeeshoBotError), type(exc).__name__)
+        # The loop must still be alive and usable: a second flow starts (and
+        # aborts) fine instead of deadlocking after the first cancellation.
+        try:
+            client.prepare_login("9876543211")
+            check("watchdog: loop still usable after an abort", False, "no exception")
+        except MeeshoBotTimeout:
+            check("watchdog: loop still usable after an abort", True)
+        check("watchdog: loop thread alive", thread.is_alive())
+    finally:
+        client.stop()
+        thread.join(timeout=5)
+
+
 def scenario_screen_parsing():
     s = REFERRAL_SET
     check("screenshot screen classified as referral", s.classify() == S_REFERRAL, s.classify())
@@ -838,6 +991,10 @@ def main():
     scenario_try_again_variant()
     scenario_try_again_variant_first()
     scenario_setup_interstitial()
+    scenario_verifying_transient()
+    scenario_verifying_wrong_code_after_transient()
+    scenario_verifying_stuck()
+    scenario_flow_watchdog()
     scenario_sending_otp_transient()
     scenario_sending_otp_stuck()
     scenario_with_link()

@@ -150,12 +150,20 @@ auto mode) instead of being lost.
      "max_offer_rerolls": 30,
      "max_change_number": 5,
      "step_timeout_seconds": 60,
+     "flow_timeout_seconds": 0,
      "human_delay_seconds": [1.0, 2.5]
    }
    ```
 
    **The bot's @username is required** — it is not visible in the screenshots.
    `human_delay_seconds` randomizes pauses between taps for human-like timing.
+   `step_timeout_seconds` is the per-step budget (one screen wait/settle);
+   `flow_timeout_seconds` is the hang watchdog for a whole flow: a flow is
+   aborted only when **no step finishes** for that long (a hung Telegram call).
+   `0` (default) = auto: `max(180, 4 × step_timeout)`. Long offer-reroll
+   sessions are never killed — every completed poll/tap resets the clock — and
+   a timeout aborts the flow with a clear alert (stating whether the
+   number/code had already been sent) instead of crashing the automation.
    `referral_link` may be left empty, but then the automation stops and reports
    if the bot asks for a referral link (`referral_failure_action: "stop"`, the
    default). Set it from Telegram with `/referral <link>` while the tool runs —
@@ -177,9 +185,11 @@ auto mode) instead of being lost.
 | Referral prompt with no link configured | `"stop"`: 🛑 stop, report, cancel the number + verify the refund. `"skip"`: tap the skip option and continue |
 | Referral screen never appears | nothing to do — the login continues normally (verified for the Change Number path too) |
 | Wrong / incorrect OTP | count `otp_wrong`, Change Number, verify refund, continue |
+| "🔎 Verifying your code…" after the code | transient — waited out until "Account linked!" / the error screen; stuck > `step_timeout_seconds` → alert stating the **code WAS submitted** |
 | OTP expired | count `otp_expired`, Change Number, continue |
 | Number blocked / banned / already registered | count `user_blocked`, cancel/reset, continue |
 | Unknown/unexpected screen | alert with the screen text **and the buttons**, cancel the number (refund verified — nothing was submitted), reset flow |
+| Telegram side hangs (no screen/tap progress for `flow_timeout_seconds`) | ⏱️ `MeeshoBotTimeout` — alert (with the stage it hung at), cancel the number (refund verified — the tally flags it if the number had already reached the bot), reset flow, **automation continues** |
 | Change Number used > `max_change_number` in a row | reset to main menu (full flow restart) |
 | Change Number recovery | never shows the referral screen; the replacement number is sent only at the number prompt |
 | Refund not credited | 🛑 stop everything + critical alert |
