@@ -751,8 +751,9 @@ class ParallelAutomationCoordinator:
                 f"⚠️ [{pname}] PRIMES bot needs attention",
                 f"Unexpected bot screen while processing {number}:\n\n{exc.screen_text[:600]}\n\n"
                 f"{buttons_line}"
-                "Cancelling this number (number not submitted; refund checked) and "
-                "resetting the bot flow.\n"
+                "Cancelling this number and resetting the bot flow. The refund is "
+                "checked against the balance - if the number had already reached "
+                "the bot (SMS delivered), the tally will flag it.\n"
                 f"Referral step: {self.bot.referral_summary}"
             )
             try:
