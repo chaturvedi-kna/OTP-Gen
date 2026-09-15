@@ -1391,6 +1391,17 @@ class MeeshoBotClient:
 
     # -- synchronous wrappers (called from coordinator threads) -------------
 
+    def screen_state(self):
+        """
+        Classify the bot's CURRENT screen without tapping or typing anything
+        (read-only). Used by the coordinator before it commits to anything
+        destructive - e.g. a late OTP salvaged during a cancellation race is
+        only auto-submitted when the bot is genuinely still waiting for the
+        code, and Change Number is only tapped once the provider cancellation
+        is settled.
+        """
+        return self._run(self._latest_screen()).classify()
+
     def prepare_login(self, number):
         return self._run(self._a_prepare_login(number, continue_from_prompt=False))
 

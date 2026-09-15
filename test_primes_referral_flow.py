@@ -24,6 +24,7 @@ from meesho_bot_client import (
     Screen,
     S_MENU,
     S_REFERRAL,
+    S_OTP_WAIT,
     S_SENDING_OTP,
     S_VERIFYING,
     S_WRONG_OTP,
@@ -446,6 +447,11 @@ def scenario_with_link():
     check("with link: number sent after referral", bot.sent_numbers == ["9876543210"], bot.sent_numbers)
     check("with link: offer rerolled to target", res["rerolls"] == 1 and res["upi"] == 45.0, res)
     check("with link: tap order logged", res["referral_action"] == "pasted referral link", res["referral_action"])
+    check("with link: screen_state() reports the OTP-wait screen (read-only)",
+          client.screen_state() == S_OTP_WAIT, client.screen_state())
+    check("with link: screen_state() sent nothing to the bot",
+          bot.sent_numbers == ["9876543210"] and bot.sent_codes == [],
+          f"numbers={bot.sent_numbers} codes={bot.sent_codes}")
     return client, bot
 
 

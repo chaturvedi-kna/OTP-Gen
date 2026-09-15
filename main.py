@@ -50,6 +50,7 @@ from meesho_bot_client import (
     MeeshoBotReferralError,
     MeeshoBotTimeout,
     MeeshoBotUnknownScreen,
+    S_OTP_WAIT,
 )
 from notifier import Notifier
 
@@ -406,41 +407,65 @@ class ParallelAutomationCoordinator:
                 code = salvaged.get("code")
                 sms = salvaged.get("sms", "")
                 log(f"🚨 OTP arrived during cancellation race! Code: {code}", prefix=pname)
+                # Immediate alert (before anything else touches the PRIMES
+                # bot): the code is in hand while the bot still sits on its
+                # OTP screen, so it can be used automatically - and manually
+                # if the auto-submit fails.
                 self.notify.alert(
-                    f"🚨 [{pname}] OTP arrived during cancellation - act NOW",
+                    f"🚨 [{pname}] OTP arrived during cancellation",
                     f"Number: {number}\nActivation: {activation_id}\nReason: {reason}\n\n"
                     f"Code: `{code}`\nSMS: {sms}\n\n"
-                    "The SMS was delivered, so the provider may deny the refund. "
-                    "Use the code manually now if it is still valid."
+                    "The SMS was delivered, so the charge stands (no refund). "
+                    "The PRIMES bot is still on its OTP screen - the automation "
+                    "will submit this code itself; if that fails, enter it "
+                    "manually while it is still valid."
+                )
+                # The charge legitimately stands: the SMS this number was paid
+                # for was delivered. The current balance becomes the new
+                # baseline - running the refund tally here would always fail
+                # (no refund is owed) and critical-stop the automation for a
+                # charge that is correct.
+                refund_delay = self.settings.get("refund_check_delay_seconds", 2)
+                if refund_delay > 0:
+                    time.sleep(refund_delay)
+                try:
+                    actual_balance = client.get_balance()
+                    self._note_balance(client.name, actual_balance)
+                except Exception:
+                    pass
+                self.stats.increment("numbers_consumed")
+                log(f"Number consumed (late OTP delivered); new balance "
+                    f"baseline: {actual_balance}", prefix=pname)
+                tally_ok = True
+            else:
+                refund_delay = self.settings.get("refund_check_delay_seconds", 2)
+                if refund_delay > 0:
+                    time.sleep(refund_delay)
+
+                tally_ok, actual_balance = self.guard.verify_refund(
+                    client, expected_balance,
+                    activation_id=activation_id, number=number,
+                    stop_event=self.stop_requested, prefix=pname,
                 )
 
-            refund_delay = self.settings.get("refund_check_delay_seconds", 2)
-            if refund_delay > 0:
-                time.sleep(refund_delay)
-
-            tally_ok, actual_balance = self.guard.verify_refund(
-                client, expected_balance,
-                activation_id=activation_id, number=number,
-                stop_event=self.stop_requested, prefix=pname,
-            )
-
-            if expected_balance is not None and tally_ok:
-                self.stats.increment("refunds_verified")
-                self._note_balance(client.name, actual_balance)
-            elif expected_balance is not None and not tally_ok:
-                self.stats.increment("refunds_missing")
-                salvage_note = (
-                    f"\nLate OTP code: `{salvaged.get('code')}`" if salvaged else
-                    "\nNo OTP was seen - check the provider panel for this activation."
-                )
-                self._critical_stop(
-                    f"[{pname}] REFUND DID NOT TALLY",
-                    f"Number: {number}\nActivation: {activation_id}\n"
-                    f"Expected balance: ~{expected_balance:.4f}\nActual balance: {actual_balance}\n"
-                    f"Reason for cancel: {reason}{salvage_note}\n\n"
-                    "No new numbers will be purchased until you verify this activation "
-                    "in the provider dashboard."
-                )
+                if expected_balance is not None and tally_ok:
+                    self.stats.increment("refunds_verified")
+                    self._note_balance(client.name, actual_balance)
+                elif expected_balance is not None and not tally_ok:
+                    self.stats.increment("refunds_missing")
+                    salvage_note = (
+                        f"\nLate OTP code: `{salvaged.get('code')}`" if salvaged else
+                        "\nNo OTP was seen - check the provider panel for this activation."
+                    )
+                    self._critical_stop(
+                        f"[{pname}] REFUND DID NOT TALLY",
+                        f"Number: {number}\nActivation: {activation_id}\n"
+                        f"Expected balance: ~{expected_balance:.4f}\nActual balance: {actual_balance}\n"
+                        f"Reason for cancel: {reason}{salvage_note}\n\n"
+                        "No new numbers will be purchased until you verify this activation "
+                        "in the provider panel. The PRIMES bot was left on its OTP "
+                        "screen - if the OTP shows up, enter it manually."
+                    )
 
         result = {"tally_ok": bool(tally_ok), "salvaged": salvaged, "balance": actual_balance}
 
@@ -1358,12 +1383,91 @@ class ParallelAutomationCoordinator:
 
     def _recover_change_number(self, target, reason, expect_refund=True):
         """
-        OTP missing/rejected recovery: tap Change Number in the PRIMES bot,
-        cancel the provider activation (verifying the refund when the SMS was
-        not delivered), then let workers hunt the next number (which is sent
-        straight to the waiting bot).
+        OTP missing/rejected recovery. The ORDER is safety-critical:
+
+        1. Cancel the provider activation FIRST (with the late-OTP salvage
+           race and the refund tally) while the PRIMES bot is still on its
+           OTP-wait screen - nothing has moved it yet.
+        2. If the cancellation salvages a late OTP (the SMS landed inside the
+           cancel race), it is submitted to the bot immediately - the bot
+           still waits for the code - and the alert with the code has already
+           gone out, so it can also be entered manually if the auto-submit
+           fails. The charge stands either way: the SMS was delivered.
+        3. Only when the cancellation is clean (refund tallied / charge
+           stands, no salvaged OTP, automation not stopping) does the bot tap
+           Change Number and the workers resume hunting.
+
+        The old order tapped Change Number first: when the OTP then arrived
+        during the cancellation race, the screen to enter it was already
+        gone - money spent, no refund, account not added, and even manual
+        entry was impossible.
         """
         pname = target.provider_name.upper()
+
+        # --- 1) cancel the provider activation while the bot is untouched --
+        log(f"Cancelling {target.activation_id} for recovery ({reason}, "
+            f"refund expected: {expect_refund})...", prefix=pname)
+        result = self.handle_cancellation(
+            target.client, target.activation_id, target.clean_number,
+            f"Recovery: {reason}", expect_refund=expect_refund
+        ) or {}
+        salvaged = result.get("salvaged")
+
+        # --- 2) salvaged late OTP: use it while the screen is still there ---
+        if salvaged and salvaged.get("code") and self.bot.ready:
+            code = salvaged.get("code")
+            sms = salvaged.get("sms", "")
+            self.stats.increment("otp_received")
+            try:
+                state = self.bot.screen_state()
+            except Exception as exc:
+                log(f"Could not check the bot screen for the salvaged OTP ({exc}).",
+                    prefix=pname)
+                state = None
+            if state == S_OTP_WAIT:
+                log(f"Salvaged OTP {code} for {target.clean_number}; the bot is "
+                    f"still waiting for the code - submitting it automatically.",
+                    prefix=pname)
+                status = self._bot_submit_code(target, code, sms, late=True)
+                if status == "linked":
+                    if self.settings.get("stop_after_success", False):
+                        log("Account linked from a salvaged OTP and "
+                            "stop_after_success=true; stopping.")
+                        self.stop_requested.set()
+                    else:
+                        log("Account linked from a salvaged OTP; resuming the search.",
+                            prefix=pname)
+                    return
+                # Not linked (wrong/expired/unknown): _bot_submit_code already
+                # alerted with the code; the charge stands - fall through to
+                # Change Number and hunt the next number.
+            else:
+                # The bot moved on by itself (e.g. its code prompt expired):
+                # the salvaged code cannot be auto-submitted. Say so loudly -
+                # manual entry is only possible while a prompt still exists.
+                self.notify.alert(
+                    f"⚠️ [{pname}] Salvaged OTP could not be auto-submitted",
+                    f"Number: {target.clean_number}\nCode: `{code}`\n"
+                    f"Current bot screen: {state or 'unknown'}\n\n"
+                    "The SMS was delivered (the charge stands), but the bot is "
+                    "no longer waiting for a code. If the bot still shows a "
+                    "code prompt anywhere, enter it manually NOW."
+                )
+
+        # --- 3) clean cancellation: now move the bot to the number prompt ---
+        if self.stop_requested.is_set():
+            # A refund mismatch (or another critical stop) halted the
+            # automation. The bot is deliberately LEFT on its OTP screen so
+            # the number can still be completed manually if the OTP turns up
+            # in the provider panel - moving it away now would burn the paid
+            # SMS for good.
+            log("Automation is stopping after the cancellation; the bot is left "
+                "on its OTP screen so a late OTP can still be entered manually.",
+                prefix=pname)
+            self.bot_at_number_prompt = False
+            self.bot_change_attempts = 0
+            return
+
         prompt_ready = False
         if self.bot.ready:
             prompt_ready = self._bot_prepare_change_number(target)
@@ -1373,17 +1477,6 @@ class ParallelAutomationCoordinator:
                  if prompt_ready else
                  f"{target.clean_number} ({reason}). The bot flow will restart from the menu.")
             )
-        log(f"Cancelling {target.activation_id} for recovery ({reason}, refund expected: {expect_refund})...",
-            prefix=pname)
-        result = self.handle_cancellation(
-            target.client, target.activation_id, target.clean_number,
-            f"Recovery: {reason}", expect_refund=expect_refund
-        )
-        if result.get("salvaged"):
-            # Late code arrived - do not leave the bot waiting for a replacement.
-            self.bot_at_number_prompt = False
-        # Otherwise the flag was already set by _bot_prepare_change_number
-        # (True while the bot shows the number prompt, False for a full menu restart).
 
 
 def load_config():

@@ -187,9 +187,10 @@ auto mode) instead of being lost.
 | Wrong / incorrect OTP | count `otp_wrong`, Change Number, verify refund, continue |
 | "🔎 Verifying your code…" after the code | transient — waited out until "Account linked!" / the error screen; stuck > `step_timeout_seconds` → alert stating the **code WAS submitted** |
 | OTP expired | count `otp_expired`, Change Number, continue |
+| OTP timeout (no code in the window) | **cancel first, move the bot second**: final salvage probes → provider cancel + refund tally → only a clean, refunded cancellation taps Change Number. If the SMS lands inside the cancel race, the code is **auto-submitted while the bot still waits on its OTP screen** (immediate alert with the code either way — manual entry is still possible); the charge stands, no false refund alarm |
 | Number blocked / banned / already registered | count `user_blocked`, cancel/reset, continue |
 | Unknown/unexpected screen | alert with the screen text **and the buttons**, cancel the number (refund verified — nothing was submitted), reset flow |
 | Telegram side hangs (no screen/tap progress for `flow_timeout_seconds`) | ⏱️ `MeeshoBotTimeout` — alert (with the stage it hung at), cancel the number (refund verified — the tally flags it if the number had already reached the bot), reset flow, **automation continues** |
 | Change Number used > `max_change_number` in a row | reset to main menu (full flow restart) |
 | Change Number recovery | never shows the referral screen; the replacement number is sent only at the number prompt |
-| Refund not credited | 🛑 stop everything + critical alert |
+| Refund not credited | 🛑 stop everything + critical alert; the bot is **left on its OTP screen** so the OTP can still be entered manually if it shows up |

@@ -87,6 +87,9 @@ class FakeProviderClient:
     def finish(self, activation_id):
         return True
 
+    def cancel(self, activation_id):
+        return {"type": "STATUS_CANCEL"}
+
 
 class FakeNumberContext:
     def __init__(self):
@@ -101,7 +104,8 @@ class FakeUserbot:
     """Stands in for the configured MeeshoBotClient (enabled + ready)."""
 
     def __init__(self, result=None, error=None, code_result=None,
-                 referral_link="", referral_failure_action="stop"):
+                 referral_link="", referral_failure_action="stop",
+                 screen="otp_wait"):
         self.bot_username = "@primesbot"
         self.max_change_number = 5
         self.enabled = True
@@ -115,7 +119,12 @@ class FakeUserbot:
         self._result = result or {}
         self._error = error
         self._code_result = code_result or {"status": "linked", "user_id": "1", "account_number": "42"}
+        self._screen = screen
         self.calls = []
+
+    def screen_state(self):
+        self.calls.append(("screen_state",))
+        return self._screen
 
     def prepare_login(self, number):
         self.calls.append(("prepare_login", number))
@@ -347,6 +356,185 @@ def test_code_timeout_reports_code_state():
     check("code timeout: automation NOT stopped", not coordinator.stop_requested.is_set())
 
 
+def test_timeout_recovery_cancels_before_bot_moves():
+    """
+    The provider cancellation (with its late-OTP salvage race) must run
+    BEFORE the bot taps Change Number - a late OTP is only usable while the
+    bot still sits on its OTP screen.
+    """
+    coordinator, sent, _ = build_coordinator()
+    coordinator.bot = FakeUserbot()
+    events = []
+    original_change_number = coordinator.bot.change_number
+
+    def traced_change_number(new_number=None):
+        events.append("bot_change_number")
+        return original_change_number(new_number)
+
+    coordinator.bot.change_number = traced_change_number
+
+    def traced_cancel(*a, **kw):
+        events.append("cancel")
+        return {"tally_ok": True, "salvaged": None, "balance": 99.0}
+
+    coordinator.handle_cancellation = traced_cancel
+    coordinator._recover_change_number(FakeNumberContext(), "otp_timeout")
+
+    check("recovery order: cancellation runs BEFORE Change Number",
+          events and events[0] == "cancel" and "bot_change_number" in events,
+          events)
+    check("recovery order: cancellation runs exactly once",
+          events.count("cancel") == 1, events)
+
+
+def test_salvaged_late_otp_is_auto_submitted():
+    """
+    A late OTP salvaged during the cancellation race is submitted to the bot
+    automatically while it still waits on the OTP screen - the money is not
+    lost, and no 'refund did not tally' critical stop fires for a charge
+    that legitimately stands.
+    """
+    coordinator, sent, cancellations = build_coordinator()
+    coordinator.bot = FakeUserbot(code_result={
+        "status": "linked", "user_id": "777", "account_number": "4242",
+    })
+    coordinator.handle_cancellation = (
+        lambda *a, **kw: {"tally_ok": True, "balance": 93.0,
+                          "salvaged": {"code": "111111", "sms": "Your code is 111111"}}
+    )
+    context = FakeNumberContext()
+    coordinator._recover_change_number(context, "otp_timeout")
+
+    check("salvaged OTP: screen checked before submitting",
+          ("screen_state",) in coordinator.bot.calls, coordinator.bot.calls)
+    check("salvaged OTP: submitted to the bot automatically",
+          ("submit_otp", "111111") in coordinator.bot.calls, coordinator.bot.calls)
+    check("salvaged OTP: linked alert sent",
+          any("Account linked" in t for t, _m in sent), [t for t, _m in sent])
+    check("salvaged OTP: bot NOT moved to Change Number after a link",
+          ("change_number", None) not in coordinator.bot.calls, coordinator.bot.calls)
+    check("salvaged OTP: automation not stopped",
+          not coordinator.stop_requested.is_set())
+
+
+def test_salvaged_late_otp_wrong_code_still_recovers():
+    """A salvaged code the bot rejects still recovers with Change Number."""
+    coordinator, sent, _ = build_coordinator()
+    coordinator.bot = FakeUserbot(code_result={"status": "wrong_otp", "screen": "❌ Incorrect code."})
+    coordinator.handle_cancellation = (
+        lambda *a, **kw: {"tally_ok": True, "balance": 93.0,
+                          "salvaged": {"code": "222222", "sms": "Your code is 222222"}}
+    )
+    coordinator._recover_change_number(FakeNumberContext(), "otp_timeout")
+
+    check("salvaged wrong code: submitted first",
+          ("submit_otp", "222222") in coordinator.bot.calls, coordinator.bot.calls)
+    check("salvaged wrong code: recovered with Change Number afterwards",
+          ("change_number", None) in coordinator.bot.calls, coordinator.bot.calls)
+    check("salvaged wrong code: wrong-otp alert sent",
+          any("Wrong OTP" in t for t, _m in sent), [t for t, _m in sent])
+
+
+def test_salvaged_otp_not_on_otp_screen():
+    """
+    If the bot left the OTP screen on its own (e.g. the prompt expired), the
+    salvaged code cannot be auto-submitted: an immediate alert carries the
+    code for manual entry and the recovery continues.
+    """
+    coordinator, sent, _ = build_coordinator()
+    coordinator.bot = FakeUserbot(screen="otp_expired")
+    coordinator.handle_cancellation = (
+        lambda *a, **kw: {"tally_ok": True, "balance": 93.0,
+                          "salvaged": {"code": "333333", "sms": "Your code is 333333"}}
+    )
+    coordinator._recover_change_number(FakeNumberContext(), "otp_timeout")
+
+    check("not on OTP screen: code NOT submitted blindly",
+          all(c[0] != "submit_otp" for c in coordinator.bot.calls),
+          coordinator.bot.calls)
+    check("not on OTP screen: alert carries the code for manual entry",
+          any("333333" in msg for _t, msg in sent), sent)
+    check("not on OTP screen: recovery continues with Change Number",
+          ("change_number", None) in coordinator.bot.calls, coordinator.bot.calls)
+
+
+def test_refund_mismatch_leaves_bot_on_otp_screen():
+    """
+    When the refund does not tally the automation critical-stops; the bot
+    must NOT tap Change Number - its OTP screen is left for manual entry if
+    the OTP turns up in the provider panel.
+    """
+    coordinator, sent, _ = build_coordinator()
+    coordinator.bot = FakeUserbot()
+
+    def failing_cancel(*a, **kw):
+        coordinator._critical_stop("[TEST] REFUND DID NOT TALLY", "test mismatch")
+        return {"tally_ok": False, "salvaged": None, "balance": 50.0}
+
+    coordinator.handle_cancellation = failing_cancel
+    coordinator._recover_change_number(FakeNumberContext(), "otp_timeout")
+
+    check("refund mismatch: bot left on the OTP screen (no Change Number tap)",
+          ("change_number", None) not in coordinator.bot.calls, coordinator.bot.calls)
+    check("refund mismatch: automation stopped", coordinator.stop_requested.is_set())
+    check("refund mismatch: critical alert sent",
+          any("REFUND DID NOT TALLY" in t for t, _m in sent), [t for t, _m in sent])
+
+
+def test_cancel_race_salvage_charge_stands_no_critical_stop():
+    """
+    Inside handle_cancellation itself: when the salvage probes find a late
+    OTP (the SMS landed in the cancel race), the charge legitimately stands -
+    the balance baseline moves to the actual balance, NO refund tally /
+    critical stop runs (it would always 'fail': no refund is owed), and the
+    immediate alert carries the code plus the fact that the bot screen is
+    still untouched.
+    """
+    coordinator, sent, _ = build_coordinator()
+    # Exercise the REAL handle_cancellation (build_coordinator patches it out).
+    coordinator.handle_cancellation = (
+        m.ParallelAutomationCoordinator.handle_cancellation.__get__(coordinator)
+    )
+    coordinator.settings["refund_check_delay_seconds"] = 0
+    coordinator._note_balance("tempora", 100.0)  # the refund WOULD be expected...
+
+    verify_calls = []
+    coordinator.guard.verify_refund = lambda *a, **k: verify_calls.append(1) or (False, 91.0)
+    coordinator.guard.salvage_late_otp = (
+        lambda *a, **k: {"type": "STATUS_OK", "code": "111111",
+                         "sms": "Your code is 111111"}
+    )
+
+    class NoRefundClient(FakeProviderClient):
+        def get_balance(self):
+            return 93.0  # the SMS was delivered: no refund arrives
+
+    result = coordinator.handle_cancellation(
+        NoRefundClient(), "act-123", "9876543210",
+        "Recovery: otp_timeout", expect_refund=True,
+    )
+
+    check("cancel race: salvaged code returned to the caller",
+          (result.get("salvaged") or {}).get("code") == "111111", result)
+    check("cancel race: reported as accounted-for",
+          result.get("tally_ok") is True, result)
+    check("cancel race: refund tally never ran (the charge stands)",
+          verify_calls == [], verify_calls)
+    check("cancel race: no critical stop",
+          not coordinator.stop_requested.is_set())
+    check("cancel race: balance baseline updated to the actual balance",
+          coordinator._expected_balance("tempora", "act-123") == 93.0,
+          coordinator._expected_balance("tempora", "act-123"))
+    title, message = sent[-1]
+    check("cancel race: alert carries the code", "111111" in message, message)
+    check("cancel race: alert says the bot screen is untouched",
+          "still on its OTP screen" in message, message)
+    snap = coordinator.stats.snapshot()
+    check("cancel race: counted as consumed, not as a missing refund",
+          snap["numbers_consumed"] == 1 and snap["refunds_missing"] == 0
+          and snap["late_otp_salvaged"] == 1, snap)
+
+
 def test_referral_screen_absent_continues():
     """
     Point 1: when the bot does not show the referral screen, the flow proceeds
@@ -448,6 +636,12 @@ def main():
     test_unexpected_screen_alert_and_refund()
     test_flow_timeout_cancels_and_continues()
     test_code_timeout_reports_code_state()
+    test_timeout_recovery_cancels_before_bot_moves()
+    test_salvaged_late_otp_is_auto_submitted()
+    test_salvaged_late_otp_wrong_code_still_recovers()
+    test_salvaged_otp_not_on_otp_screen()
+    test_refund_mismatch_leaves_bot_on_otp_screen()
+    test_cancel_race_salvage_charge_stands_no_critical_stop()
     test_code_not_submitted_after_referral_interrupt()
     test_startup_logs_referral_config()
     print()
