@@ -61,7 +61,11 @@ if "websocket" not in sys.modules:
         sys.modules["websocket"] = websocket
 
 import main as m  # noqa: E402
-from meesho_bot_client import MeeshoBotUnknownScreen  # noqa: E402
+from meesho_bot_client import (  # noqa: E402
+    MeeshoBotClient,
+    MeeshoBotReferralError,
+    MeeshoBotUnknownScreen,
+)
 
 
 FAILURES = []
@@ -95,12 +99,18 @@ class FakeNumberContext:
 class FakeUserbot:
     """Stands in for the configured MeeshoBotClient (enabled + ready)."""
 
-    def __init__(self, result=None, error=None, code_result=None):
+    def __init__(self, result=None, error=None, code_result=None,
+                 referral_link="", referral_failure_action="stop"):
         self.bot_username = "@primesbot"
         self.max_change_number = 5
         self.enabled = True
         self.ready = True
-        self.referral_summary = "referral link configured: https://app.meesho.com/x?via=1"
+        self.referral_link = referral_link
+        self.referral_failure_action = referral_failure_action
+        self.referral_summary = (
+            f"referral link configured: {referral_link}" if referral_link
+            else "no referral link configured - stops and reports if asked"
+        )
         self._result = result or {}
         self._error = error
         self._code_result = code_result or {"status": "linked", "user_id": "1", "account_number": "42"}
@@ -135,6 +145,15 @@ class FakeUserbot:
     def return_to_menu(self):
         self.calls.append(("return_to_menu",))
         return {"stage": "menu"}
+
+    @property
+    def referral_required(self):
+        return self.referral_failure_action == "stop"
+
+    def set_referral_link(self, link):
+        previous = self.referral_link
+        self.referral_link = (link or "").strip()
+        return previous
 
 
 def build_coordinator():
@@ -193,7 +212,8 @@ def test_unexpected_screen_alert_and_refund():
     check("alert path: screen text included", "Referral link?" in message, message)
     check("alert path: buttons included", "Yes, I have a refer code" in message, message)
     check("alert path: mentions the referral config",
-          "Referral step: referral link configured" in message, message)
+          "Referral step:" in message and "no referral link configured" in message,
+          message)
     check("alert path: cancels with refund expected (nothing submitted)",
           cancellations and cancellations[-1][1] is True, cancellations)
     check("alert path: bot flow reset", ("cancel_flow",) in coordinator.bot.calls,
@@ -228,6 +248,129 @@ def test_code_not_submitted_after_referral_interrupt():
           ("change_number", None) in coordinator.bot.calls, coordinator.bot.calls)
 
 
+def test_referral_failure_stops_and_refunds():
+    """
+    Point 2: referral screen present + link unusable -> alert, cancel the number
+    with a refund tally, and STOP the automation (no further numbers bought).
+    """
+    coordinator, sent, cancellations = build_coordinator()
+    error = MeeshoBotReferralError(
+        "Referral step failed: no referral link is configured. "
+        "meesho_bot.referral_link is empty. Buttons on screen: "
+        "🚫 I don't have a refer code / ❌ Cancel. Set it with /referral <link>...",
+        "🎁 Referral link? Paste your Meesho referral link below.",
+        ["🚫 I don't have a refer code", "❌ Cancel"],
+    )
+    coordinator.bot = FakeUserbot(error=error)
+    context = FakeNumberContext()
+    check("referral failure: stop flag clear before the attempt",
+          coordinator.stop_requested.is_set() is False)
+
+    res = coordinator._bot_send_number(context, from_prompt=False)
+
+    check("referral failure: returns None so the worker moves on", res is None, res)
+    title, message = sent[-1]
+    check("referral failure: alert says the automation stopped",
+          "Referral step failed" in title and "stopped" in title.lower(), title)
+    check("referral failure: alert includes the screen",
+          "Referral link?" in message, message)
+    check("referral failure: alert includes the buttons",
+          "I don't have a refer code" in message, message)
+    check("referral failure: alert names both fixes",
+          "/referral" in message and "referral_failure_action" in message, message)
+    check("referral failure: alert reports the refund tally",
+          "Refund tally" in message, message)
+    check("referral failure: number cancelled with refund expected",
+          cancellations and cancellations[-1][1] is True, cancellations)
+    check("referral failure: automation STOPPED", coordinator.stop_requested.is_set())
+    check("referral failure: critical stop counted",
+          coordinator.stats.snapshot()["critical_stops"] == 1,
+          coordinator.stats.snapshot())
+    check("referral failure: bot flow reset", ("cancel_flow",) in coordinator.bot.calls,
+          coordinator.bot.calls)
+
+
+def test_referral_screen_absent_continues():
+    """
+    Point 1: when the bot does not show the referral screen, the flow proceeds
+    normally even in strict mode with no link configured.
+    """
+    coordinator, sent, cancellations = build_coordinator()
+    coordinator.bot = FakeUserbot(result={
+        "stage": "otp_sent", "upi": 45.0, "rerolls": 1, "referral_action": None,
+    })
+    context = FakeNumberContext()
+    res = coordinator._bot_send_number(context, from_prompt=False)
+
+    check("screen absent: number accepted", res and res["stage"] == "otp_sent", res)
+    check("screen absent: automation still running", not coordinator.stop_requested.is_set())
+    check("screen absent: nothing cancelled", cancellations == [], cancellations)
+    joined = "\n".join(msg for _t, msg in sent)
+    check("screen absent: no referral line in the notification",
+          "Referral:" not in joined, joined)
+
+
+def test_referral_command_sets_and_clears_link():
+    """Point 4: set the referral link from Telegram, saved to config.json."""
+    coordinator, _sent, _canc = build_coordinator()
+    coordinator.bot = FakeUserbot()
+
+    reply = coordinator.command_referral_link("")
+    check("referral cmd: status reply when no argument",
+          "not set" in reply and "Failure action: stop" in reply, reply)
+
+    reply = coordinator.command_referral_link("not-a-link")
+    check("referral cmd: rejects a non-Meesho value",
+          reply.startswith("❌") and coordinator.bot.referral_link == "", reply)
+
+    link = "https://app.meesho.com/2yoV/r99th0qd?via=852o6g&from=account_section"
+    reply = coordinator.command_referral_link(link)
+    check("referral cmd: confirms saving", reply.startswith("✅") and link in reply, reply)
+    check("referral cmd: applied to the live userbot",
+          coordinator.bot.referral_link == link, coordinator.bot.referral_link)
+    saved = json.load(open("config.json", encoding="utf-8"))
+    check("referral cmd: persisted to config.json",
+          saved["meesho_bot"]["referral_link"] == link, saved["meesho_bot"])
+    check("referral cmd: rest of config intact",
+          saved["telegram"]["chat_id"] == "883480917", saved["telegram"])
+
+    reply = coordinator.command_referral_link("off")
+    check("referral cmd: 'off' clears the link",
+          reply.startswith("✅") and coordinator.bot.referral_link == "", reply)
+    saved = json.load(open("config.json", encoding="utf-8"))
+    check("referral cmd: cleared value persisted",
+          saved["meesho_bot"]["referral_link"] == "", saved["meesho_bot"])
+
+
+def test_telegram_referral_command_wiring():
+    """The notifier routes /referral (with its argument) to the callback."""
+    from notifier import TelegramBackend
+
+    backend = TelegramBackend(token="t", chat_id="1")
+    received = []
+
+    class FakeUpdates(TelegramBackend):
+        def _call(self, method, payload=None, timeout=None):
+            if method == "getUpdates":
+                return [{"update_id": 1, "message": {
+                    "text": "/referral@MyAlertsBot https://app.meesho.com/abc?via=1",
+                    "chat": {"id": 1},
+                }}]
+            self.sent.append((method, payload))
+            return True
+
+    backend2 = FakeUpdates(token="t", chat_id="1")
+    backend2.sent = []
+    backend2.referral_callback = lambda arg: received.append(arg) or "✅ saved"
+    backend2.poll_signal({"run": "run"})
+
+    check("telegram: /referral argument extracted (mention stripped)",
+          received == ["https://app.meesho.com/abc?via=1"], received)
+    titles = [p.get("text", "") for m, p in backend2.sent if m == "sendMessage"]
+    check("telegram: reply sent back to the chat",
+          any("Referral" in t for t in titles), titles)
+
+
 def test_startup_logs_referral_config():
     coordinator, _, _ = build_coordinator()
     coordinator.bot = FakeUserbot()
@@ -239,7 +382,12 @@ def test_startup_logs_referral_config():
 def main():
     print("=== Coordinator integration (referral flow) ===\n")
     print(f"(scratch dir: {SCRATCH_DIR})\n")
+    shutil.copy(os.path.join(REPO_DIR, "config.json"), os.path.join(SCRATCH_DIR, "config.json"))
     test_successful_login_reports_referral()
+    test_referral_screen_absent_continues()
+    test_referral_failure_stops_and_refunds()
+    test_referral_command_sets_and_clears_link()
+    test_telegram_referral_command_wiring()
     test_unexpected_screen_alert_and_refund()
     test_code_not_submitted_after_referral_interrupt()
     test_startup_logs_referral_config()

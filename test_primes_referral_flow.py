@@ -16,6 +16,7 @@ import time
 
 from meesho_bot_client import (
     MeeshoBotClient,
+    MeeshoBotReferralError,
     MeeshoBotUnknownScreen,
     Screen,
     S_MENU,
@@ -89,6 +90,7 @@ OFFER_45 = Screen(
 
 OTP_WAIT = Screen(
     "✅ OTP on its way!\n\nWe've sent a code to 9xxxxxxxxx. Type it here when it arrives.",
+    [["🔄 Change Number"]],
 )
 
 LINKED = Screen(
@@ -178,6 +180,11 @@ class FakeBot:
             self.state = "link_choice"
             self._edit_last(LINK_CHOICE)
         elif "Login with Number" in label:
+            if self.referral_script == "absent":
+                # The referral screen is optional - on many logins it never shows.
+                self.state = "login_mode"
+                self._edit_last(LOGIN_MODE)
+                return
             self.state = "referral"
             self.referral_seen += 1
             if getattr(self, "referral_override", None) is not None:
@@ -193,6 +200,9 @@ class FakeBot:
         elif "Continue" in label and self.state == "login_mode":
             self._edit_last(LOGIN_MODE)
         elif label == "Normal" and self.state == "login_mode":
+            self.state = "offer"
+            self._edit_last(self._offer_screen())
+        elif "Change Number" in label:
             self.state = "offer"
             self._edit_last(self._offer_screen())
         elif "Try Another Offer" in label:
@@ -219,7 +229,9 @@ class FakeBot:
             elif self.referral_script == "silent_reask":
                 self._push(REFERRAL_ASK)
             elif self.referral_script == "two_screens":
-                self._push(REFERRAL_ASK)
+                # Exactly the screenshot sequence: the first paste is saved, then
+                # the bot asks again for this account; the second paste proceeds.
+                self._push(REFERRAL_ASK if len(self.pasted) == 1 else LOGIN_MODE)
             elif self.referral_script == "ack_then_login":
                 self._push(REFERRAL_ACK)
             else:
@@ -261,7 +273,8 @@ class FakeTelegramClient:
         return self.bot.last
 
 
-def build_client(referral_link="", referral_script="save", **kwargs):
+def build_client(referral_link="", referral_script="save",
+                 referral_failure_action="stop", **kwargs):
     config = {
         "meesho_bot": {
             "enabled": True,
@@ -275,6 +288,7 @@ def build_client(referral_link="", referral_script="save", **kwargs):
             "poll_interval_seconds": 0.01,
             "human_delay_seconds": [0, 0],
             "referral_link": referral_link,
+            "referral_failure_action": referral_failure_action,
             **kwargs,
         }
     }
@@ -318,8 +332,9 @@ def scenario_with_link():
     return client, bot
 
 
-def scenario_without_link():
-    client, bot = build_client(referral_link=None)
+def scenario_without_link_skip_mode():
+    """referral_failure_action="skip": continue using the bot's own skip button."""
+    client, bot = build_client(referral_link=None, referral_failure_action="skip")
     res = client.prepare_login("9876543211")
     check("without link: flow reaches OTP screen", res["stage"] == "otp_sent", res)
     check("without link: skip option tapped", "🚫 I don't have a refer code" in bot.tapped, bot.tapped)
@@ -341,15 +356,15 @@ def scenario_two_screens_like_screenshot():
     )
     res = client.prepare_login("9876543210")
     check("screenshot sequence: flow reaches OTP screen", res["stage"] == "otp_sent", res)
-    check("screenshot sequence: link pasted once", len(bot.pasted) == 1, bot.pasted)
-    check("screenshot sequence: skip used on the second screen",
-          "🚫 I don't have a refer code" in bot.tapped, bot.tapped)
+    check("screenshot sequence: link pasted for both prompts",
+          len(bot.pasted) == 2, bot.pasted)
+    check("screenshot sequence: skip button never needed",
+          not any("refer code" in t for t in bot.tapped), bot.tapped)
     check("screenshot sequence: number only after both screens",
           bot.sent_numbers == ["9876543210"], bot.sent_numbers)
     check("screenshot sequence: price target respected", res["upi"] == 45.0, res)
-    check("screenshot sequence: referral surfaced in the result",
-          res["referral_action"] == "tapped '🚫 I don't have a refer code'",
-          res["referral_action"])
+    check("screenshot sequence: referral action recorded",
+          res["referral_action"] == "pasted referral link", res["referral_action"])
 
 
 def scenario_acknowledgement_screen():
@@ -365,9 +380,10 @@ def scenario_acknowledgement_screen():
     check("ack screen: link pasted once", len(bot.pasted) == 1, bot.pasted)
 
 
-def scenario_link_rejected():
+def scenario_link_rejected_skip_mode():
     client, bot = build_client(referral_link="https://app.meesho.com/bad?via=000",
-                               referral_script="reject")
+                               referral_script="reject",
+                               referral_failure_action="skip")
     res = client.prepare_login("9876543212")
     check("rejected link: flow still reaches OTP screen", res["stage"] == "otp_sent", res)
     check("rejected link: skip used as fallback",
@@ -377,10 +393,12 @@ def scenario_link_rejected():
 
 def scenario_link_silently_reasked():
     client, bot = build_client(referral_link="https://app.meesho.com/bad?via=000",
-                               referral_script="silent_reask")
+                               referral_script="silent_reask",
+                               referral_failure_action="skip")
     res = client.prepare_login("9876543213")
     check("silent re-ask: flow still reaches OTP screen", res["stage"] == "otp_sent", res)
-    check("silent re-ask: link pasted only once", len(bot.pasted) == 1, bot.pasted)
+    check("silent re-ask: pasted only up to the budget",
+          len(bot.pasted) == 2, bot.pasted)
     check("silent re-ask: skip used after re-ask",
           "🚫 I don't have a refer code" in bot.tapped, bot.tapped)
 
@@ -392,7 +410,7 @@ def scenario_unknown_referral_screen():
     informative error instead of cancelling silently or typing a number into
     the referral field.
     """
-    client, bot = build_client(referral_link=None)
+    client, bot = build_client(referral_link=None, referral_failure_action="skip")
     mystery = Screen("🎁 Referral link? Paste your Meesho referral link below.",
                      [["✅ Yes, I have a referral link"]])
     client._referral_screen_override = mystery
@@ -409,6 +427,117 @@ def scenario_unknown_referral_screen():
               any("Yes, I have" in b for b in exc.buttons), exc.buttons)
     check("unknown referral: no number typed into the referral field",
           bot.sent_numbers == [], bot.sent_numbers)
+
+
+def scenario_screen_absent_strict_mode():
+    """
+    Point 1: the referral screen may not appear at all. In "stop" mode (the
+    default) with no link configured, a login that never asks for a referral
+    must still run normally - no error, no link needed.
+    """
+    client, bot = build_client(referral_link=None, referral_script="absent",
+                               referral_failure_action="stop")
+    res = client.prepare_login("9876543210")
+    check("no referral screen (strict, no link): flow reaches OTP screen",
+          res["stage"] == "otp_sent", res)
+    check("no referral screen: nothing pasted and no skip tapped",
+          bot.pasted == [] and not any("refer code" in t for t in bot.tapped), bot.tapped)
+    check("no referral screen: number sent", bot.sent_numbers == ["9876543210"],
+          bot.sent_numbers)
+    check("no referral screen: offer reroll still applied",
+          res["rerolls"] == 1 and res["upi"] == 45.0, res)
+    check("no referral screen: no referral action recorded",
+          res["referral_action"] is None, res["referral_action"])
+
+
+def scenario_screen_present_strict_no_link():
+    """
+    Point 2: the screen appears but no link is set -> stop, report, cancel the
+    number with a refund tally. The flow must NOT continue without the link and
+    must NOT type the number into the referral field.
+    """
+    client, bot = build_client(referral_link=None, referral_failure_action="stop")
+    try:
+        client.prepare_login("9876543210")
+        check("strict, no link: raises MeeshoBotReferralError", False, "no exception")
+    except MeeshoBotReferralError as exc:
+        check("strict, no link: raises MeeshoBotReferralError", True)
+        check("strict, no link: error explains the missing link",
+              "no referral link is configured" in str(exc), str(exc))
+        check("strict, no link: error tells how to fix it",
+              "/referral" in str(exc) and "referral_failure_action" in str(exc), str(exc))
+        check("strict, no link: buttons included",
+              "Main Menu" in exc.buttons or "refer code" in str(exc.buttons), exc.buttons)
+    except MeeshoBotUnknownScreen as exc:
+        check("strict, no link: raises MeeshoBotReferralError", False,
+              f"raised base class instead: {exc}")
+    check("strict, no link: number never sent", bot.sent_numbers == [], bot.sent_numbers)
+    check("strict, no link: skip button not tapped",
+          not any("refer code" in t for t in bot.tapped), bot.tapped)
+
+
+def scenario_link_rejected_strict():
+    """Point 2: a link the bot refuses must also stop, not silently skip."""
+    client, bot = build_client(referral_link="https://app.meesho.com/bad?via=000",
+                               referral_script="reject", referral_failure_action="stop")
+    try:
+        client.prepare_login("9876543210")
+        check("strict, rejected link: raises MeeshoBotReferralError", False, "no exception")
+    except MeeshoBotReferralError as exc:
+        check("strict, rejected link: raises MeeshoBotReferralError", True)
+        check("strict, rejected link: error says the link was rejected",
+              "rejected" in str(exc) or "invalid" in str(exc), str(exc))
+    check("strict, rejected link: skip button NOT used",
+          not any("refer code" in t for t in bot.tapped), bot.tapped)
+    check("strict, rejected link: number never sent", bot.sent_numbers == [], bot.sent_numbers)
+    check("strict, rejected link: exactly one paste attempt", len(bot.pasted) == 1, bot.pasted)
+
+
+def scenario_change_number_no_referral_screen():
+    """
+    Point 3: Change Number does not show the referral screen. The recovery path
+    must work in strict mode with no link configured (nothing to paste), and the
+    replacement number must go out only after the number prompt.
+    """
+    client, bot = build_client(referral_link=None, referral_script="absent",
+                               referral_failure_action="stop")
+    client.prepare_login("9876543210")
+    check("change number (strict, no link): first number sent",
+          bot.sent_numbers == ["9876543210"], bot.sent_numbers)
+
+    res = client.change_number(None)
+    check("change number (strict, no link): still reaches the number prompt",
+          res["stage"] == "prompt", res)
+
+    res2 = client.continue_with_number("9876543211")
+    check("change number (strict, no link): replacement number sent",
+          bot.sent_numbers[-1] == "9876543211", bot.sent_numbers)
+    check("change number (strict, no link): OTP screen reached",
+          res2["stage"] == "otp_sent", res2)
+    check("change number (strict, no link): no referral error raised",
+          res2.get("referral_action") is None, res2.get("referral_action"))
+
+
+def scenario_change_number_with_link_no_referral_screen():
+    """Point 3 with a link set: recovery must not paste anything it doesn't need."""
+    client, bot = build_client(referral_link="https://app.meesho.com/x?via=1",
+                               referral_script="absent", referral_failure_action="stop")
+    client.prepare_login("9876543210")
+    pasted_during_login = len(bot.pasted)
+    check("change number (link set, screen absent): nothing pasted during login",
+          pasted_during_login == 0, bot.pasted)
+
+    # Tap Change Number (the bot goes back to the number prompt), then send.
+    prompt = client.change_number(None)
+    check("change number (link set, screen absent): Change Number reaches the prompt",
+          prompt["stage"] == "prompt", prompt)
+    res = client.continue_with_number("9876543212")
+    check("change number (link set, screen absent): replacement number sent",
+          bot.sent_numbers[-1] == "9876543212", bot.sent_numbers)
+    check("change number (link set, screen absent): OTP screen reached",
+          res["stage"] == "otp_sent", res)
+    check("change number (link set, screen absent): still nothing pasted",
+          len(bot.pasted) == pasted_during_login, bot.pasted)
 
 
 def scenario_menu_refer_earn_not_mistaken():
@@ -516,10 +645,15 @@ def main():
     scenario_with_link()
     scenario_two_screens_like_screenshot()
     scenario_acknowledgement_screen()
-    scenario_without_link()
-    scenario_link_rejected()
+    scenario_without_link_skip_mode()
+    scenario_link_rejected_skip_mode()
     scenario_link_silently_reasked()
     scenario_unknown_referral_screen()
+    scenario_screen_absent_strict_mode()
+    scenario_screen_present_strict_no_link()
+    scenario_link_rejected_strict()
+    scenario_change_number_no_referral_screen()
+    scenario_change_number_with_link_no_referral_screen()
     scenario_menu_refer_earn_not_mistaken()
     scenario_referral_mid_otp_wait()
     scenario_change_number_with_referral()

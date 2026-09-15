@@ -54,6 +54,17 @@ class MeeshoBotUnknownScreen(MeeshoBotError):
         self.buttons = buttons or []
 
 
+class MeeshoBotReferralError(MeeshoBotUnknownScreen):
+    """
+    The referral step could not be completed the way it is configured.
+
+    With meesho_bot.referral_failure_action = "stop" (default) this is raised
+    instead of falling back to the bot's own skip button: the coordinator stops
+    the automation, reports why, and cancels the number with a refund tally -
+    the login is never continued without the referral link.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Screen model / parsing (pure - no Telethon dependency, fully unit-testable)
 # ---------------------------------------------------------------------------
@@ -194,8 +205,9 @@ class Screen:
     @property
     def is_referral(self):
         """
-        True for the "🎁 Referral link?" promotion screen the bot shows between
-        the login-mode choice and the number prompt.
+        True for the "🔗 Set Refer Link" / "🎁 Referral link?" screen the bot
+        shows between "Login with Number" and the NORMAL/AUTO login mode (it may
+        also not appear at all on a given login).
 
         Matching looks for a referral/invite word plus a link/code/paste word,
         which survives copy changes between bot revisions. Menu, login-mode and
@@ -392,16 +404,25 @@ class MeeshoBotClient:
             self.delay_min, self.delay_max = 1.0, 2.5
 
         # Referral step (between "Login with Number" and the Normal/Auto mode).
-        # referral_link is pasted when the bot asks for it; without one the
-        # bot's own "I don't have a refer code" option is used instead.
+        # The screen may or may not appear on a given login; when it does,
+        # referral_link is pasted. referral_failure_action decides what happens
+        # when that cannot be done:
+        #   "stop" (default) - stop, report, cancel the number and tally the refund
+        #   "skip"           - tap the bot's own "I don't have a refer code" button
         link = conf.get("referral_link") or conf.get("meesho_referral_link") or ""
         self.referral_link = link.strip() if isinstance(link, str) else ""
-        self.max_referral_pastes = int(conf.get("max_referral_pastes", 1))
-        self.max_referral_events = int(conf.get("max_referral_events", 3))
+        action = str(conf.get("referral_failure_action", "stop") or "stop").strip().lower()
+        self.referral_failure_action = action if action in ("stop", "skip") else "stop"
+        # The bot commonly asks twice in one login - first "🔗 Set Refer Link"
+        # (saves it for future logins), then "🎁 Referral link?" per account -
+        # so the link is pasted once for each prompt by default.
+        self.max_referral_pastes = int(conf.get("max_referral_pastes", 2))
+        self.max_referral_events = int(conf.get("max_referral_events", 4))
 
         # Per-login referral bookkeeping (reset by _a_prepare_login).
         self._referral_events = 0
         self._referral_pastes_in_flow = 0
+        self._last_referral_problem = None
         self.last_referral_action = None
 
         self._client = None
@@ -431,8 +452,27 @@ class MeeshoBotClient:
     def referral_summary(self):
         """One-line description of the referral configuration, for logs/alerts."""
         if self.referral_link:
-            return f"referral link configured: {self.referral_link}"
-        return "no referral link configured (taps the bot's own skip option)"
+            return (f"referral link configured: {self.referral_link} "
+                    f"(on failure: {self.referral_failure_action})")
+        if self.referral_required:
+            return ("no referral link configured - if the bot asks for one the "
+                    "automation stops and reports (set it with /referral <link>)")
+        return ("no referral link configured - the bot's own skip option is used "
+                "if the bot asks for one")
+
+    @property
+    def referral_required(self):
+        """True when a referral link is mandatory for any login that asks for it."""
+        return self.referral_failure_action == "stop"
+
+    def set_referral_link(self, link):
+        """
+        Apply a referral link at runtime (used by the Telegram /referral
+        command). An empty value clears it. Returns the previous value.
+        """
+        previous = self.referral_link
+        self.referral_link = (link or "").strip()
+        return previous
 
     def _session_string(self):
         try:
@@ -645,36 +685,45 @@ class MeeshoBotClient:
 
     # -- referral screen -----------------------------------------------------
 
-    def _referral_screen_error(self, screen, reason):
-        """Loud, actionable error for a referral screen we cannot answer."""
-        configured = (f"meesho_bot.referral_link = {self.referral_link}"
+    def _referral_screen_error(self, screen, problem):
+        """
+        Loud, actionable error for a referral screen we cannot answer.
+
+        In "stop" mode this is a MeeshoBotReferralError, which makes the
+        coordinator stop the automation, report it, and cancel the number with
+        a refund tally, rather than logging in without the referral link.
+        """
+        problem = problem or self._last_referral_problem or "unknown reason"
+        configured = (f"meesho_bot.referral_link is set ({self.referral_link})"
                       if self.referral_link else
                       "meesho_bot.referral_link is empty")
-        return MeeshoBotUnknownScreen(
-            f"Referral screen needs a decision ({reason}); {configured}. "
-            f"Buttons: {screen.button_summary}",
-            screen.text,
-            screen.button_labels,
-        )
+        next_step = ("Set it with /referral <link> in Telegram or "
+                     "python main.py --set-referral-link <link>, then start again; "
+                     'or set meesho_bot.referral_failure_action to "skip" to log in '
+                     "without a referral link.")
+        message = (f"Referral step failed: {problem}. {configured}. "
+                   f"Buttons on screen: {screen.button_summary}. {next_step}")
+        error_class = MeeshoBotReferralError if self.referral_required else MeeshoBotUnknownScreen
+        return error_class(message, screen.text, screen.button_labels)
 
     async def _a_resolve_referral(self, screen):
         """
         Answer the bot's referral screen and return the screen it produced.
 
-        Order of preference:
-          0. nothing left to try (screen re-offered after a paste, or a refused
-             link): take the bot's own "I don't have a refer code" option;
+        Order of preference with a usable link:
           1. a configured referral_link that has not been pasted yet in this
              login -> paste it (a Yes/No question is answered with Yes first);
-          2. the bot's skip option, so the login continues without a referral;
-          3. otherwise raise with the screen text and buttons - losing a paid
-             number is worse than stopping for a human decision.
+          2. if the link was refused/asked for again, or none is configured:
+             - "stop" mode (default): raise MeeshoBotReferralError so the
+               coordinator stops, reports, and cancels the number with a refund
+               tally - the login never continues without the referral link;
+             - "skip" mode: tap the bot's own "I don't have a refer code" button.
         """
         self._referral_events += 1
         if self._referral_events > self.max_referral_events:
             raise self._referral_screen_error(
                 screen,
-                f"keeps re-appearing ({self._referral_events - 1} answered already)",
+                f"the screen keeps re-appearing ({self._referral_events - 1} answered already)",
             )
 
         skip = screen.referral_skip_button()
@@ -684,7 +733,7 @@ class MeeshoBotClient:
         self._log(f"[MEESHO-BOT] Referral screen: {screen.button_summary} "
                   f"(link {'set' if self.referral_link else 'unset'}, "
                   f"paste #{self._referral_pastes_in_flow + 1}, "
-                  f"seen #{self._referral_events})")
+                  f"seen #{self._referral_events}, on failure: {self.referral_failure_action})")
 
         if can_paste:
             if yes is not None and not screen.referral_prompt:
@@ -701,22 +750,52 @@ class MeeshoBotClient:
             await self._client.send_message(self._bot_entity, self.referral_link)
             self._human_delay()
             new_screen = await self._wait_new_screen(before)
-            if new_screen.classify() == S_REFERRAL and not new_screen.referral_rejected:
-                # The bot asked again without complaining: treat the link as
-                # unpasteable and take the skip option on the next pass.
-                self._log("[MEESHO-BOT] Referral screen reappeared after pasting; "
-                          "will use the bot's skip option instead.")
-                self._referral_pastes_in_flow = self.max_referral_pastes
+            if new_screen.classify() == S_REFERRAL:
+                if new_screen.referral_rejected:
+                    # A refused link is not retried: no point pasting it again.
+                    self._last_referral_problem = (
+                        "the bot rejected the configured referral link "
+                        "(invalid, expired or already used)"
+                    )
+                    self._referral_pastes_in_flow = self.max_referral_pastes
+                else:
+                    # Being asked again is normal (save-the-link screen, then the
+                    # per-account prompt); the paste budget decides when it stops
+                    # making sense.
+                    remaining = max(0, self.max_referral_pastes - self._referral_pastes_in_flow)
+                    self._log("[MEESHO-BOT] Referral screen reappeared after pasting; "
+                              f"{remaining} paste(s) left this login.")
+                    if remaining <= 0:
+                        self._last_referral_problem = (
+                            f"the bot kept asking for the referral link after "
+                            f"{self._referral_pastes_in_flow} paste(s) "
+                            f"(max_referral_pastes={self.max_referral_pastes})"
+                        )
             return new_screen
+
+        # There is nothing more to paste: explain exactly why.
+        if self._last_referral_problem is None:
+            if self.referral_link:
+                self._last_referral_problem = (
+                    f"the link was already pasted {self._referral_pastes_in_flow}x in "
+                    f"this login (max_referral_pastes={self.max_referral_pastes})"
+                )
+            else:
+                self._last_referral_problem = "no referral link is configured"
+
+        if self.referral_required:
+            raise self._referral_screen_error(screen, self._last_referral_problem)
 
         if skip is not None:
             self.last_referral_action = f"tapped '{skip[2]}'"
             self._log(f"[MEESHO-BOT] Referral screen: tapping '{skip[2]}' "
-                      f"({'link already tried' if self.referral_link else 'no link configured'}).")
+                      f"({self._last_referral_problem}; skip mode).")
             new_screen = await self._click(screen, skip[2])
             return new_screen
 
-        raise self._referral_screen_error(screen, f"no skip option on the screen")
+        raise self._referral_screen_error(
+            screen, self._last_referral_problem + " and the screen offers no skip option"
+        )
 
     # -- step settling -------------------------------------------------------
 
@@ -768,6 +847,7 @@ class MeeshoBotClient:
         # interruptions, then the bot's own skip option is used.
         self._referral_events = 0
         self._referral_pastes_in_flow = 0
+        self._last_referral_problem = None
         self.last_referral_action = None
 
         screen = await self._latest_screen()
@@ -900,7 +980,16 @@ class MeeshoBotClient:
         if screen.classify() == S_REFERRAL and not screen.referral_acknowledged:
             self._log("[MEESHO-BOT] Referral screen on screen before code submission; "
                       "answering it first.")
-            screen = await self._a_resolve_referral(screen)
+            try:
+                screen = await self._a_resolve_referral(screen)
+            except MeeshoBotReferralError as exc:
+                # "stop" mode: never guess. Report the referral failure with the
+                # code context so the activation can be handled deliberately.
+                raise MeeshoBotReferralError(
+                    f"The referral step could not be completed while the OTP code "
+                    f"was pending ({exc}); code {code} was NOT submitted",
+                    exc.screen_text, exc.buttons,
+                ) from exc
             if screen.classify() != S_OTP_WAIT:
                 raise MeeshoBotUnknownScreen(
                     f"Bot is not waiting for the OTP code anymore "

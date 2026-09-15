@@ -11,11 +11,13 @@ When disabled or not configured, the tool behaves exactly as before (manual
 ## What it does automatically
 
 1. `/start` → **Add Account** → **Login with Number**
-2. **Referral step** — the bot asks for a Meesho referral link here
-   (🔗 *Set Refer Link* / 🎁 *Referral link?*), **before** the Normal/Auto login
-   mode. With `referral_link` configured the link is pasted once per login;
-   without one the bot's own **🚫 I don't have a refer code** option is tapped.
-   The step is never Cancel-ed and never gets the phone number typed into it
+2. **Referral step (optional — the bot does not always show it)** — when it does
+   (🔗 *Set Refer Link* / 🎁 *Referral link?*), it appears **before** the
+   Normal/Auto login mode and the configured `referral_link` is pasted for it
+   (the bot commonly asks twice per login: once to save the link, once per
+   account — see `max_referral_pastes`). If the screen never appears the login
+   simply continues. The step is never Cancel-ed and never gets the phone number
+   or the OTP code typed into it
 3. **Normal** login mode
 4. Reads the offer's `UPI · ₹` price and taps **Try Another Offer** until
    UPI ≤ `target_upi_price` (default ₹47; configurable), before any number is spent
@@ -29,33 +31,56 @@ When disabled or not configured, the tool behaves exactly as before (manual
    during recovery is answered the same way, so a paid number is never typed
    into the referral field or lost behind that screen
 
-## Referral link (optional but recommended)
+## Referral link
 
-Paste your Meesho referral link once and the bot can attach it to every new
-account. Two ways to save it:
+Paste your Meesho referral link once and it is given to the bot whenever the
+bot asks for it. Three ways to set it:
+
+**1. From Telegram (no restart needed)** — send to your notification bot:
+
+```
+/referral https://app.meesho.com/...?via=...
+```
+
+`/referral` alone shows the current setting, `/referral off` clears it. The link
+is saved into `config.json` and applied to the running userbot immediately.
+
+**2. From the CLI**
 
 ```
 python main.py --set-referral-link "https://app.meesho.com/...?via=..."
+python main.py --no-referral-link     # clear it
 ```
 
-or edit `config.json` → `meesho_bot.referral_link` directly. Remove it again
-with `python main.py --no-referral-link`.
+**3. Directly** — `config.json` → `meesho_bot.referral_link`.
 
-Behaviour is the same either way from the coordinator's point of view; the
-notification for a triggered OTP reports which referral action was taken
+### If the link cannot be used: `referral_failure_action`
+
+This is the important switch. It applies when the bot **does** show the referral
+screen and the link cannot be delivered (nothing set, the bot rejects it, or it
+keeps asking after the paste budget):
+
+| `referral_failure_action` | Behaviour |
+|---|---|
+| `"stop"` (default) | 🛑 Stop the automation, send a max-priority alert with the screen, its buttons and the reason, cancel the number, and **verify the refund tallied** — nothing was submitted to Meesho, so no money may leak. Nothing new is purchased until you fix the link and `/run` again. |
+| `"skip"` | Tap the bot's own **🚫 I don't have a refer code** option and continue the login without a referral. |
+
+When the bot does **not** show the referral screen, the flow continues normally in
+both modes — a missing link never blocks a login that never asks for one.
+
+* `max_referral_pastes` (default **2**) — the bot usually asks twice per login
+  (save-the-link screen, then the per-account prompt), so the link is pasted once
+  for each prompt. A **rejected** link is never retried.
+* `max_referral_events` (default 4) — how many times the referral screen may
+  interrupt one login before the flow stops rather than guessing.
+* **Change Number recovery never involves the referral screen** (the bot goes
+  straight back to the number prompt), and the flow is verified for that path:
+  the replacement number is only sent once the bot actually shows the number
+  prompt, so it can never land in a referral field.
+
+The OTP notification reports which referral action was taken
 (`Referral: pasted referral link` / `Referral: tapped '🚫 I don't have a refer
-code'`).
-
-* The `🔗 Set Refer Link` variant shows **🏠 Main Menu** but no skip button, so
-  a configured link is what keeps that login alive. The `🎁 Referral link?`
-  variant always offers a skip option, so it works with or without a link.
-* A rejected/expired link is detected (invalid / expired / already used) and the
-  bot's skip option is used for the rest of that login, so the account creation
-  still goes through.
-* A link is pasted **at most once per login** (`max_referral_pastes`); if the bot
-  asks again the skip option is used instead.
-* The referral prompt may re-appear up to `max_referral_events` times per login
-  (default 3). Beyond that the flow stops with an alert rather than guessing.
+code'`), and `/status` shows the configured link plus the failure action.
 
 Check what the bot currently shows, and how the flow classifies it, without
 sending any number:
@@ -111,8 +136,9 @@ auto mode) instead of being lost.
      "bot_username": "@THE_BOT_USERNAME",
      "login_mode": "Normal",
      "referral_link": "https://app.meesho.com/...?via=...",
-     "max_referral_pastes": 1,
-     "max_referral_events": 3,
+     "referral_failure_action": "stop",
+     "max_referral_pastes": 2,
+     "max_referral_events": 4,
      "target_upi_price": 47,
      "max_offer_rerolls": 30,
      "max_change_number": 5,
@@ -123,11 +149,13 @@ auto mode) instead of being lost.
 
    **The bot's @username is required** — it is not visible in the screenshots.
    `human_delay_seconds` randomizes pauses between taps for human-like timing.
-   `referral_link` may be left empty: the bot's own "I don't have a refer code"
-   button is then used at the referral step (see the section above).
+   `referral_link` may be left empty, but then the automation stops and reports
+   if the bot asks for a referral link (`referral_failure_action: "stop"`, the
+   default). Set it from Telegram with `/referral <link>` while the tool runs —
+   no config edit or restart needed.
 
 6. Counters (`accounts_linked`, `otp_wrong`, `otp_expired`, `user_blocked`,
-   `otp_timeout`, `change_number`, `referral_pasted/skipped`,
+   `otp_timeout`, `change_number`, `offer_rerolls`, `referral_pasted/skipped`,
    `refunds_verified/missing`, `late_otp_salvaged`) persist in `stats.json` and
    are shown via `/status` and
    in every event notification. Set `automation.stop_after_success` to `true`
@@ -137,12 +165,14 @@ auto mode) instead of being lost.
 
 | Bot screen | Action |
 |---|---|
-| Referral link prompt (🎁 / 🔗 Set Refer Link) | paste `referral_link` once, else tap **🚫 I don't have a refer code**; continue the login |
-| Referral link rejected (invalid / expired) | fall back to the skip option for that login, continue |
-| Referral prompt that cannot be answered (no link configured and no skip button) | stop with an alert naming the config key, the screen text and the buttons offered — the number is cancelled with its refund verified, never typed into the referral field |
+| Referral link prompt (🎁 / 🔗 Set Refer Link) | paste `referral_link` for each prompt (up to `max_referral_pastes`), then continue the login |
+| Referral link rejected, or asked again after the paste budget | `"stop"`: 🛑 stop, report, cancel the number + verify the refund. `"skip"`: tap **🚫 I don't have a refer code** and continue |
+| Referral prompt with no link configured | `"stop"`: 🛑 stop, report, cancel the number + verify the refund. `"skip"`: tap the skip option and continue |
+| Referral screen never appears | nothing to do — the login continues normally (verified for the Change Number path too) |
 | Wrong / incorrect OTP | count `otp_wrong`, Change Number, verify refund, continue |
 | OTP expired | count `otp_expired`, Change Number, continue |
 | Number blocked / banned / already registered | count `user_blocked`, cancel/reset, continue |
 | Unknown/unexpected screen | alert with the screen text **and the buttons**, cancel the number (refund verified — nothing was submitted), reset flow |
 | Change Number used > `max_change_number` in a row | reset to main menu (full flow restart) |
+| Change Number recovery | never shows the referral screen; the replacement number is sent only at the number prompt |
 | Refund not credited | 🛑 stop everything + critical alert |

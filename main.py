@@ -46,6 +46,7 @@ from balance_guard import BalanceGuard
 from meesho_bot_client import (
     MeeshoBotClient,
     MeeshoBotError,
+    MeeshoBotReferralError,
     MeeshoBotUnknownScreen,
 )
 from notifier import Notifier
@@ -136,7 +137,8 @@ class ParallelAutomationCoordinator:
             status_cb=self.get_status_summary,
             balance_cb=self.get_balances_summary,
             run_cb=self.request_run,
-            stop_cb=self.request_stop
+            stop_cb=self.request_stop,
+            referral_cb=self.command_referral_link
         )
 
     # -- Ledger helpers ------------------------------------------------------
@@ -210,6 +212,11 @@ class ParallelAutomationCoordinator:
                     f"({self.active_target.provider_name.upper()})"
                 )
 
+        if self.bot.ready or self.bot.referral_link:
+            link = self.bot.referral_link
+            shown = f"{link[:48]}..." if len(link) > 51 else (link or "(not set)")
+            lines.append(f"Referral: {shown} | on failure: {self.bot.referral_failure_action}")
+
         if self.worker_statuses:
             lines.append("\nWorkers:")
             for name, st in self.worker_statuses.items():
@@ -232,6 +239,70 @@ class ParallelAutomationCoordinator:
 
         lines.append("\n" + self.get_balances_summary())
         return "\n".join(lines)
+
+    # -- Referral link (config + Telegram /referral command) -----------------
+
+    def referral_status_text(self):
+        link = self.bot.referral_link or "(not set)"
+        mode = self.bot.referral_failure_action
+        if mode == "stop":
+            behaviour = ("if the bot asks for a referral link and this link cannot be "
+                         "used, the automation stops, reports it and cancels the number "
+                         "with a refund check")
+        else:
+            behaviour = ("if the bot asks for a referral link and this link cannot be "
+                         "used, the bot's own \u201cI don't have a refer code\u201d button "
+                         "is tapped and the login continues")
+        return (f"Referral link: {link}\n"
+                f"Failure action: {mode}\n\n{behaviour}\n\n"
+                "Commands:\n"
+                "• /referral <link> - save a link\n"
+                "• /referral off - clear it\n"
+                "• /referral - show this")
+
+    def command_referral_link(self, argument):
+        """
+        Telegram /referral handler. Saves the link to config.json AND applies it
+        to the running userbot. Returns the reply text for the chat.
+        """
+        argument = (argument or "").strip()
+        lowered = argument.lower()
+
+        if lowered in ("", "status", "show", "?"):
+            return self.referral_status_text()
+
+        if lowered in ("off", "none", "clear", "remove", "delete", "reset"):
+            link = ""
+        else:
+            link = argument
+            if not (link.lower().startswith("http") and "meesho" in link.lower()):
+                return ("❌ That does not look like a Meesho referral link (it should "
+                        "start with http and contain app.meesho.com).\n"
+                        "Nothing was changed.\n\n" + self.referral_status_text())
+
+        config_path = next((name for name in CONFIG_FILES if os.path.exists(name)), None)
+        if config_path is None:
+            return ("❌ config.json was not found, so the link could not be saved.\n"
+                    "Use the CLI instead: python main.py --set-referral-link <link>")
+
+        try:
+            set_referral_link(config_path, link)
+        except Exception as exc:
+            return f"❌ Could not update {config_path}: {exc}"
+
+        previous = self.bot.set_referral_link(link)
+        log(f"Referral link {'set' if link else 'cleared'} via Telegram command "
+            f"(was: {previous or 'not set'}).")
+
+        if link:
+            return (f"✅ Referral link saved to {config_path} and applied now.\n"
+                    f"{link}\n\n"
+                    f"It is pasted once per login when the bot asks for it "
+                    f"(failure action: {self.bot.referral_failure_action}).")
+        return ("✅ Referral link cleared. If the bot now asks for a referral link, "
+                "the automation stops, reports it and cancels the number with a "
+                'refund check (change meesho_bot.referral_failure_action to "skip" '
+                "to continue without a link instead).")
 
     def request_run(self):
         if self.is_running:
@@ -636,6 +707,42 @@ class ParallelAutomationCoordinator:
                 res = self.bot.continue_with_number(number)
             else:
                 res = self.bot.prepare_login(number)
+        except MeeshoBotReferralError as exc:
+            # referral_failure_action = "stop": the login must not continue
+            # without the configured referral link. Cancel the number (nothing
+            # was submitted to Meesho, so the refund must tally), report why,
+            # and stop the automation until the link is fixed.
+            log(f"PRIMES bot referral step failed: {exc}", prefix=pname)
+            buttons = getattr(exc, "buttons", None)
+            buttons_line = f"Buttons: {' / '.join(buttons)}\n\n" if buttons else ""
+            try:
+                self.bot.cancel_flow()
+            except Exception as exc2:
+                log(f"Reset of the bot flow failed ({exc2}); a manual /start may be needed.",
+                    prefix=pname)
+            self.bot_at_number_prompt = False
+            self.bot_change_attempts = 0
+            refund = self.handle_cancellation(
+                context.client, context.activation_id, number,
+                "PRIMES referral step failed", expect_refund=True
+            )
+            refund_line = (
+                "Refund tally: ✅ balanced (no money lost)." if refund.get("tally_ok") is not False
+                else "Refund tally: ❌ NOT verified - check the provider panel."
+            )
+            self._critical_stop(
+                f"[{pname}] Referral step failed - automation stopped",
+                f"Number: {number} was cancelled before it reached Meesho.\n"
+                f"Reason: {exc}\n\n"
+                f"Screen:\n{exc.screen_text[:600]}\n\n{buttons_line}"
+                f"{refund_line}\n\n"
+                "Fix the referral link, then start again:\n"
+                "• Telegram: /referral <your Meesho referral link>\n"
+                "• CLI: python main.py --set-referral-link <link>\n"
+                "• Or allow logins without it: set meesho_bot.referral_failure_action "
+                'to "skip".'
+            )
+            return None
         except MeeshoBotUnknownScreen as exc:
             log(f"PRIMES bot unexpected screen: {exc}; screen: {exc.screen_text[:300]}", prefix=pname)
             buttons = getattr(exc, "buttons", None)
@@ -720,6 +827,25 @@ class ParallelAutomationCoordinator:
         log(f"Submitting OTP {code} to PRIMES bot...", prefix=pname)
         try:
             res = self.bot.submit_otp(code)
+        except MeeshoBotReferralError as exc:
+            # The referral step broke the login after the SMS was already
+            # delivered: surface it, stop the automation, and let the caller's
+            # recovery finish the activation off (the charge legitimately stands).
+            self.notify.alert(
+                f"🛑 [{pname}] Referral step failed after OTP - stopping",
+                f"Number: {context.clean_number}\nCode: `{code}`\n\n{exc}\n\n"
+                f"Screen:\n{exc.screen_text[:600]}\n\n"
+                "The code was NOT submitted - use it manually if the account is "
+                "still pending.\n"
+                "Fix the link (/referral <link>) or set "
+                'meesho_bot.referral_failure_action to "skip", then start again.'
+            )
+            self._critical_stop(
+                f"[{pname}] Referral step failed after OTP",
+                f"Number: {context.clean_number} could not complete the login and "
+                f"the SMS was already consumed (charge stands). Automation stopped."
+            )
+            return "unknown"
         except MeeshoBotUnknownScreen as exc:
             buttons = getattr(exc, "buttons", None)
             buttons_line = f"Buttons: {' / '.join(buttons)}\n\n" if buttons else ""
@@ -977,6 +1103,14 @@ class ParallelAutomationCoordinator:
             if started and self.bot.ready:
                 log(f"PRIMES bot automation ENABLED for {self.bot.bot_username}")
                 log(f"Referral step: {self.bot.referral_summary}")
+                if self.bot.referral_required and not self.bot.referral_link:
+                    log("WARNING: no referral link is configured. The referral screen "
+                        "may not appear at all (the flow then runs normally), but if it "
+                        "does appear the automation will stop, report it and cancel the "
+                        "number. Set it with Telegram /referral <link> or "
+                        "python main.py --set-referral-link <link>, or set "
+                        "meesho_bot.referral_failure_action to \"skip\" to log in without "
+                        "a link.")
             else:
                 log(f"PRIMES bot automation unavailable ({self.bot.start_error}); using manual trigger flow.")
                 if not self._bot_warned:
