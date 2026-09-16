@@ -93,11 +93,24 @@ class ParallelAutomationCoordinator:
 
         self.checker = CheckerClient(
             base_url=self.checker_conf.get("base_url", "https://superassets.in"),
-            api_key=self.checker_conf.get("api_key", "")
+            api_key=self.checker_conf.get("api_key", ""),
+            api_keys=self.checker_conf.get("api_keys"),
+            timeout=self.checker_conf.get("timeout", 15),
+            max_retries=self.checker_conf.get("max_retries", 10),
+            max_retry_wait_seconds=self.checker_conf.get("max_retry_wait_seconds", 45.0),
+            min_interval_seconds=self.checker_conf.get("min_interval_seconds", 1.0),
+            rate_limit_buffer_seconds=self.checker_conf.get("rate_limit_buffer_seconds", 0.5),
+            network_backoff_seconds=self.checker_conf.get("network_backoff_seconds", 1.5),
+            log_fn=log
         )
 
         self.checker_service = self.checker_conf.get("service", "meesho")
         self.target_registered = self.settings.get("target_registered", False)
+        log(
+            f"Checker ready: {self.checker.key_count()} API key(s), "
+            f"service '{self.checker_service}', "
+            f"retry budget {self.checker.max_retry_wait_seconds:.0f}s"
+        )
 
         self.state = StateStore()
         self.stats = StatsStore()

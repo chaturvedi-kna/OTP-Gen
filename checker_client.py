@@ -1,4 +1,34 @@
+"""
+Client for the Meesho registration checker API (superassets.in).
+
+The checker rate limits per API key per service: HTTP 429 with a body like
+{"detail": "Rate limit exceeded. Please wait 4.6s for service 'meesho'"}.
+Several parallel provider workers validate through this one client, so it is
+built to absorb that instead of failing activations:
+
+  1. Retries a check on HTTP 429, honouring the wait the server asks for
+     (parsed from the body hint or the Retry-After header) - a rate limit is
+     never worth cancelling a paid number over.
+  2. Rotates across multiple API keys (config "checker"."api_keys", with the
+     legacy single "api_key" still supported); each key has independent
+     rate-limit state, so N keys give roughly N times the throughput.
+  3. Paces itself per (api_key, service): after a 429 it remembers the
+     spacing the server demanded, so later workers wait their turn instead of
+     bursting into more 429s.
+  4. Retries transient failures (network errors, HTTP 5xx) with a short
+     backoff.
+  5. All of the above is bounded by a retry budget (max_retries and
+     max_retry_wait_seconds); only when the budget is genuinely exhausted
+     does it raise, and the caller's cancel path takes over as a last resort.
+
+API keys rejected with 401/403 are retired for the rest of the run; the client
+keeps rotating through the remaining ones.
+"""
+
 import re
+import threading
+import time
+
 import requests
 
 
@@ -10,13 +40,31 @@ class CheckerUnavailable(CheckerError):
     pass
 
 
+class CheckerRateLimited(CheckerUnavailable):
+    """Raised when the retry budget is exhausted under HTTP 429 rate limiting."""
+
+
+# Matches the server hint: "Please wait 4.6s for service 'meesho'"
+_RATE_LIMIT_WAIT_RE = re.compile(r"wait(?:ing)?\s+([\d.]+)\s*s", re.IGNORECASE)
+
+# Fallback when a 429 carries no parseable wait hint.
+_DEFAULT_RATE_LIMIT_WAIT = 1.0
+
+
 class CheckerClient:
 
     def __init__(
         self,
         base_url,
-        api_key,
-        timeout=15
+        api_key=None,
+        api_keys=None,
+        timeout=15,
+        max_retries=10,
+        max_retry_wait_seconds=45.0,
+        min_interval_seconds=1.0,
+        rate_limit_buffer_seconds=0.5,
+        network_backoff_seconds=1.5,
+        log_fn=None
     ):
         base = base_url.strip().rstrip("/")
         if base.endswith("/api/v1/check"):
@@ -26,8 +74,104 @@ class CheckerClient:
         else:
             self.endpoint_url = f"{base}/api/v1/check"
 
-        self.api_key = api_key
         self.timeout = timeout
+        self.max_retries = max(1, int(max_retries))
+        self.max_retry_wait_seconds = float(max_retry_wait_seconds)
+        self.min_interval_seconds = max(0.0, float(min_interval_seconds))
+        self.rate_limit_buffer_seconds = max(0.0, float(rate_limit_buffer_seconds))
+        self.network_backoff_seconds = max(0.0, float(network_backoff_seconds))
+        self._log_fn = log_fn
+
+        self._keys = self._resolve_keys(api_key, api_keys)
+        self._bad_keys = set()
+        # (api_key, service) -> {"available_at": monotonic, "pace": seconds}
+        self._slots = {}
+        self._lock = threading.Lock()
+
+    # -- Setup helpers -------------------------------------------------------
+
+    @staticmethod
+    def _resolve_keys(api_key, api_keys):
+        """Merge legacy single api_key and the multi-key list, dropping dupes."""
+        keys = []
+        if isinstance(api_keys, str):
+            api_keys = [part.strip() for part in api_keys.split(",")]
+        for key in (api_keys or []):
+            key = (key or "").strip()
+            if key and key not in keys:
+                keys.append(key)
+        single = (api_key or "").strip()
+        if single and single not in keys:
+            keys.append(single)
+        return keys
+
+    def key_count(self):
+        return len(self._keys)
+
+    def usable_key_count(self):
+        with self._lock:
+            return sum(1 for key in self._keys if key not in self._bad_keys)
+
+    def _log(self, message):
+        if self._log_fn:
+            try:
+                self._log_fn(message)
+            except Exception:
+                pass
+
+    # -- Rate-limit bookkeeping ----------------------------------------------
+
+    def _slot(self, api_key, service):
+        return self._slots.setdefault(
+            (api_key, service), {"available_at": 0.0, "pace": 0.0}
+        )
+
+    def _acquire(self, service):
+        """
+        Pick the usable key that becomes free soonest and reserve it.
+
+        Returns (api_key, ready_at_monotonic). The caller must not fire before
+        ready_at. Reserving bumps the slot so a concurrent worker picks
+        another key (or waits) instead of bursting onto the same one.
+        """
+        with self._lock:
+            usable = [k for k in self._keys if k not in self._bad_keys]
+            if not usable:
+                raise CheckerError(
+                    f"Checker authentication failed: all {len(self._keys)} "
+                    "API keys were rejected (HTTP 401/403)"
+                )
+            best_key = None
+            best_ready = None
+            for key in usable:
+                ready = self._slot(key, service)["available_at"]
+                if best_ready is None or ready < best_ready:
+                    best_key, best_ready = key, ready
+            slot = self._slot(best_key, service)
+            now = time.monotonic()
+            ready = max(now, best_ready)
+            slot["available_at"] = ready + max(slot["pace"], self.min_interval_seconds)
+            return best_key, ready
+
+    def _postpone(self, service, api_key, wait_seconds):
+        """After a 429: push the slot out and remember the demanded spacing."""
+        pause = max(0.0, float(wait_seconds)) + self.rate_limit_buffer_seconds
+        with self._lock:
+            slot = self._slot(api_key, service)
+            slot["pace"] = max(slot["pace"], pause)
+            slot["available_at"] = max(
+                slot["available_at"], time.monotonic() + pause
+            )
+
+    def _disable_key(self, api_key):
+        with self._lock:
+            self._bad_keys.add(api_key)
+
+    @staticmethod
+    def _key_tag(api_key):
+        return f"...{api_key[-4:]}" if api_key else "<empty key>"
+
+    # -- HTTP ----------------------------------------------------------------
 
     @staticmethod
     def format_number(number):
@@ -46,69 +190,164 @@ class CheckerClient:
             return cleaned[-10:]
         return cleaned
 
+    @staticmethod
+    def _parse_retry_after(response):
+        """Best-effort wait hint: Retry-After header, else the 429 body text."""
+        header = (response.headers or {}).get("Retry-After")
+        if header:
+            try:
+                return max(0.0, float(header))
+            except (TypeError, ValueError):
+                pass
+        match = _RATE_LIMIT_WAIT_RE.search(response.text or "")
+        if match:
+            try:
+                return max(0.0, float(match.group(1)))
+            except ValueError:
+                pass
+        return _DEFAULT_RATE_LIMIT_WAIT
+
     def check(self, service, number):
+        """
+        Check one number, absorbing rate limits and transient errors.
+
+        Raises CheckerRateLimited only when the whole retry budget is spent
+        under 429s, CheckerUnavailable for persistent network/5xx trouble,
+        and CheckerError for definitive failures (bad request, dead keys).
+        """
         formatted_number = self.format_number(number)
+        deadline = time.monotonic() + self.max_retry_wait_seconds
+        attempt = 0
+        last_error = None
 
-        try:
-            response = requests.post(
-                self.endpoint_url,
-                headers={
-                    "x-api-key": self.api_key,
-                    "accept": "application/json",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "service": service,
-                    "number": formatted_number
-                },
-                timeout=self.timeout
-            )
+        while True:
+            attempt += 1
+            api_key, ready_at = self._acquire(service)
 
-        except requests.RequestException as exc:
-            raise CheckerUnavailable(f"Checker network error: {exc}")
+            delay = ready_at - time.monotonic()
+            if delay > 0:
+                if ready_at > deadline:
+                    raise last_error or CheckerRateLimited(
+                        f"Rate limited and retry window "
+                        f"({self.max_retry_wait_seconds:.0f}s) too small to wait "
+                        f"{delay:.1f}s for a free key"
+                    )
+                self._log(
+                    f"Checker: pacing - waiting {delay:.1f}s for key "
+                    f"{self._key_tag(api_key)} ({service})"
+                )
+                time.sleep(delay)
 
-        if response.status_code >= 500:
-            raise CheckerUnavailable(
-                f"HTTP {response.status_code}: {response.text}"
-            )
+            try:
+                response = requests.post(
+                    self.endpoint_url,
+                    headers={
+                        "x-api-key": api_key,
+                        "accept": "application/json",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "service": service,
+                        "number": formatted_number
+                    },
+                    timeout=self.timeout
+                )
+            except requests.RequestException as exc:
+                last_error = CheckerUnavailable(f"Checker network error: {exc}")
+                if attempt >= self.max_retries or time.monotonic() >= deadline:
+                    raise last_error
+                self._log(
+                    f"Checker network error ({exc}); retry "
+                    f"{attempt}/{self.max_retries} in "
+                    f"{self.network_backoff_seconds:.1f}s"
+                )
+                time.sleep(self.network_backoff_seconds)
+                continue
 
-        if response.status_code in (401, 403):
-            raise CheckerError(
-                f"Checker authentication failed (HTTP {response.status_code}): Invalid or missing API key"
-            )
+            status = response.status_code
 
-        if response.status_code >= 400:
-            raise CheckerError(
-                f"HTTP {response.status_code}: {response.text}"
-            )
+            if status == 429:
+                wait = self._parse_retry_after(response)
+                self._postpone(service, api_key, wait)
+                last_error = CheckerRateLimited(
+                    f"HTTP 429 rate limited: {response.text[:200]}"
+                )
+                if (
+                    attempt >= self.max_retries
+                    or time.monotonic() + wait >= deadline
+                ):
+                    raise last_error
+                self._log(
+                    f"Checker rate limited on key {self._key_tag(api_key)}: "
+                    f"server asked to wait {wait:.1f}s; retry "
+                    f"{attempt}/{self.max_retries}"
+                )
+                continue
 
-        try:
-            data = response.json()
-        except ValueError:
-            raise CheckerError(
-                f"Checker returned non-JSON response: {response.text[:200]}"
-            )
+            if status in (401, 403):
+                self._disable_key(api_key)
+                remaining = self.usable_key_count()
+                if remaining == 0:
+                    raise CheckerError(
+                        f"Checker authentication failed (HTTP {status}): all "
+                        f"{len(self._keys)} API keys invalid or missing"
+                    )
+                last_error = CheckerError(
+                    f"Checker rejected key {self._key_tag(api_key)} "
+                    f"(HTTP {status})"
+                )
+                self._log(
+                    f"Checker key {self._key_tag(api_key)} rejected "
+                    f"(HTTP {status}); rotating - {remaining} usable key(s) left"
+                )
+                continue
 
-        if not isinstance(data, dict):
-            raise CheckerError(
-                f"Checker returned unexpected format: {data}"
-            )
+            if status >= 500:
+                last_error = CheckerUnavailable(
+                    f"HTTP {status}: {response.text}"
+                )
+                if attempt >= self.max_retries or time.monotonic() >= deadline:
+                    raise last_error
+                self._log(
+                    f"Checker server error (HTTP {status}); retry "
+                    f"{attempt}/{self.max_retries} in "
+                    f"{self.network_backoff_seconds:.1f}s"
+                )
+                time.sleep(self.network_backoff_seconds)
+                continue
 
-        # Handle service down status
-        if data.get("is_down") is True:
-            raise CheckerUnavailable(
-                "Checker reports service is_down=true"
-            )
+            if status >= 400:
+                raise CheckerError(
+                    f"HTTP {status}: {response.text}"
+                )
 
-        # Handle unsuccessful response
-        if not data.get("success", False):
-            msg = data.get("message") or data.get("error") or "Checker returned success=false"
-            raise CheckerError(f"Checker error: {msg}")
+            try:
+                data = response.json()
+            except ValueError:
+                raise CheckerError(
+                    f"Checker returned non-JSON response: {response.text[:200]}"
+                )
 
-        # Ensure required field is present
-        if "is_registered" not in data:
-            raise CheckerError(
-                f"Checker response missing required 'is_registered' field: {data}"
-            )
+            if not isinstance(data, dict):
+                raise CheckerError(
+                    f"Checker returned unexpected format: {data}"
+                )
 
-        return data
+            # Handle service down status
+            if data.get("is_down") is True:
+                raise CheckerUnavailable(
+                    "Checker reports service is_down=true"
+                )
+
+            # Handle unsuccessful response
+            if not data.get("success", False):
+                msg = data.get("message") or data.get("error") or "Checker returned success=false"
+                raise CheckerError(f"Checker error: {msg}")
+
+            # Ensure required field is present
+            if "is_registered" not in data:
+                raise CheckerError(
+                    f"Checker response missing required 'is_registered' field: {data}"
+                )
+
+            return data
