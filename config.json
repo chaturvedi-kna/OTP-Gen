@@ -49,8 +49,15 @@
 
   "checker": {
     "base_url": "https://superassets.in",
-    "api_key": "AK__3b9HMjWPCtV8_kNsN4npV64lwPVqdAa",
-    "service": "meesho"
+    "api_keys": [
+      "AK__3b9HMjWPCtV8_kNsN4npV64lwPVqdAa"
+    ],
+    "service": "meesho",
+    "max_retries": 10,
+    "max_retry_wait_seconds": 45.0,
+    "min_interval_seconds": 1.0,
+    "rate_limit_buffer_seconds": 0.5,
+    "network_backoff_seconds": 1.5
   },
 
   "balance_guard": {
