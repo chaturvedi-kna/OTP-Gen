@@ -84,6 +84,47 @@ OFFER = Screen(
 
 OTP_WAIT = Screen("📩 OTP on its way to your number.", [["🔄 Change Number"]])
 
+# ---------------------------------------------------------------------------
+# The real checker screens, transcribed from the screenshots of the live bot
+# (used by the "real screens" scenario at the bottom of this file).
+# ---------------------------------------------------------------------------
+
+REAL_MENU = Screen(
+    "🛍️ PRIMES Meesho\n"
+    "Your personal Meesho shopping concierge\n"
+    "________\n\n"
+    "💰 Wallet · ₹0.00\n"
+    "👤 Accounts · 24 linked\n\n"
+    "✦ Service fee — ₹10.00 per order\n\n"
+    "Pick an option below to get started 👇",
+    [["🛍️ Open Shop"],
+     ["➕ Add Account", "👤 My Accounts"],
+     ["💵 Add Funds", "📜 History"],
+     ["🔍 Check Number", "🔗 Set Refer Link"],
+     ["📍 Change Address"],
+     ["🎁 Claim All Refunds", "🎁 How Offer Works"],
+     ["👤 Manage Accounts", "🏷️ Check Price"]],
+)
+
+REAL_CHECK_PROMPT = Screen(
+    "🔍 Check Number\n\n"
+    "Send the 10-digit mobile number you want to verify.\n"
+    "I'll tell you if it's registered on Meesho.",
+    [["✖️ Cancel"]],
+)
+
+REAL_RESULT_REGISTERED = Screen(
+    "🔍 +91 7637803667\n\n"
+    "✅ Registered on Meesho.",
+    [["🔍 Check Another"], ["🏠 Main Menu"]],
+)
+
+REAL_RESULT_NOT_REGISTERED = Screen(
+    "🔍 +91 8897006968\n\n"
+    "❌ Not Registered on Meesho.",
+    [["🔍 Check Another"], ["🏠 Main Menu"]],
+)
+
 
 # ---------------------------------------------------------------------------
 # Fake Telethon
@@ -114,7 +155,7 @@ class FakeBot(object):
 
     def __init__(self, check_button=True, results=None, checking_polls=0,
                  command="/check {number}", checker_copy="standard",
-                 start_state="menu", default_result=None):
+                 start_state="menu", default_result=None, real_screens=False):
         self.taps = []
         self.messages = []
         self.next_id = 1000
@@ -127,10 +168,11 @@ class FakeBot(object):
         self.sent_numbers = []                   # numbers typed into the checker
         self.sent_texts = []                     # every plain message sent
         self.state = start_state
+        self.real_screens = real_screens
         self.active_checks = 0
         self.max_concurrent_checks = 0
         self._pending_result = None
-        self._push(MAIN_MENU if check_button else MAIN_MENU_NO_CHECKER)
+        self._push(self._menu_screen())
 
     # -- helpers -----------------------------------------------------------
 
@@ -151,7 +193,19 @@ class FakeBot(object):
     def last(self):
         return self.messages[-1]
 
+    def _menu_screen(self):
+        if self.real_screens:
+            return REAL_MENU
+        return MAIN_MENU if self.check_button else MAIN_MENU_NO_CHECKER
+
+    def _prompt_screen(self):
+        return REAL_CHECK_PROMPT if self.real_screens else CHECK_PROMPT
+
     def _result_screen(self, number, verdict):
+        if self.real_screens:
+            template = REAL_RESULT_REGISTERED if verdict else REAL_RESULT_NOT_REGISTERED
+            other = "7637803667" if verdict else "8897006968"
+            return Screen(template.text.replace(other, number), template.buttons)
         if self.checker_copy == "caps":
             text = ("🔍 NUMBER CHECK 🔍\n\n" + number + "\n\n"
                     + ("✅ ALREADY REGISTERED ON MEESHO" if verdict
@@ -168,13 +222,13 @@ class FakeBot(object):
     async def on_tap(self, label):
         if "Check Number" in label or "Number Status" in label:
             self.state = "check_prompt"
-            self._edit_last(CHECK_PROMPT)
+            self._edit_last(self._prompt_screen())
         elif "Main Menu" in label:
             self.state = "menu"
-            self._edit_last(MAIN_MENU if self.check_button else MAIN_MENU_NO_CHECKER)
+            self._edit_last(self._menu_screen())
         elif "Cancel" in label:
             self.state = "menu"
-            self._edit_last(MAIN_MENU if self.check_button else MAIN_MENU_NO_CHECKER)
+            self._edit_last(self._menu_screen())
 
     async def on_message(self, text):
         stripped = text.strip()
@@ -189,7 +243,7 @@ class FakeBot(object):
             return
         if stripped == "/start":
             self.state = "menu"
-            self._push(MAIN_MENU if self.check_button else MAIN_MENU_NO_CHECKER)
+            self._push(self._menu_screen())
 
     async def _run_check(self, number):
         self.active_checks += 1
@@ -512,6 +566,52 @@ def test_checks_are_serialized():
           sorted(r["is_registered"] for r in results) == [False, True], results)
 
 
+def test_real_screens_from_screenshots():
+    """
+    The exact live-bot sequence: main menu -> [🔍 Check Number] -> 'Send the
+    10-digit mobile number you want to verify. I'll tell you if it's registered
+    on Meesho.' [✖️ Cancel] -> number -> '✅ Registered on Meesho.' /
+    '❌ Not Registered on Meesho.' [🔍 Check Another] [🏠 Main Menu].
+    """
+    check("real menu: entry button found",
+          REAL_MENU.checker_button() is not None
+          and REAL_MENU.checker_button()[2] == "🔍 Check Number",
+          REAL_MENU.checker_button())
+    check("real menu: 'Check Price' never picked",
+          (REAL_MENU.checker_button() or ("", "", ""))[2] != "🏷️ Check Price")
+    check("real prompt: classified as the number prompt",
+          REAL_CHECK_PROMPT.classify_check() == S_CHECK_PROMPT,
+          REAL_CHECK_PROMPT.looks_like_check_prompt())
+    check("real prompt: not read as a verdict (it says 'registered on Meesho')",
+          REAL_CHECK_PROMPT.check_verdict() is None, REAL_CHECK_PROMPT.check_verdict())
+    check("real result: registered screen -> True",
+          REAL_RESULT_REGISTERED.check_verdict() is True, REAL_RESULT_REGISTERED.check_verdict())
+    check("real result: not-registered screen -> False",
+          REAL_RESULT_NOT_REGISTERED.check_verdict() is False,
+          REAL_RESULT_NOT_REGISTERED.check_verdict())
+    check("real result: classified as a result",
+          REAL_RESULT_REGISTERED.classify_check() == S_CHECK_RESULT
+          and REAL_RESULT_NOT_REGISTERED.classify_check() == S_CHECK_RESULT)
+
+    client, bot = build_client(results={"7637803667": True, "8897006968": False},
+                               real_screens=True)
+    registered = client.check_registration("7637803667")
+    check("real flow: +91 number typed as 10 digits",
+          bot.sent_numbers == ["7637803667"], bot.sent_numbers)
+    check("real flow: registered verdict", registered["is_registered"] is True, registered)
+    check("real flow: entry button tapped",
+          "🔍 Check Number" in bot.taps, bot.taps)
+    check("real flow: reset via Main Menu, not 'Check Another'",
+          "🏠 Main Menu" in bot.taps and "🔍 Check Another" not in bot.taps, bot.taps)
+    check("real flow: back at the menu", bot.state == "menu", bot.state)
+
+    not_registered = client.check_registration("8897006968")
+    check("real flow: not-registered verdict",
+          not_registered["is_registered"] is False, not_registered)
+    check("real flow: second number typed once",
+          bot.sent_numbers == ["7637803667", "8897006968"], bot.sent_numbers)
+
+
 def main():
     test_screen_verdicts()
     test_registered_number()
@@ -527,6 +627,7 @@ def main():
     test_prompt_hint_variant()
     test_reset_after_check_config()
     test_checks_are_serialized()
+    test_real_screens_from_screenshots()
 
     print()
     if FAILURES:

@@ -119,13 +119,27 @@ Every fallback is logged, counted and visible:
 ## 3. `bot`: how the PRIMES bot checker is driven
 
 One check = reset to the main menu → open the checker → send the 10-digit
-number → read the verdict → back to the main menu:
+number → read the verdict → back to the main menu. The **live bot's screens
+are covered by the defaults** (verified against the recorded screens and
+locked in by `test_bot_checker_flow.py`):
 
 ```
-main menu -> [🔍 Check Number] -> "Send the 10-digit number" -> 9876543210
-          -> "🔍 Checking the number, please wait..." -> "✅ ... already registered"
-             / "❌ ... not registered" -> [🏠 Main Menu]
+/start -> [🛍️ PRIMES Meesho … 📍 Change Address / 🔍 Check Number / 🔗 Set Refer Link …]
+   tap "🔍 Check Number"
+        -> "🔍 Check Number — Send the 10-digit mobile number you want to verify.
+            I'll tell you if it's registered on Meesho."   [✖️ Cancel]
+   send 9876543210
+        -> "🔍 +91 9876543210 — ✅ Registered on Meesho."     [🔍 Check Another] [🏠 Main Menu]
+        or "🔍 +91 9876543210 — ❌ Not Registered on Meesho."  [🔍 Check Another] [🏠 Main Menu]
+   tap "🏠 Main Menu"  (never "Check Another" - that would start another check)
 ```
+
+* the menu's **🔍 Check Number** button is picked exactly; **🏷️ Check Price**,
+  **Claim All Refunds**, **Set Refer Link**, … can never be picked for it;
+* the prompt is never misread as a verdict, even though it says
+  "…tell you if it's registered on Meesho";
+* `✅ Registered on Meesho.` → `is_registered: true`,
+  `❌ Not Registered on Meesho.` → `is_registered: false`.
 
 `checker.bot` settings:
 
@@ -146,10 +160,11 @@ Matching is done on emoji-stripped, lowercased labels, so hints are plain text
 `offer`, `shop`, `wallet`, `referr`, … is never picked, so **Check Balance**
 can't be mistaken for the checker.
 
-The defaults already cover the common wording (`✅ Registered`, `❌ Not
-registered`, `already registered`, `no account`, `not linked`, `available`,
-caps variants, `🟢 number registered ✅`, …). Negative wording wins when both
-appear, and a screen that is *asking* for the number is never read as a result.
+The defaults already cover this wording (`✅ Registered on Meesho.`,
+`❌ Not Registered on Meesho.`, `already registered`, `no account`, `not
+linked`, `available`, caps variants, `🟢 number registered ✅`, …). Negative
+wording wins when both appear, and a screen that is *asking* for the number is
+never read as a result.
 
 ### Tuning it against the real bot (recommended once)
 
