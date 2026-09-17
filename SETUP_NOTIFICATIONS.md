@@ -78,6 +78,8 @@ You can interact with the running tool via Telegram anytime:
 - **`/run`**: Starts searching for fresh numbers from Telegram if the script was stopped or idle.
 - **`/balance`**: Retrieves live balances for TemporaSMS and OtpDoctor.
 - **`/stop`**: Gracefully stops the active search.
+- **`/referral <link>`**: Saves/updates the Meesho referral link (`/referral off` clears it, `/referral` shows it).
+- **`/checker api|bot|auto`**: Shows or switches the number-checker strategy (API only / PRIMES bot only / API first with the bot as fallback). See `SETUP_CHECKER.md`.
 - **`/start`**: Shows available bot commands.
 
 ## 5. Dual OTP Providers (TemporaSMS + OtpDoctor)

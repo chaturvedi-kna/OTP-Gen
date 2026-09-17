@@ -8,6 +8,21 @@ Telegram's servers; there is no screen tapping.
 When disabled or not configured, the tool behaves exactly as before (manual
 "OTP Triggered" gate in your notification bot).
 
+The same userbot can also run the **bot's own number checker** — used as a
+fallback when the checker API is down or too slow (`checker.mode: "auto"`, or
+`"bot"` to use it for every check). Screen wording, entry button and timeouts
+are configured under `"checker"` → `"bot"`; the full explanation, the tuning
+helper (`python meesho_bot_client.py <number>`) and the safety rules are in
+**SETUP_CHECKER.md** (§1–§4). Notes that concern this file:
+
+* `checker.mode: "bot"` requires this userbot to be ready — the run refuses to
+  start otherwise (numbers would otherwise be bought only to be cancelled).
+* `checker.mode: "auto"` works without the userbot; API errors then cancel the
+  number exactly as before.
+* A number check and a login flow never interleave: both use the one bot
+  conversation and are serialised, so enabling the bot checker costs nothing
+  in flow safety.
+
 ## What it does automatically
 
 1. `/start` → **Add Account** → **Login with Number**
@@ -171,6 +186,7 @@ auto mode) instead of being lost.
 
 6. Counters (`accounts_linked`, `otp_wrong`, `otp_expired`, `user_blocked`,
    `otp_timeout`, `change_number`, `offer_rerolls`, `referral_pasted/skipped`,
+   `checker_api_checks` / `checker_bot_checks` / `checker_fallbacks`,
    `refunds_verified/missing`, `late_otp_salvaged`) persist in `stats.json` and
    are shown via `/status` and
    in every event notification. Set `automation.stop_after_success` to `true`

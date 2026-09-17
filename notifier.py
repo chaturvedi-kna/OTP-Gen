@@ -182,6 +182,7 @@ class TelegramBackend:
         self.run_callback = None
         self.stop_callback = None
         self.referral_callback = None
+        self.checker_callback = None
 
     @property
     def configured(self):
@@ -445,6 +446,17 @@ class TelegramBackend:
                     self.stop_callback()
                     self.send("Automation Stopping", "⏹ Stopping active search.")
                     continue
+                elif cmd == "checker" and self.checker_callback:
+                    # /checker api|bot|auto - switch strategy; /checker alone
+                    # shows the current one.
+                    parts = raw_text.split(None, 1)
+                    argument = parts[1].strip() if len(parts) > 1 else ""
+                    try:
+                        reply = self.checker_callback(argument)
+                    except Exception as exc:
+                        reply = f"❌ Checker command failed: {exc}"
+                    self.send("Checker Mode", reply or "Checker command handled.")
+                    continue
                 elif cmd == "referral" and self.referral_callback:
                     # /referral <link> - save; /referral off - clear;
                     # /referral alone - show the current setting.
@@ -465,6 +477,8 @@ class TelegramBackend:
                         "💰 /balance - Check live balances on all providers\n"
                         "🎁 /referral <link> - Save the Meesho referral link "
                         "(/referral off to clear, /referral to show)\n"
+                        "🔎 /checker api|bot|auto - Number checker strategy "
+                        "(/checker to show)\n"
                         "⏹ /stop - Stop running search"
                     )
                     continue
@@ -516,16 +530,17 @@ class Notifier:
         SIGNAL_DIR.mkdir(exist_ok=True)
 
     def set_command_callbacks(self, status_cb=None, balance_cb=None, run_cb=None,
-                              stop_cb=None, referral_cb=None):
+                              stop_cb=None, referral_cb=None, checker_cb=None):
         """
         Attach callbacks for interactive Telegram commands (/status, /balance,
-        /run, /stop, /referral <link>).
+        /run, /stop, /referral <link>, /checker <mode>).
         """
         self.telegram.status_callback = status_cb
         self.telegram.balance_callback = balance_cb
         self.telegram.run_callback = run_cb
         self.telegram.stop_callback = stop_cb
         self.telegram.referral_callback = referral_cb
+        self.telegram.checker_callback = checker_cb
 
     def send(self, title, message, priority="default", notif_id=NOTIF_ID_STATUS,
              termux_buttons=None, telegram_buttons=None, ongoing=False, silent=False):

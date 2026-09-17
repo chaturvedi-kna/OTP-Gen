@@ -25,6 +25,15 @@ Recovery:
   OTP missing/wrong/expired/blocked -> [Change Number] -> send the next number
   (the bot keeps the current offer screen), instead of redoing the whole menu.
 
+Number checker (checker.mode = "bot" / "auto"):
+  the same userbot can ask the bot whether a number is already registered on
+  Meesho, instead of / in addition to the HTTP checker API: main menu ->
+  [checker button] (or checker.bot.command) -> send the 10-digit number ->
+  read the "registered" / "not registered" verdict -> back to the main menu.
+  Used as a fallback when the API is down / too slow / rejects every key (see
+  checker_router.py). All screen wording is configurable under
+  "checker" -> "bot", because bot copy varies between revisions.
+
 Timeouts: every step (screen poll, tap, settle) has its own budget
 (step_timeout_seconds), and _run() additionally aborts a whole flow with a
 MeeshoBotTimeout when it stops making progress for flow_timeout_seconds
@@ -135,6 +144,98 @@ S_WRONG_OTP = "wrong_otp"
 S_EXPIRED = "otp_expired"
 S_BLOCKED = "blocked"
 S_UNKNOWN = "unknown"
+
+# Number-checker screens (the bot's own "is this number registered?" service,
+# used as a fallback when the checker API is down / too slow - see
+# checker_router.py).
+S_CHECK_PROMPT = "check_prompt"      # the bot asks for the 10-digit number
+S_CHECKING = "checking"              # transient "checking..." screen
+S_CHECK_RESULT = "check_result"      # "registered" / "not registered"
+
+# -- default screen hints for the bot checker --------------------------------
+#
+# All of these can be overridden/extended from
+# config.json -> "checker" -> "bot" (see SETUP_CHECKER.md), because bot copy
+# varies between revisions. Matching is done on normalized labels (lowercase,
+# no emoji), so hints here stay plain text.
+
+# Buttons on the main menu that open the checker.
+DEFAULT_CHECK_BUTTON_HINTS = (
+    "check number", "number check", "check registration", "registration check",
+    "check account", "account check", "check status", "verify number",
+    "number status", "check meesho", "check user", "check number status",
+)
+# A last-resort generic pass: any button with one of these words, as long as
+# it does not contain one of the excluded words below.
+DEFAULT_CHECK_BUTTON_FALLBACK_HINTS = ("check", "verify", "validate", "status")
+DEFAULT_CHECK_BUTTON_EXCLUDE = (
+    "balance", "price", "offer", "shop", "wallet", "upi", "order", "payment",
+    "support", "help", "referr", "invite", "menu", "cancel", "back", "otp",
+)
+
+# Text on the screen that asks for the number to check.
+DEFAULT_CHECK_PROMPT_HINTS = (
+    "send the number", "send your number", "send number", "send me the number",
+    "send me a number", "enter the number", "enter number", "enter your number",
+    "enter a number", "type the number", "type number", "paste the number",
+    "paste number", "provide the number", "share the number", "give me the number",
+    "which number", "number to check", "check which number", "10-digit",
+    "10 digit", "10digit",
+)
+_CHECK_NUMBER_WORDS = ("number", "mobile", "contact", "phone")
+_CHECK_ASK_WORDS = ("send", "enter", "type", "paste", "provide", "share",
+                    "give", "which", "what", "check")
+
+# Result wording. Checked BEFORE the positive hints, because "not registered"
+# contains "registered".
+DEFAULT_CHECK_NOT_REGISTERED_HINTS = (
+    "not registered", "isn't registered", "isnt registered", "is not registered",
+    "no longer registered", "unregistered", "not linked", "isn't linked",
+    "not associated", "no account", "doesn't have", "does not have",
+    "don't have", "not found", "no user found", "no record", "not in our",
+    "not on meesho", "never registered", "no meesho account",
+    "not a meesho user", "not available", "available for registration",
+    "available on meesho", "fresh number", "new number", "no existing account",
+)
+DEFAULT_CHECK_REGISTERED_HINTS = (
+    "already registered", "is registered", "registered on meesho",
+    "registered with meesho", "registration found", "already exists",
+    "number exists", "account exists", "user exists", "existing account",
+    "existing user", "already has an account", "has an account",
+    "has a meesho account", "already linked", "linked to an account",
+    "already associated", "found on meesho", "old account", "already in use",
+    "in use",
+)
+# Emoji confirmation next to a "registered"/"registration" word.
+_CHECK_YES_EMOJI = ("✅", "✔", "☑")
+_CHECK_NO_EMOJI = ("❌", "✖", "🚫", "⛔", "❎")
+
+# Words that mean "the bot is working on the check right now, keep waiting".
+_CHECKING_HINTS = (
+    "checking", "please wait", "just a moment", "one moment", "processing",
+    "searching", "looking up", "fetching", "wait a", "hold on",
+)
+
+# A short hint (a single short word) is matched on word boundaries so e.g.
+# "no" can never match inside "notification".
+_HINT_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def _hint_matches(text, hint):
+    """True when `hint` appears in the normalized `text`."""
+    hint = normalize_label(hint)
+    if not hint:
+        return False
+    if " " in hint or len(hint) > 4 or not hint.isalnum():
+        return hint in text
+    return re.search(rf"\b{re.escape(hint)}\b", text) is not None
+
+
+def _hint_match(text, hints):
+    for hint in hints:
+        if _hint_matches(text, hint):
+            return hint
+    return None
 
 # The promotional screen the bot inserts between "Login with Number" and the
 # login-mode ("Normal" / "Auto") choice. Two copies have been observed:
@@ -358,6 +459,158 @@ class Screen:
                     return r, c, label
         return None
 
+    # -- number-checker screens --------------------------------------------
+
+    def checker_button(self, extra_hints=(),
+                       fallback_hints=DEFAULT_CHECK_BUTTON_FALLBACK_HINTS,
+                       exclude=DEFAULT_CHECK_BUTTON_EXCLUDE):
+        """
+        (row, col, label) of the button that opens the bot's number checker,
+        or None.
+
+        Tried in order: the configured/default checker phrases, then a
+        generic "check/verify/validate/status" pass over the remaining
+        buttons. A button containing an excluded word (balance, offer, shop,
+        ...) is never picked, so "Check Balance" can't be mistaken for it.
+        """
+        def blocked(label_norm):
+            return any(word in label_norm for word in exclude)
+
+        def pick(hints):
+            for hint in hints:
+                norm_hint = normalize_label(hint)
+                if not norm_hint:
+                    continue
+                for r, row in enumerate(self.buttons):
+                    for c, label in enumerate(row):
+                        norm = normalize_label(label)
+                        if norm_hint in norm and not blocked(norm):
+                            return r, c, label
+            return None
+
+        return pick(tuple(extra_hints or ()) + tuple(DEFAULT_CHECK_BUTTON_HINTS)) \
+            or pick(fallback_hints)
+
+    def looks_like_check_prompt(self, extra_hints=()):
+        """
+        True when the screen is asking for the number to check (the step
+        between the checker button and the result). Kept conservative: the
+        number is only typed into a screen this accepts.
+        """
+        # Menu / login / offer screens carry their own buttons and must never
+        # be read as the checker's number prompt.
+        if self.has_button("try another offer", "add account", "open shop",
+                           "login with numb", "choose login mode",
+                           "try another number"):
+            return False
+        text = normalize_label(self.text)
+        if _hint_match(text, tuple(extra_hints or ()) + DEFAULT_CHECK_PROMPT_HINTS):
+            return True
+        if any(word in text for word in _CHECK_NUMBER_WORDS) and (
+            any(word in text for word in _CHECK_ASK_WORDS)
+        ):
+            return True
+        # A bare "10-digit mobile number" style heading with only its own
+        # navigation buttons is still the prompt.
+        return (
+            any(word in text for word in ("10-digit", "10 digit", "10digit"))
+            and self.has_button("main menu", "cancel", "back")
+            and not self.has_button("add account", "open shop", "try another offer")
+        )
+
+    def looks_like_checking(self):
+        """True for a transient 'checking, please wait...' screen."""
+        text = normalize_label(self.text)
+        if any(hint in text for hint in _CHECKING_HINTS):
+            return not self.has_button("add account", "open shop", "try another offer")
+        return False
+
+    def check_verdict(self, registered_hints=(), not_registered_hints=()):
+        """
+        Read a checker RESULT screen.
+
+        Returns True (registered), False (not registered) or None when the
+        screen carries no verdict. Negative wording is checked first because
+        "not registered" contains "registered"; extra phrase lists can be
+        supplied from config for a bot revision whose copy is different.
+        """
+        text = normalize_label(self.text)
+        raw = self.text or ""
+        reg = tuple(DEFAULT_CHECK_REGISTERED_HINTS) + tuple(registered_hints or ())
+        unreg = tuple(DEFAULT_CHECK_NOT_REGISTERED_HINTS) + tuple(not_registered_hints or ())
+
+        # A screen that is asking for the number, or showing the transient
+        # "checking…" state, is never a verdict - however it is worded (a
+        # prompt may legitimately say "...tell you whether it IS REGISTERED").
+        # Unless it also quotes the number next to a ✅/❌ marker, in which case
+        # it is a result.
+        marked_result = bool(re.search(r"\b\d{10}\b", raw)) and any(
+            emoji in raw for emoji in _CHECK_YES_EMOJI + _CHECK_NO_EMOJI
+        )
+        if not marked_result and (self.looks_like_check_prompt()
+                                  or self.looks_like_checking()):
+            return None
+
+        neg = _hint_match(text, unreg)
+        pos = _hint_match(text, reg)
+        if neg and not pos:
+            return False
+        if pos and not neg:
+            return True
+        if pos and neg:
+            # Both vocabularies matched: trust the explicit negative wording.
+            return False
+
+        # No configured phrase matched: look for the word itself next to a
+        # negation or an ❌ / ✅ marker.
+        for match in re.finditer(r"regist(?:ered|ration|er)", text):
+            window = text[max(0, match.start() - 32): match.end() + 24]
+            raw_window = raw[max(0, match.start() - 32): match.end() + 24]
+            if (any(emoji in raw_window for emoji in _CHECK_NO_EMOJI)
+                    or re.search(r"\b(not|no|never|isn'?t|isnt|wasn'?t|hasn'?t|without|un)\b",
+                                 window)):
+                return False
+        for match in re.finditer(r"regist(?:ered|ration|er)", text):
+            window = text[max(0, match.start() - 16): match.end() + 16]
+            raw_window = raw[max(0, match.start() - 16): match.end() + 16]
+            if any(emoji in raw_window for emoji in _CHECK_YES_EMOJI):
+                return True
+
+        # Emoji-only results: a "check"/"result" screen quoting the number
+        # with exactly one kind of marker.
+        if (re.search(r"\b\d{10}\b", raw)
+                and any(word in text for word in ("check", "result", "status"))):
+            yes = [e for e in _CHECK_YES_EMOJI if e in raw]
+            no = [e for e in _CHECK_NO_EMOJI if e in raw]
+            if no and not yes:
+                return False
+            if yes and not no:
+                return True
+
+        # Last resort: the screen talks about registration without negating
+        # it, and is not itself a prompt / transient / menu / offer screen.
+        if ("regist" in text and not self.looks_like_check_prompt()
+                and not self.looks_like_checking()
+                and not self.has_button("add account", "open shop",
+                                        "login with numb", "try another offer")):
+            return True
+        return None
+
+    def classify_check(self, registered_hints=(), not_registered_hints=(),
+                       prompt_hints=()):
+        """
+        Classification used by the bot-checker flow. The transient
+        "checking..." state is tested before the prompt so a working screen
+        never gets the number typed into it a second time.
+        """
+        if self.check_verdict(registered_hints, not_registered_hints) is not None:
+            return S_CHECK_RESULT
+        if self.looks_like_checking():
+            return S_CHECKING
+        if self.looks_like_check_prompt(prompt_hints):
+            return S_CHECK_PROMPT
+        return S_UNKNOWN
+
     # -- regex helpers -----------------------------------------------------
 
     def search(self, pattern):
@@ -493,6 +746,17 @@ class MeeshoBotClient:
         # so the link is pasted once for each prompt by default.
         self.max_referral_pastes = int(conf.get("max_referral_pastes", 2))
         self.max_referral_events = int(conf.get("max_referral_events", 4))
+
+        # Bot number-checker (checker.mode = "bot" / "auto", see
+        # checker_router.py): the bot's own "is this number registered?"
+        # service. Configuration lives under "checker" -> "bot"; every hint
+        # list can be extended for a bot revision whose copy differs.
+        self.checker_conf = dict((config.get("checker", {}) or {}).get("bot", {}) or {})
+
+        # One conversation with one bot: a number check and a login flow must
+        # never interleave. Reentrant, because a public wrapper may end up
+        # calling another one from the same thread.
+        self._flow_lock = threading.RLock()
 
         # Per-login referral bookkeeping (reset by _a_prepare_login).
         self._referral_events = 0
@@ -1375,6 +1639,210 @@ class MeeshoBotClient:
             )
         return {"stage": "otp_sent", "screen": screen.text, "upi": screen.upi_price}
 
+    # -- bot number checker --------------------------------------------------
+
+    def _checker_settings(self, overrides=None):
+        """Resolve checker.bot config (defaults + overrides) into a plain dict."""
+        conf = dict(self.checker_conf)
+        conf.update(overrides or {})
+        entry = str(conf.get("entry", "auto") or "auto").strip().lower()
+        if entry not in ("auto", "button", "command"):
+            entry = "auto"
+        try:
+            step_timeout = float(conf.get("step_timeout_seconds", self.step_timeout))
+        except (TypeError, ValueError):
+            step_timeout = self.step_timeout
+        step_timeout = step_timeout if step_timeout > 0 else self.step_timeout
+        try:
+            attempts = max(1, int(conf.get("max_attempts", 2)))
+        except (TypeError, ValueError):
+            attempts = 2
+        return {
+            "entry": entry,
+            "command": str(conf.get("command") or "").strip(),
+            "button_hints": tuple(conf.get("button_hints") or ()),
+            "button_fallbacks": tuple(conf.get("button_fallback_hints")
+                                      or DEFAULT_CHECK_BUTTON_FALLBACK_HINTS),
+            "button_exclude": tuple(conf.get("button_exclude")
+                                    or DEFAULT_CHECK_BUTTON_EXCLUDE),
+            "prompt_hints": tuple(conf.get("number_prompt_hints") or ()),
+            "registered_hints": tuple(conf.get("registered_hints") or ()),
+            "not_registered_hints": tuple(conf.get("not_registered_hints") or ()),
+            "step_timeout": step_timeout,
+            "attempts": attempts,
+            "reset_after_check": bool(conf.get("reset_after_check", True)),
+        }
+
+    @staticmethod
+    def _ten_digit(number):
+        digits = re.sub(r"\D", "", str(number or ""))
+        if len(digits) == 12 and digits.startswith("91"):
+            return digits[2:]
+        if len(digits) == 11 and digits.startswith("0"):
+            return digits[1:]
+        return digits[-10:] if len(digits) >= 10 else digits
+
+    def _check_state(self, screen, conf):
+        return screen.classify_check(
+            conf["registered_hints"], conf["not_registered_hints"], conf["prompt_hints"]
+        )
+
+    def _check_verdict(self, screen, conf):
+        return screen.check_verdict(conf["registered_hints"], conf["not_registered_hints"])
+
+    async def _settle_check(self, screen, conf, want_result):
+        """
+        Poll until the checker has something to show: the number prompt
+        (want_result=False) or a readable result (want_result=True).
+
+        Returns the last screen; the caller raises if it is not usable. Login
+        screens short-circuit so a drifted flow fails fast with the screen text
+        instead of burning the whole step timeout.
+        """
+        deadline = time.time() + conf["step_timeout"]
+        while True:
+            state = self._check_state(screen, conf)
+            if state == S_CHECK_RESULT:
+                return screen
+            if not want_result and state == S_CHECK_PROMPT:
+                return screen
+            if state == S_CHECKING:
+                self._note("bot checker is working (transient screen)")
+            elif screen.classify() in (S_MENU, S_LINK_CHOICE, S_LOGIN_MODE,
+                                       S_OFFER, S_REFERRAL, S_OTP_WAIT, S_LINKED,
+                                       S_BLOCKED, S_WRONG_OTP, S_EXPIRED):
+                # The bot left the checker (or never entered it): report now.
+                return screen
+            if time.time() >= deadline:
+                return screen
+            await asyncio.sleep(self.poll_interval)
+            self._progress()
+            screen = await self._latest_screen()
+
+    async def _a_check_registration(self, number, overrides=None):
+        """
+        Ask the PRIMES bot whether `number` is registered on Meesho.
+
+        Returns {"success": True, "is_registered": bool, "source": "bot", ...}
+        - the same shape the API checker returns, so callers can treat both
+        the same way. Raises MeeshoBotError subclasses when no verdict can be
+        read; the caller (checker_router) turns those into CheckerUnavailable.
+        """
+        conf = self._checker_settings(overrides)
+        digits = self._ten_digit(number)
+        if len(digits) != 10:
+            raise MeeshoBotError(f"Not a usable 10-digit number: {number!r}")
+
+        self._note(f"checking {digits} with the bot checker")
+        self._log(f"[MEESHO-BOT] Bot checker: checking {digits} "
+                  f"(entry: {conf['entry']}).")
+
+        screen = await self._latest_screen()
+        button = None
+        if conf["entry"] in ("auto", "button"):
+            if screen.classify() != S_MENU:
+                # Never type a number into a leftover login/OTP screen.
+                screen = await self._cancel_to_menu()
+            button = screen.checker_button(
+                conf["button_hints"], conf["button_fallbacks"], conf["button_exclude"]
+            )
+
+        command_sent = False
+        if button is not None:
+            self._log(f"[MEESHO-BOT] Bot checker: tapping '{button[2]}'.")
+            screen = await self._click(screen, button[2])
+        elif conf["command"] and conf["entry"] in ("auto", "command"):
+            text = conf["command"].format(number=digits)
+            self._log(f"[MEESHO-BOT] Bot checker: sending command '{text}'.")
+            screen = await self._send_text(text, timeout=conf["step_timeout"])
+            command_sent = True
+        else:
+            raise MeeshoBotUnknownScreen(
+                "No bot-checker menu button found and checker.bot.command is "
+                "empty. Add the checker button's exact label to "
+                "checker.bot.button_hints (or set checker.bot.command, e.g. "
+                "'/check {number}') - see SETUP_CHECKER.md.",
+                screen.text, screen.button_labels,
+            )
+
+        screen = await self._settle_check(screen, conf, want_result=False)
+        verdict = self._check_verdict(screen, conf)
+
+        def no_result_error():
+            if self._check_state(screen, conf) == S_CHECKING:
+                return MeeshoBotUnknownScreen(
+                    f"The bot stayed on its 'checking...' screen for "
+                    f"{conf['step_timeout']:.0f}s without answering - the check did "
+                    f"not complete",
+                    screen.text, screen.button_labels,
+                )
+            return MeeshoBotUnknownScreen(
+                "The bot checker gave no readable result for this number. Add "
+                "its result wording to checker.bot.registered_hints / "
+                "checker.bot.not_registered_hints - see SETUP_CHECKER.md.",
+                screen.text, screen.button_labels,
+            )
+
+        if verdict is None:
+            # A prompt is always answered with the number (also when the
+            # configured command /check carried it and the bot asked again).
+            state = self._check_state(screen, conf)
+            if state == S_CHECKING:
+                raise no_result_error()
+            if state != S_CHECK_PROMPT:
+                if command_sent:
+                    raise MeeshoBotUnknownScreen(
+                        f"The bot did not answer the checker command "
+                        f"'{conf['command']}' with a readable result. Add its "
+                        f"result wording to checker.bot.registered_hints / "
+                        f"checker.bot.not_registered_hints - see SETUP_CHECKER.md.",
+                        screen.text, screen.button_labels,
+                    )
+                raise MeeshoBotUnknownScreen(
+                    "Expected the bot to ask for the number to check, got an "
+                    "unreadable screen. Add its wording to "
+                    "checker.bot.number_prompt_hints - see SETUP_CHECKER.md.",
+                    screen.text, screen.button_labels,
+                )
+            for attempt in range(conf["attempts"]):
+                if verdict is not None:
+                    break
+                self._note(f"sending {digits} to the bot checker")
+                self._log(f"[MEESHO-BOT] Bot checker: sending number {digits}"
+                          + ("" if attempt == 0 else f" (attempt {attempt + 1})") + ".")
+                screen = await self._send_text(str(digits), timeout=conf["step_timeout"])
+                screen = await self._settle_check(screen, conf, want_result=True)
+                verdict = self._check_verdict(screen, conf)
+                if verdict is None and attempt + 1 < conf["attempts"]:
+                    if self._check_state(screen, conf) == S_CHECK_PROMPT:
+                        continue  # the bot asked again: send it once more
+                    break
+
+        if verdict is None:
+            raise no_result_error()
+
+        result = {
+            "success": True,
+            "is_registered": bool(verdict),
+            "source": "bot",
+            "number": digits,
+            "message": screen.text,
+            "stage": "checked",
+        }
+        self._log(f"[MEESHO-BOT] Bot checker: {digits} -> "
+                  f"{'REGISTERED' if verdict else 'NOT registered'}.")
+
+        if conf["reset_after_check"]:
+            try:
+                await self._cancel_to_menu()
+                self._note("bot checker: back at the main menu")
+            except MeeshoBotError as exc:
+                # The verdict is already known; a failed reset is not worth
+                # failing the check (the login flow resets itself anyway).
+                self._log(f"[MEESHO-BOT] Bot checker: could not return to the "
+                          f"main menu after the check ({exc}).")
+        return result
+
     async def _a_return_to_menu(self):
         screen = await self._latest_screen()
         if screen.classify() == S_REFERRAL and not screen.referral_acknowledged:
@@ -1390,6 +1858,10 @@ class MeeshoBotClient:
         return {"stage": "menu"}
 
     # -- synchronous wrappers (called from coordinator threads) -------------
+    #
+    # Every wrapper takes _flow_lock: there is exactly one conversation with
+    # the bot, so a worker's number check can never interleave with the
+    # coordinator's login flow (the second caller simply waits its turn).
 
     def screen_state(self):
         """
@@ -1400,32 +1872,50 @@ class MeeshoBotClient:
         code, and Change Number is only tapped once the provider cancellation
         is settled.
         """
-        return self._run(self._latest_screen()).classify()
+        with self._flow_lock:
+            return self._run(self._latest_screen()).classify()
+
+    def check_registration(self, number, overrides=None):
+        """
+        Ask the bot's own checker whether `number` is registered on Meesho.
+
+        Returns the API checker's dict shape ({"success": True,
+        "is_registered": bool, "source": "bot", ...}) or raises a
+        MeeshoBotError subclass when no verdict could be read.
+        """
+        with self._flow_lock:
+            return self._run(self._a_check_registration(number, overrides))
 
     def prepare_login(self, number):
-        return self._run(self._a_prepare_login(number, continue_from_prompt=False))
+        with self._flow_lock:
+            return self._run(self._a_prepare_login(number, continue_from_prompt=False))
 
     def continue_with_number(self, number):
-        return self._run(self._a_prepare_login(number, continue_from_prompt=True))
+        with self._flow_lock:
+            return self._run(self._a_prepare_login(number, continue_from_prompt=True))
 
     def submit_otp(self, code):
-        return self._run(self._a_submit_otp(code))
+        with self._flow_lock:
+            return self._run(self._a_submit_otp(code))
 
     def change_number(self, new_number=None):
-        return self._run(self._a_change_number(new_number))
+        with self._flow_lock:
+            return self._run(self._a_change_number(new_number))
 
     def return_to_menu(self):
-        return self._run(self._a_return_to_menu())
+        with self._flow_lock:
+            return self._run(self._a_return_to_menu())
 
     def cancel_flow(self):
-        return self._run(self._a_cancel_flow())
+        with self._flow_lock:
+            return self._run(self._a_cancel_flow())
 
 
 # ---------------------------------------------------------------------------
 # Live diagnostic (no taps, no numbers):  python meesho_bot_client.py
 # ---------------------------------------------------------------------------
 
-def _dump_screen(screen, title):
+def _dump_screen(screen, title, checker=None):
     print(f"\n--- {title} ---")
     print(f"classified : {screen.classify()}")
     print(f"referral   : {screen.is_referral} "
@@ -1434,6 +1924,15 @@ def _dump_screen(screen, title):
     yes = screen.referral_yes_button()
     print(f"skip option: {skip[2] if skip else None}")
     print(f"yes option : {yes[2] if yes else None}")
+    if checker is not None:
+        conf = checker
+        verdict = screen.check_verdict(conf["registered_hints"],
+                                       conf["not_registered_hints"])
+        entry = screen.checker_button(conf["button_hints"],
+                                      conf["button_fallbacks"],
+                                      conf["button_exclude"])
+        print(f"checker    : {screen.classify_check(conf['registered_hints'], conf['not_registered_hints'], conf['prompt_hints'])}"
+              f" | verdict={verdict} | entry button={entry[2] if entry else None}")
     print(f"buttons    : {screen.button_summary}")
     print(f"upi price  : {screen.upi_price}")
     print("text       :")
@@ -1441,14 +1940,31 @@ def _dump_screen(screen, title):
         print(f"  | {line}")
 
 
-def main():
+def main(argv=None):
     """
-    Print how the userbot currently sees the PRIMES bot screen. Read-only, so
-    it is safe to run while automation is stopped; a referral screen showing
-    up here is classified and resolved by the flow automatically.
+    Print how the userbot currently sees the PRIMES bot screen. Read-only by
+    default, so it is safe to run while automation is stopped; a referral
+    screen showing up here is classified and resolved by the flow
+    automatically.
+
+    With a number it performs ONE check through the bot's checker and prints
+    the verdict - the fastest way to tune checker.bot hints against the real
+    bot:
+
+        python meesho_bot_client.py 9876543210
     """
     import json
     import os
+    import sys
+
+    argv = list(sys.argv[1:] if argv is None else argv)
+    check_number = None
+    for arg in argv:
+        if arg.isdigit():
+            check_number = arg
+        elif arg in ("-h", "--help"):
+            print(main.__doc__)
+            return 0
 
     config = {}
     for name in ("config.json", "config.jon"):
@@ -1460,6 +1976,10 @@ def main():
     client = MeeshoBotClient(config, log_fn=print)
     print(f"Referral step: {client.referral_summary}")
     print(f"Target UPI price: ₹{client.target_upi_price}")
+    checker_conf = client._checker_settings()
+    print(f"Bot checker: entry={checker_conf['entry']} "
+          f"command={checker_conf['command'] or '(none)'} "
+          f"step_timeout={checker_conf['step_timeout']:.0f}s")
 
     if not client.enabled:
         print("\nmeesho_bot.enabled is false - the flow will not run. "
@@ -1472,7 +1992,17 @@ def main():
 
     try:
         screen = client._run(client._latest_screen(), timeout=30)
-        _dump_screen(screen, f"Current screen ({client.bot_username})")
+        _dump_screen(screen, f"Current screen ({client.bot_username})", checker_conf)
+        if check_number:
+            print(f"\n--- Bot checker: {check_number} ---")
+            try:
+                result = client.check_registration(check_number)
+            except Exception as exc:
+                print(f"check failed: {exc}")
+                return 1
+            print(f"is_registered = {result['is_registered']} "
+                  f"(source: {result.get('source', 'bot')})")
+            print(f"raw result screen: {(result.get('message') or '').strip()}")
         return 0
     finally:
         client.stop()

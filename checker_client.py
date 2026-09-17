@@ -23,6 +23,17 @@ built to absorb that instead of failing activations:
 
 API keys rejected with 401/403 are retired for the rest of the run; the client
 keeps rotating through the remaining ones.
+
+Failures are typed so a caller (see checker_router.py) can tell a temporary
+problem from a definitive one:
+
+  * CheckerTimeout      - the API took too long to answer (read/connect timeout)
+  * CheckerServerError  - HTTP 5xx
+  * CheckerServiceDown  - the API answered {"is_down": true}
+  * CheckerUnavailable  - network errors / anything else transient
+  * CheckerRateLimited  - retry budget spent under HTTP 429
+  * CheckerAuthError    - every API key rejected (401/403)
+  * CheckerError        - definitive failures (bad request, success=false, ...)
 """
 
 import re
@@ -37,11 +48,33 @@ class CheckerError(Exception):
 
 
 class CheckerUnavailable(CheckerError):
-    pass
+    """The checker service could not answer usefully right now."""
 
 
 class CheckerRateLimited(CheckerUnavailable):
     """Raised when the retry budget is exhausted under HTTP 429 rate limiting."""
+
+
+class CheckerTimeout(CheckerUnavailable):
+    """
+    The API did not answer within the HTTP timeout (connect or read timeout).
+
+    Distinguished from a generic network error so a router can decide that the
+    service "takes too long to respond" and switch to another checker (e.g. the
+    PRIMES bot) instead of cancelling a paid number.
+    """
+
+
+class CheckerServerError(CheckerUnavailable):
+    """HTTP 5xx from the checker API (server-side problem, worth retrying)."""
+
+
+class CheckerServiceDown(CheckerUnavailable):
+    """The checker API answered `is_down: true` for this service."""
+
+
+class CheckerAuthError(CheckerError):
+    """Every configured API key was rejected (HTTP 401/403)."""
 
 
 # Matches the server hint: "Please wait 4.6s for service 'meesho'"
@@ -252,6 +285,20 @@ class CheckerClient:
                     },
                     timeout=self.timeout
                 )
+            except requests.Timeout as exc:
+                # Read/connect timeout: the service is reachable but too slow.
+                # Kept distinct (CheckerTimeout) so a router can fall back to
+                # another checker instead of cancelling the number.
+                last_error = CheckerTimeout(f"Checker timed out: {exc}")
+                if attempt >= self.max_retries or time.monotonic() >= deadline:
+                    raise last_error
+                self._log(
+                    f"Checker timed out ({exc}); retry "
+                    f"{attempt}/{self.max_retries} in "
+                    f"{self.network_backoff_seconds:.1f}s"
+                )
+                time.sleep(self.network_backoff_seconds)
+                continue
             except requests.RequestException as exc:
                 last_error = CheckerUnavailable(f"Checker network error: {exc}")
                 if attempt >= self.max_retries or time.monotonic() >= deadline:
@@ -288,7 +335,7 @@ class CheckerClient:
                 self._disable_key(api_key)
                 remaining = self.usable_key_count()
                 if remaining == 0:
-                    raise CheckerError(
+                    raise CheckerAuthError(
                         f"Checker authentication failed (HTTP {status}): all "
                         f"{len(self._keys)} API keys invalid or missing"
                     )
@@ -303,7 +350,7 @@ class CheckerClient:
                 continue
 
             if status >= 500:
-                last_error = CheckerUnavailable(
+                last_error = CheckerServerError(
                     f"HTTP {status}: {response.text}"
                 )
                 if attempt >= self.max_retries or time.monotonic() >= deadline:
@@ -335,7 +382,7 @@ class CheckerClient:
 
             # Handle service down status
             if data.get("is_down") is True:
-                raise CheckerUnavailable(
+                raise CheckerServiceDown(
                     "Checker reports service is_down=true"
                 )
 

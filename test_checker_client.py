@@ -251,6 +251,65 @@ def test_definitive_failures_not_retried():
     check("definitive: 400 not retried", len(poster.calls) == 1, str(len(poster.calls)))
 
 
+def test_error_taxonomy():
+    # A read timeout is retried, then surfaced as CheckerTimeout (so a router
+    # can switch to the bot checker instead of cancelling the number).
+    poster = ScriptedPoster([
+        checker_client.requests.Timeout("ReadTimeout(15)"),
+        ok(is_registered=False),
+    ])
+    checker_client.requests.post = poster
+    client = make_client("k-timeout")
+    data = client.check("meesho", "9876543210")
+    check("timeout: retried and succeeded", data.get("is_registered") is False)
+
+    poster = ScriptedPoster([checker_client.requests.Timeout("ReadTimeout(15)")])
+    checker_client.requests.post = poster
+    make_poster_client = CheckerClient(
+        "https://checker.example", api_keys=["k-timeout"], max_retries=1,
+        min_interval_seconds=0.0, network_backoff_seconds=0.0,
+    )
+    try:
+        make_poster_client.check("meesho", "9876543210")
+        check("timeout: raises CheckerTimeout", False)
+    except checker_client.CheckerTimeout as exc:
+        check("timeout: raises CheckerTimeout", True)
+        check("timeout: is a CheckerUnavailable (cancel path unchanged)",
+              isinstance(exc, CheckerUnavailable), type(exc).__name__)
+
+    # 5xx -> CheckerServerError, is_down -> CheckerServiceDown, dead keys ->
+    # CheckerAuthError: each keeps the old base class, so existing handling
+    # still works.
+    poster = ScriptedPoster([FakeResponse(503, "unavailable")])
+    checker_client.requests.post = poster
+    try:
+        CheckerClient("https://checker.example", api_keys=["k"], max_retries=1,
+                      min_interval_seconds=0.0, network_backoff_seconds=0.0
+                      ).check("meesho", "9876543210")
+        check("5xx: raises CheckerServerError", False)
+    except checker_client.CheckerServerError as exc:
+        check("5xx: raises CheckerServerError", isinstance(exc, CheckerUnavailable),
+              type(exc).__name__)
+
+    poster = ScriptedPoster([FakeResponse(200, '{"success": true, "is_down": true}')])
+    checker_client.requests.post = poster
+    try:
+        make_client("k").check("meesho", "9876543210")
+        check("is_down: raises CheckerServiceDown", False)
+    except checker_client.CheckerServiceDown as exc:
+        check("is_down: raises CheckerServiceDown", isinstance(exc, CheckerUnavailable),
+              type(exc).__name__)
+
+    poster = ScriptedPoster([FakeResponse(401, "unauthorized")])
+    checker_client.requests.post = poster
+    try:
+        make_client("k-revoked").check("meesho", "9876543210")
+        check("auth: raises CheckerAuthError", False)
+    except checker_client.CheckerAuthError as exc:
+        check("auth: raises CheckerAuthError", isinstance(exc, CheckerError),
+              type(exc).__name__)
+
+
 def test_format_number_regression():
     cases = {
         "919876543210": "9876543210",
@@ -276,6 +335,7 @@ def main():
     test_learned_pacing_gaps_successive_checks()
     test_legacy_single_api_key_argument()
     test_definitive_failures_not_retried()
+    test_error_taxonomy()
     test_format_number_regression()
     print()
     if FAILURES:
