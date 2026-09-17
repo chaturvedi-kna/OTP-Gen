@@ -48,6 +48,7 @@
   },
 
   "checker": {
+    "mode": "auto",
     "base_url": "https://superassets.in",
     "api_keys": [
       "AK__3b9HMjWPCtV8_kNsN4npV64lwPVqdAa"
@@ -57,7 +58,31 @@
     "max_retry_wait_seconds": 45.0,
     "min_interval_seconds": 1.0,
     "rate_limit_buffer_seconds": 0.5,
-    "network_backoff_seconds": 1.5
+    "network_backoff_seconds": 1.5,
+
+    "fallback": {
+      "is_down": true,
+      "read_timeout": true,
+      "network": true,
+      "http_5xx": true,
+      "auth": true,
+      "rate_limit": false,
+      "cooldown_seconds": 60,
+      "max_cooldown_seconds": 600
+    },
+
+    "bot": {
+      "entry": "auto",
+      "command": "",
+      "button_hints": [],
+      "number_prompt_hints": [],
+      "registered_hints": [],
+      "not_registered_hints": [],
+      "step_timeout_seconds": 30,
+      "max_attempts": 2,
+      "reset_after_check": true,
+      "stop_after_failures": 3
+    }
   },
 
   "balance_guard": {

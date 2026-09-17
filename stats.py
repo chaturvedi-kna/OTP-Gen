@@ -29,6 +29,9 @@ COUNTERS = {
     "late_otp_salvaged": 0,    # OTP found during/after the cancel race
     "referral_pasted": 0,      # referral link pasted at the bot's referral step
     "referral_skipped": 0,     # referral step answered with the bot's skip option
+    "checker_api_checks": 0,   # numbers checked through the HTTP checker API
+    "checker_bot_checks": 0,   # numbers checked through the PRIMES bot checker
+    "checker_fallbacks": 0,    # checks that fell back from the API to the bot
 }
 
 

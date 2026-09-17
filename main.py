@@ -41,6 +41,12 @@ from checker_client import (
     CheckerError,
     CheckerUnavailable
 )
+from checker_router import (
+    CheckerRouter,
+    MODE_BOT,
+    MODE_AUTO,
+    normalize_mode
+)
 from state import StateStore
 from stats import StatsStore
 from balance_guard import BalanceGuard
@@ -91,32 +97,28 @@ class ParallelAutomationCoordinator:
         self.checker_conf = config.get("checker", {})
         self.settings = config.get("automation", {})
 
-        self.checker = CheckerClient(
-            base_url=self.checker_conf.get("base_url", "https://superassets.in"),
-            api_key=self.checker_conf.get("api_key", ""),
-            api_keys=self.checker_conf.get("api_keys"),
-            timeout=self.checker_conf.get("timeout", 15),
-            max_retries=self.checker_conf.get("max_retries", 10),
-            max_retry_wait_seconds=self.checker_conf.get("max_retry_wait_seconds", 45.0),
-            min_interval_seconds=self.checker_conf.get("min_interval_seconds", 1.0),
-            rate_limit_buffer_seconds=self.checker_conf.get("rate_limit_buffer_seconds", 0.5),
-            network_backoff_seconds=self.checker_conf.get("network_backoff_seconds", 1.5),
-            log_fn=log
-        )
-
-        self.checker_service = self.checker_conf.get("service", "meesho")
-        self.target_registered = self.settings.get("target_registered", False)
-        log(
-            f"Checker ready: {self.checker.key_count()} API key(s), "
-            f"service '{self.checker_service}', "
-            f"retry budget {self.checker.max_retry_wait_seconds:.0f}s"
-        )
-
         self.state = StateStore()
         self.stats = StatsStore()
         self.guard = BalanceGuard(config.get("balance_guard", {}), log_fn=log)
         self.notify = Notifier(config)
         self.bot = MeeshoBotClient(config, log_fn=log)
+
+        # Number checking strategy: API only, PRIMES bot only, or API with an
+        # automatic bot fallback (checker.mode in config.json - see
+        # SETUP_CHECKER.md). The bot is looked up lazily so replacing
+        # self.bot at runtime (tests) is picked up.
+        self.checker = CheckerRouter(
+            config,
+            bot_getter=lambda: self.bot,
+            log_fn=log,
+            stats=self.stats
+        )
+        self.checker_service = self.checker_conf.get("service", "meesho")
+        self.target_registered = self.settings.get("target_registered", False)
+        log(
+            f"Checker: {self.checker.describe()}, service '{self.checker_service}', "
+            f"API retry budget {self.checker.max_retry_wait_seconds:.0f}s"
+        )
 
         # Thread synchronization primitives
         self.stop_requested = threading.Event()
@@ -129,6 +131,9 @@ class ParallelAutomationCoordinator:
         self.worker_attempts = {}
         self.worker_max_attempts = {}
         self.total_attempts = 0
+        # Consecutive checker failures (bot mode / bot fallback): a broken
+        # checker must not keep buying numbers only to cancel them.
+        self.checker_failure_streak = 0
         self.attempts_lock = threading.Lock()
         self.is_running = False
 
@@ -154,7 +159,8 @@ class ParallelAutomationCoordinator:
             balance_cb=self.get_balances_summary,
             run_cb=self.request_run,
             stop_cb=self.request_stop,
-            referral_cb=self.command_referral_link
+            referral_cb=self.command_referral_link,
+            checker_cb=self.command_checker_mode
         )
 
     # -- Ledger helpers ------------------------------------------------------
@@ -185,6 +191,16 @@ class ParallelAutomationCoordinator:
             entry = self.ledger.get(name, {})
             return entry.get("expected_balance")
 
+    def _note_checker_failure(self):
+        """Count one more consecutive failed check; returns the streak."""
+        with self.attempts_lock:
+            self.checker_failure_streak += 1
+            return self.checker_failure_streak
+
+    def _reset_checker_failures(self):
+        with self.attempts_lock:
+            self.checker_failure_streak = 0
+
     def _critical_stop(self, title, message):
         """Halt ALL workers and send a max-priority alert."""
         log(f"CRITICAL STOP: {title} - {message}")
@@ -212,7 +228,11 @@ class ParallelAutomationCoordinator:
             f"🤖 Meesho Automation: {state_str}",
             f"Mode: {self.config.get('active_otp_provider', 'both').upper()}",
             f"PRIMES bot automation: {'🟢 ON' if self.bot.ready else '⚪ manual'}",
+            f"Checker: {self.checker.describe()}",
         ]
+        cooldown = self.checker.cooldown_remaining()
+        if cooldown > 0:
+            lines.append(f"  ⚠️ API cooling down, bot checker in use for ~{cooldown:.0f}s")
 
         if self.worker_max_attempts:
             att_parts = []
@@ -247,6 +267,9 @@ class ParallelAutomationCoordinator:
             f"  OTP timeouts: {s['otp_timeout']} | Change-number: {s['change_number']}\n"
             f"  Referral step: {s.get('referral_pasted', 0)} pasted | "
             f"{s.get('referral_skipped', 0)} skipped | {s.get('offer_rerolls', 0)} offer rerolls\n"
+            f"  Checks: {s.get('checker_api_checks', 0)} via API | "
+            f"{s.get('checker_bot_checks', 0)} via PRIMES bot | "
+            f"{s.get('checker_fallbacks', 0)} API→bot fallbacks\n"
             f"  Numbers consumed (charged): {s['numbers_consumed']}\n"
             f"  Refunds verified: {s['refunds_verified']} | Refunds missing: {s['refunds_missing']} | "
             f"Late OTP salvaged: {s['late_otp_salvaged']}"
@@ -319,6 +342,79 @@ class ParallelAutomationCoordinator:
                 "the automation stops, reports it and cancels the number with a "
                 'refund check (change meesho_bot.referral_failure_action to "skip" '
                 "to continue without a link instead).")
+
+    # -- Checker mode (config + Telegram /checker command) -------------------
+
+    def checker_status_text(self):
+        lines = [
+            f"Checker mode: {self.checker.mode.upper()}",
+            f"{self.checker.describe()}",
+            f"Service: {self.checker_service}",
+        ]
+        if self.checker.mode == MODE_AUTO:
+            triggers = [name for name in
+                        ("is_down", "timeout", "network", "http_5xx", "auth",
+                         "rate_limit", "unknown")
+                        if self.checker.fallback.get(name)]
+            lines.append(f"API failures that switch to the bot: "
+                         f"{', '.join(triggers) if triggers else '(none - auto behaves like api)'}")
+            lines.append(f"API cooldown after a fallback: "
+                         f"{self.checker.fallback['cooldown_seconds']:.0f}s "
+                         f"(doubling, max {self.checker.fallback['max_cooldown_seconds']:.0f}s)")
+            remaining = self.checker.cooldown_remaining()
+            if remaining > 0:
+                lines.append(f"⚠️ API cooling down right now - bot checks for ~{remaining:.0f}s")
+        if self.checker.mode_wants_bot:
+            if self.checker.bot_ready:
+                lines.append("PRIMES bot checker: 🟢 ready")
+            else:
+                lines.append(f"PRIMES bot checker: ⚪ not ready "
+                             f"({self.checker.bot.unavailable_reason or 'unknown reason'})")
+        s = self.stats.snapshot()
+        lines.append(
+            f"Checks so far: {s.get('checker_api_checks', 0)} via API | "
+            f"{s.get('checker_bot_checks', 0)} via PRIMES bot | "
+            f"{s.get('checker_fallbacks', 0)} fallbacks"
+        )
+        lines.append(
+            "\nCommands:\n"
+            "• /checker api - checker API only\n"
+            "• /checker bot - PRIMES bot checker only\n"
+            "• /checker auto - API first, PRIMES bot when the API fails\n"
+            "• /checker - show this"
+        )
+        return "\n".join(lines)
+
+    def command_checker_mode(self, argument):
+        """
+        Telegram /checker handler: show the current strategy, or switch between
+        api / bot / auto. The choice is saved to config.json and applied to the
+        running tool immediately (no restart).
+        """
+        argument = (argument or "").strip()
+        if argument.lower() in ("", "status", "show", "?"):
+            return self.checker_status_text()
+
+        mode = normalize_mode(argument, default=None)
+        if mode is None:
+            return (f"❌ Unknown checker mode '{argument}'. Use api, bot or auto.\n\n"
+                    + self.checker_status_text())
+
+        config_path = next((name for name in CONFIG_FILES if os.path.exists(name)), None)
+        saved = ""
+        if config_path is None:
+            saved = "\n⚠️ config.json not found - the change applies to this run only."
+        else:
+            try:
+                set_checker_mode(config_path, mode)
+                saved = f"\nSaved to {config_path}."
+            except Exception as exc:
+                saved = f"\n⚠️ Could not save to {config_path}: {exc}"
+
+        previous = self.checker.mode
+        self.checker.mode = mode
+        log(f"Checker mode changed via Telegram: {previous} -> {mode}.")
+        return f"✅ Checker mode set to {mode.upper()}.{saved}\n\n" + self.checker_status_text()
 
     def request_run(self):
         if self.is_running:
@@ -678,20 +774,42 @@ class ParallelAutomationCoordinator:
                 "acquired_at": now()
             })
 
-            # Check registration on Meesho checker
+            # Check registration on the Meesho checker (API and/or PRIMES bot,
+            # depending on checker.mode).
             self.worker_statuses[client.name] = f"Checking registration for {clean_number}"
-            log(f"Checking {clean_number} on {self.checker_service} checker...", prefix=pname)
+            log(f"Checking {clean_number} on {self.checker_service} checker "
+                f"(mode: {self.checker.mode})...", prefix=pname)
             try:
                 check = self.checker.check(self.checker_service, clean_number)
             except (CheckerUnavailable, CheckerError) as exc:
-                log(f"Checker error: {exc}. Cancelling number...", prefix=pname)
+                log(f"Checker error (mode {self.checker.mode}): {exc}. "
+                    f"Cancelling number...", prefix=pname)
                 self.handle_cancellation(client, activation_id, clean_number, f"Checker error: {exc}")
                 if self.stop_requested.is_set():
                     return
+                # With the bot (or the bot fallback) in the checking path, a run
+                # of failures means the checker itself is broken: stop instead
+                # of buying numbers only to cancel them.
+                if isinstance(exc, CheckerUnavailable) and self.checker.mode_wants_bot:
+                    streak = self._note_checker_failure()
+                    limit = self.checker.stop_after_failures
+                    if limit and streak >= limit:
+                        self._critical_stop(
+                            "Checker unavailable",
+                            f"{streak} checks in a row failed (checker mode "
+                            f"{self.checker.mode}): {exc}\n\n"
+                            "Stopping so no more numbers are bought only to be "
+                            "cancelled. Fix the checker/userbot and send /run, or "
+                            "switch with /checker api."
+                        )
+                        return
                 continue
 
+            self._reset_checker_failures()
             is_registered = check.get("is_registered", False)
-            log(f"Checker result: is_registered={is_registered} (Target: {self.target_registered})", prefix=pname)
+            checker_source = check.get("source", "api")
+            log(f"Checker result via {checker_source}: is_registered={is_registered} "
+                f"(Target: {self.target_registered})", prefix=pname)
 
             if is_registered != self.target_registered:
                 reason = "Already registered on Meesho" if is_registered else "Not registered on Meesho"
@@ -720,6 +838,7 @@ class ParallelAutomationCoordinator:
                     "raw_number": context.raw_number,
                     "number": context.clean_number,
                     "is_registered": is_registered,
+                    "checker_source": checker_source,
                     "found_at": now()
                 })
                 # This worker parks here while the coordinator drives the bot/OTP flow.
@@ -1168,6 +1287,7 @@ class ParallelAutomationCoordinator:
         self.total_attempts = 0
         self.bot_at_number_prompt = False
         self.bot_change_attempts = 0
+        self._reset_checker_failures()
 
         log("=" * 60)
         log("STARTING PARALLEL MEESHO OTP AUTOMATION")
@@ -1198,6 +1318,34 @@ class ParallelAutomationCoordinator:
                     )
         use_bot = self.bot.ready
         log(f"PRIMES bot flow: {'AUTO' if use_bot else 'MANUAL TRIGGER'}")
+        log(f"Checker: {self.checker.describe()}")
+
+        # Checker mode sanity. "bot" cannot work without the userbot, and
+        # starting the workers anyway would buy numbers only to cancel every
+        # one of them - so don't start at all. "auto" just degrades to the old
+        # API-only behaviour on API errors.
+        if self.checker.mode_wants_bot and not self.bot.ready:
+            if self.checker.mode == MODE_BOT:
+                reason = self.bot.start_error or "meesho_bot is not enabled/configured"
+                log(f"Checker mode is BOT but the PRIMES userbot is not ready ({reason}). "
+                    f"Not starting: every number would be bought and immediately "
+                    f"cancelled. Fix meesho_bot / run login_userbot.py, or set "
+                    f"checker.mode to 'api' or 'auto'.")
+                self.stop_requested.set()
+                self.is_running = False
+                self.notify.alert(
+                    "🛑 Checker mode 'bot' cannot run",
+                    f"checker.mode is \"bot\" but the PRIMES userbot is not ready:\n"
+                    f"{reason}\n\n"
+                    "No workers were started (each bought number would only be "
+                    "cancelled). Fix meesho_bot (enabled, api_id/api_hash, "
+                    "bot_username, userbot.session.txt) or set checker.mode to "
+                    '"api" or "auto" and run again.'
+                )
+                return
+            log("Checker mode AUTO: the PRIMES bot fallback is not ready, so an API "
+                "error will cancel the number as before (enable meesho_bot for the "
+                "fallback).")
         log("=" * 60)
 
         for client in self.clients:
@@ -1545,6 +1693,50 @@ def set_referral_link(config_path, link):
     return True
 
 
+def set_checker_mode(config_path, mode):
+    """
+    Write "mode" into the "checker" section of config.json in place, keeping
+    the rest of the file (ordering, other keys) untouched. Returns True.
+    """
+    import re
+
+    mode = normalize_mode(mode, default=None)
+    if mode is None:
+        raise ValueError(f"unknown checker mode: {mode!r} (use api, bot or auto)")
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        text = f.read()
+
+    block = re.search(r'"checker"\s*:\s*\{', text)
+    if not block:
+        raise ValueError(f'no "checker" section found in {config_path}')
+
+    depth = 1
+    index = block.end()
+    while index < len(text) and depth:
+        if text[index] == "{":
+            depth += 1
+        elif text[index] == "}":
+            depth -= 1
+        index += 1
+    if depth:
+        raise ValueError(f'unbalanced braces in the "checker" section of {config_path}')
+
+    inner_start, inner_end = block.end(), index - 1
+    inner = text[inner_start:inner_end]
+    quoted = json.dumps(mode)
+
+    existing = re.search(r'("mode"\s*:\s*)("(?:[^"\\]|\\.)*")', inner)
+    if existing:
+        new_inner = inner[:existing.start(2)] + quoted + inner[existing.end(2):]
+    else:
+        new_inner = '\n    "mode": ' + quoted + "," + inner
+
+    with open(config_path, "w", encoding="utf-8") as f:
+        f.write(text[:inner_start] + new_inner + text[inner_end:])
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(description="Meesho OTP automation with parallel provider clients.")
     parser.add_argument("--provider",
@@ -1559,8 +1751,36 @@ def main():
                         action="store_true",
                         help="Clear meesho_bot.referral_link in config.json and exit "
                              "(the bot's own 'I don't have a refer code' option is used)")
+    parser.add_argument("--checker-mode",
+                        choices=["api", "bot", "auto"],
+                        help="Number checker to use: 'api' (checker API only), "
+                             "'bot' (PRIMES bot checker only) or 'auto' (API first, "
+                             "PRIMES bot when the API is down / too slow / rejects "
+                             "every key). Saved into config.json and exit.")
+    parser.add_argument("--checker-status",
+                        action="store_true",
+                        help="Print the configured checker mode and exit")
 
     args = parser.parse_args()
+
+    if args.checker_mode:
+        config_path = next((n for n in CONFIG_FILES if os.path.exists(n)), None)
+        if not config_path:
+            log(f"Fatal: neither {', '.join(CONFIG_FILES)} could be found.")
+            return
+        try:
+            set_checker_mode(config_path, args.checker_mode)
+        except Exception as exc:
+            log(f"Fatal: could not update {config_path}: {exc}")
+            return
+        log(f"checker.mode set to \"{args.checker_mode}\" in {config_path}.")
+        if args.checker_mode == "bot":
+            log("The checker will use the PRIMES bot only; it needs meesho_bot "
+                "enabled + configured, and every check fails until the userbot is ready.")
+        elif args.checker_mode == "auto":
+            log("The checker will use the API while it works and switch to the "
+                "PRIMES bot on API errors - the bot needs meesho_bot enabled + configured.")
+        return
 
     if args.set_referral_link or args.no_referral_link:
         config_path = next((n for n in CONFIG_FILES if os.path.exists(n)), None)
@@ -1593,6 +1813,10 @@ def main():
 
     if args.balance:
         print(coordinator.get_balances_summary())
+        return
+
+    if args.checker_status:
+        print(coordinator.checker_status_text())
         return
 
     coordinator.run()
