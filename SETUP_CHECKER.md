@@ -114,6 +114,16 @@ can be tuned exactly. The flow is: it asks the bot for the 10-digit number,
 reads `"registered" / "not registered" from the screen (matching the hints),
 then optionally goes back to its main menu before it searches for another.
 
+**Continuous checking (dedicated checker bot improvement):** after every number
+check there is **no need for tapping Start** - it can directly give another
+number. The dedicated bot stays at its result/prompt screen and the next
+number is sent straight away without navigating via Main Menu / Check Number.
+`reset_after_check: false` + `continuous: true` (the new defaults for
+`checker.telegram_bot`) enables this. A "Check Another" button
+(`check_another_hints`) is used as fallback when direct send is not accepted.
+`checker.bot` (PRIMES) still defaults to `reset_after_check: true` because
+that bot shares the login conversation.
+
 ### The "Meesho Xxpress Manish" bot (tuned defaults)
 
 `config.json` -> `checker.telegram_bot` ships pre-tuned for the second
@@ -160,8 +170,10 @@ concurrent number checks with a single bot visit:
   exactly the verdict for its own number; a number the bot forgot to answer
   fails just that one check (the usual cancel-and-refund path), not the batch.
 * With batching off (default), every check is its own bot visit — same
-  behaviour as before. A lone check with batching on simply runs as a single
-  visit after the window closes.
+  behaviour as before, but with `continuous: true` the dedicated bot accepts
+  the next number directly without tapping Start. A lone check with batching
+  on simply runs as a single visit after the window closes, and stays ready
+  for the next batch.
 
 ### When the dedicated checker bot is NOT used (and why)
 
@@ -286,7 +298,9 @@ locked in by `test_bot_checker_flow.py`):
 | `registered_hints` / `not_registered_hints` | `[]` | Extra result wording for registered / not-registered screens |
 | `step_timeout_seconds` | `30` | Budget for one screen/step of the check |
 | `max_attempts` | `2` | How many times the number may be sent if the bot keeps re-asking |
-| `reset_after_check` | `true` | Return to the main menu after the verdict |
+| `reset_after_check` | `true` (PRIMES) / `false` (dedicated) | Return to the main menu after the verdict. For dedicated checker bot `false` keeps it ready for direct next number |
+| `continuous` / `reuse_checker` | `false` (PRIMES) / `true` (dedicated) | Stay at result/prompt so next number is sent directly without tapping Start. Dedicated bot improvement |
+| `check_another_hints` | `[]` | Extra labels for "Check Another Number" button (fallback when direct send fails) |
 | `stop_after_failures` | `3` | Consecutive failed checks (bot mode / bot fallback) after which the whole run stops with a 🛑 alert instead of buying numbers only to cancel them. `0` = never stop |
 
 Matching is done on emoji-stripped, lowercased labels, so hints are plain text
@@ -407,7 +421,48 @@ Failure types (`checker_client.py`) are what `auto` mode classifies:
 | `network_backoff_seconds` | `1.5` | Backoff between retries after network errors / 5xx. |
 | `timeout` | `15` | Per-request HTTP timeout — the read timeout that `auto` treats as "too slow" and hands to the bot. |
 
-## 6. Verify
+## 6. PRIMES fallback disabled + self-heal mode (new)
+
+**Problem solved:** dedicated checker `@manishmeeshobot` and PRIMES bot share the SAME Telegram account → same FloodWait limit (2622s in prod). Old flow: dedicated fails → fallback to PRIMES → PRIMES hits FloodWait → cancellation. Wasted.
+
+**Fix:**
+
+1. **PRIMES fallback disabled by default** when a dedicated checker bot is configured:
+```json
+"telegram_bot": {
+  "enabled": true,
+  "username": "@manishmeeshobot",
+  "fallback_to_primes": false,   // default false - no PRIMES fallback
+  "self_heal_enabled": true,     // default true - auto pause on FloodWait
+  "self_heal_max_wait_seconds": 3600  // cap pause at 1h (2622s will be honored)
+}
+```
+- `fallback_to_primes: false` (default): if dedicated checker fails for ANY reason, it does NOT try PRIMES. It cancels with refund directly. Set to `true` to restore old behaviour (try PRIMES as last resort).
+- When no dedicated bot is configured, PRIMES is still used as before (flag only matters when dedicated is present).
+
+2. **Self-heal mode** for FloodWait:
+- When `A wait of X seconds is required` is seen, `meesho_bot_client` records `_floodwait_until` (shared between both bots via proxy).
+- `checker_router` tracks bot FloodWait cooldown (`bot_floodwait_remaining()`).
+- Worker loop (`main.py`) detects FloodWait, enters self-heal pause:
+  - Logs `🤖 Self-heal mode ON: pausing WORKER for Xs (FloodWait was Ys)`
+  - Sleeps in 5s chunks (responsive to stop), up to `self_heal_max_wait_seconds` (default 3600).
+  - During pause, no new numbers are bought - prevents buying numbers that will be cancelled.
+  - After pause, clears cooldown and resumes. Failure streak is NOT counted, so it doesn't trigger critical stop.
+  - If `self_heal_enabled: false`, old behaviour: immediate cancel and continue (may hit FloodWait repeatedly).
+
+**Config changes required?** None - defaults are safe:
+- Existing installs without these keys get `fallback_to_primes=false` (no PRIMES fallback) and `self_heal_enabled=true` (auto pause). This is what you want to prevent the 2622s cascade.
+- To re-enable old PRIMES fallback: set `checker.telegram_bot.fallback_to_primes: true` in config.json.
+- To disable self-heal pause: set `checker.telegram_bot.self_heal_enabled: false`.
+
+**Logs you will see:**
+```
+Dedicated checker bot hit FloodWait (A wait of 2622 seconds...); NOT trying PRIMES bot as fallback (same Telegram account shares the limit) - cancelling with refund.
+Checker error (mode auto): Telegram FloodWait - ... Both dedicated checker and PRIMES share the same Telegram account, so they share the rate limit. Cancelling 9954276790 with refund.
+🤖 Self-heal mode ON: pausing VSIMPRO for 2622s (FloodWait was 2622s, max_wait 3600s) - will auto-resume after cooldown.
+```
+
+## 7. Verify
 
 Offline checks (no network, scripted responses and a fake Telethon bot):
 

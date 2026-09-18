@@ -1098,6 +1098,39 @@ class ParallelAutomationCoordinator:
                 time.sleep(1)
                 continue
 
+            # Self-heal: if bot checker is in FloodWait cooldown, pause fetching
+            # instead of buying numbers that will be cancelled.
+            try:
+                bot_fw = float(self.checker.bot_floodwait_remaining() or 0)
+            except Exception:
+                bot_fw = 0.0
+            if bot_fw > 1.0:
+                try:
+                    self_heal_on = bool(getattr(self.checker, "self_heal_enabled", True))
+                except Exception:
+                    self_heal_on = True
+                if self_heal_on:
+                    try:
+                        max_wait = float(getattr(self.checker, "self_heal_max_wait", 3600.0) or 3600.0)
+                    except Exception:
+                        max_wait = 3600.0
+                    wait_for = bot_fw if max_wait <= 0 else min(bot_fw, max_wait)
+                    log(f"Checker bot in FloodWait cooldown ({bot_fw:.0f}s left) - "
+                        f"self-heal pausing {pname} for {wait_for:.0f}s before next number.",
+                        prefix=pname)
+                    self.worker_statuses[client.name] = f"Self-heal pause {wait_for:.0f}s (FloodWait {bot_fw:.0f}s)"
+                    slept = 0
+                    while slept < wait_for and not self.stop_requested.is_set():
+                        if self.target_found_event.is_set():
+                            break
+                        chunk = min(5.0, wait_for - slept)
+                        time.sleep(chunk)
+                        slept += chunk
+                    if self.stop_requested.is_set():
+                        break
+                    # Re-check after pause
+                    continue
+
             with self.attempts_lock:
                 if self.worker_attempts[client.name] >= client_max_attempts:
                     log(f"Reached configured max attempts ({client_max_attempts}). Worker completed.", prefix=pname)
@@ -1267,15 +1300,124 @@ class ParallelAutomationCoordinator:
                     return
                 continue
             except (CheckerUnavailable, CheckerError) as exc:
-                log(f"Checker error (mode {self.checker.mode}): {exc}. "
-                    f"Cancelling number...", prefix=pname)
+                msg = str(exc)
+                is_flood = ("wait of" in msg.lower() and "seconds is required" in msg.lower()) or "floodwait" in msg.lower()
+                # Extract FloodWait seconds for self-heal
+                flood_seconds = 0
+                if is_flood:
+                    import re as _re
+                    m = _re.search(r"wait of (\d+)", msg, _re.IGNORECASE)
+                    if m:
+                        try:
+                            flood_seconds = int(m.group(1))
+                        except Exception:
+                            flood_seconds = 0
+                    # Also check bot's own tracking (more accurate)
+                    try:
+                        remaining = float(self.checker.bot_floodwait_remaining() or 0)
+                        if remaining > flood_seconds:
+                            flood_seconds = int(remaining)
+                    except Exception:
+                        pass
+                    # Fallback: try bot client directly
+                    try:
+                        br = float(self.checker.bot.floodwait_remaining or 0)
+                        if br > flood_seconds:
+                            flood_seconds = int(br)
+                    except Exception:
+                        pass
+
+                if is_flood:
+                    log(f"Checker error (mode {self.checker.mode}): Telegram FloodWait - {exc}. "
+                        f"Both dedicated checker and PRIMES share the same Telegram account, "
+                        f"so they share the rate limit. Cancelling {clean_number} with refund.",
+                        prefix=pname)
+
+                    # Self-heal mode: pause and auto-resume instead of hammering
+                    try:
+                        self_heal_on = bool(getattr(self.checker, "self_heal_enabled", True))
+                    except Exception:
+                        self_heal_on = True
+                    try:
+                        max_wait = float(getattr(self.checker, "self_heal_max_wait", 3600.0) or 3600.0)
+                    except Exception:
+                        max_wait = 3600.0
+
+                    if self_heal_on and flood_seconds > 0:
+                        # Enter bot FloodWait cooldown so other workers also pause
+                        try:
+                            self.checker._enter_bot_floodwait(flood_seconds)
+                        except Exception:
+                            pass
+
+                        wait_for = flood_seconds
+                        if max_wait > 0:
+                            wait_for = min(flood_seconds, max_wait)
+
+                        log(f"🤖 Self-heal mode ON: pausing {pname} for {wait_for:.0f}s "
+                            f"(FloodWait was {flood_seconds}s, max_wait {max_wait:.0f}s) - "
+                            f"will auto-resume after cooldown. No more numbers will be bought "
+                            f"during this pause.", prefix=pname)
+                        self.worker_statuses[client.name] = f"Self-heal pause {wait_for:.0f}s (FloodWait {flood_seconds}s)"
+
+                        # Sleep in small chunks so stop_requested is responsive
+                        slept = 0
+                        while slept < wait_for and not self.stop_requested.is_set():
+                            chunk = min(5.0, wait_for - slept)
+                            time.sleep(chunk)
+                            slept += chunk
+                            # Update status with remaining
+                            remaining = wait_for - slept
+                            if remaining > 0 and int(remaining) % 30 == 0:
+                                log(f"Self-heal: {pname} still paused, {remaining:.0f}s left...",
+                                    prefix=pname)
+
+                        if self.stop_requested.is_set():
+                            return
+
+                        log(f"Self-heal: {pname} resuming after {wait_for:.0f}s pause - "
+                            f"clearing FloodWait cooldown and retrying.",
+                            prefix=pname)
+                        try:
+                            # Clear if we waited the full FloodWait, otherwise keep remaining
+                            if flood_seconds <= max_wait:
+                                self.checker._clear_bot_floodwait()
+                                # Also clear client-side tracking if possible
+                                try:
+                                    bot_client = self.bot
+                                    if bot_client:
+                                        with getattr(bot_client, "_floodwait_lock", threading.RLock()):
+                                            bot_client._floodwait_until = 0.0
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                        # Don't count FloodWait as a checker failure when self-heal is on
+                        self._reset_checker_failures()
+                    else:
+                        if not self_heal_on:
+                            log(f"Self-heal mode OFF: not auto-pausing, will continue and may hit "
+                                f"FloodWait again. Enable with checker.telegram_bot.self_heal_enabled=true",
+                                prefix=pname)
+                else:
+                    log(f"Checker error (mode {self.checker.mode}): {exc}. "
+                        f"Cancelling number...", prefix=pname)
                 self.handle_cancellation(client, activation_id, clean_number, f"Checker error: {exc}")
                 if self.stop_requested.is_set():
                     return
                 # With the bot (or the bot fallback) in the checking path, a run
                 # of failures means the checker itself is broken: stop instead
                 # of buying numbers only to cancel them.
+                # For FloodWait with self-heal ON, we already reset the streak above,
+                # so we skip counting it as a failure.
                 if isinstance(exc, CheckerUnavailable) and self.checker.mode_wants_bot:
+                    if is_flood:
+                        try:
+                            if bool(getattr(self.checker, "self_heal_enabled", True)):
+                                # Self-heal handled the pause, don't count towards critical stop
+                                continue
+                        except Exception:
+                            pass
                     streak = self._note_checker_failure()
                     limit = self.checker.stop_after_failures
                     if limit and streak >= limit:
@@ -1823,8 +1965,13 @@ class ParallelAutomationCoordinator:
         return _BotClaim(self, "check", timeout=timeout, wait=timeout > 0)
 
     def _bot_login_claim(self):
-        """Claim the bot for a whole login/OTP/recovery flow (blocking)."""
-        return _BotClaim(self, "login", timeout=0, wait=True)
+        """Claim the bot for a whole login/OTP/recovery flow (blocking).
+
+        Login outranks prewarm: if the offer pre-warm is rerolling when a
+        number is found, the login waits for it to finish instead of
+        cancelling the paid number. 120s covers worst-case reroll budgets.
+        """
+        return _BotClaim(self, "login", timeout=120, wait=True)
 
     def _bot_warm_loop(self):
         """
@@ -1913,12 +2060,26 @@ class ParallelAutomationCoordinator:
             return False
 
     def _bot_warm_once(self):
-        """Walk the bot to an agreed offer and park it there (best effort)."""
+        """Walk the bot to an agreed offer and park it there (best effort).
+
+        If a target number appears while we are about to warm, abort - the
+        login flow will take the bot (it waits for prewarm to finish, see
+        _bot_login_claim). This avoids the 'PRIMES bot is busy (owner: prewarm)'
+        cancellation.
+        """
         prepare = getattr(self.bot, "prepare_offer", None)
         if not callable(prepare):
             return
+        # Quick check before trying to claim: don't start warming if a target
+        # is already waiting to be processed.
+        if self.target_found_event.is_set() or self.bot_login_active:
+            return
         try:
             with _BotClaim(self, "prewarm", timeout=0, wait=False):
+                # Re-check inside the claim: target may have appeared between
+                # the outer check and acquiring the lock.
+                if self.target_found_event.is_set() or self.bot_login_active:
+                    return
                 res = prepare()
         except BotBusy:
             return
@@ -2229,11 +2390,82 @@ class ParallelAutomationCoordinator:
                             # The login/OTP/recovery flow owns the PRIMES bot
                             # for as long as this number is in play: no number
                             # check may walk the bot away from its OTP screen
-                            # (see _BotClaim).
-                            with self._bot_login_claim():
-                                cont = self._process_target(target, use_bot)
+                            # (see _BotClaim). Login outranks prewarm - it now
+                            # waits up to 120s for prewarm to finish instead of
+                            # raising BotBusy immediately.
+                            # Retry once if prewarm was still holding the lock.
+                            last_exc = None
+                            for attempt in range(3):
+                                try:
+                                    with self._bot_login_claim():
+                                        cont = self._process_target(target, use_bot)
+                                    last_exc = None
+                                    break
+                                except BotBusy as busy_exc:
+                                    # Prewarm busy should NOT cancel a paid
+                                    # number - it should wait and then use the
+                                    # parked offer (or reroll if needed).
+                                    if "prewarm" in str(busy_exc).lower() and attempt < 2:
+                                        log(f"PRIMES bot busy with prewarm while processing "
+                                            f"{target.clean_number} (attempt {attempt+1}/3) - "
+                                            f"waiting for prewarm to finish instead of cancelling...",
+                                            prefix=target.provider_name.upper())
+                                        time.sleep(3 + attempt * 2)
+                                        last_exc = busy_exc
+                                        continue
+                                    raise
+                            if last_exc is not None:
+                                # Still busy after retries - treat as busy, not crash
+                                raise last_exc
                         else:
                             cont = self._process_target(target, use_bot)
+                    except BotBusy as exc:
+                        # Login claim still busy after waiting (prewarm stuck or
+                        # another login - the latter should not happen). For
+                        # prewarm we WAIT and retry the same number instead of
+                        # cancelling it - prewarm exists to SAVE time/numbers.
+                        pname = target.provider_name.upper()
+                        is_prewarm = "prewarm" in str(exc).lower()
+                        if is_prewarm:
+                            log(f"PRIMES bot busy with prewarm for {target.clean_number} "
+                                f"after retries - keeping the number and waiting for "
+                                f"prewarm to release (not cancelling).",
+                                prefix=pname)
+                            # Don't cancel, don't clear target - let it be
+                            # retried after a short wait. The outer loop will
+                            # re-enter processing for the same active_target.
+                            time.sleep(5)
+                            # Keep the target, don't clear, retry processing
+                            # in next iteration of the outer while loop.
+                            continue
+                        # Genuine login busy (should not happen for login vs login
+                        # because only one target is processed at a time) - fall
+                        # through to generic handler which cancels with refund.
+                        log(f"Unexpected BotBusy while processing {target.clean_number}: {exc}",
+                            prefix=pname)
+                        log(traceback.format_exc(), prefix=pname)
+                        self.notify.alert(
+                            f"🛑 [{pname}] Bot busy - target skipped",
+                            f"Number: {target.clean_number}\nError: {exc}\n\n"
+                            "The activation is cancelled and the refund tally checked; "
+                            "the search continues with the next number."
+                        )
+                        if use_bot:
+                            try:
+                                self.bot.cancel_flow()
+                            except Exception:
+                                pass
+                            self.bot_at_number_prompt = False
+                            self.bot_change_attempts = 0
+                        try:
+                            self.handle_cancellation(
+                                target.client, target.activation_id, target.clean_number,
+                                f"Bot busy: {exc}", expect_refund=True,
+                            )
+                        except Exception as exc2:
+                            log(f"Cancellation after bot busy failed: {exc2}", prefix=pname)
+                        self._clear_target()
+                        cont = "continue"
                     except Exception as exc:
                         # Last-resort net: nothing may ever crash the whole
                         # automation run again (a bare TimeoutError from the
