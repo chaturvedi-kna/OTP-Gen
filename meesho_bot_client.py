@@ -139,6 +139,12 @@ S_SENDING_OTP = "otp_sending"
 # code is submitted, before "Account linked!" (or a wrong-code error) appears:
 # transient, keep waiting - never report it as the flow's outcome.
 S_VERIFYING = "verifying"
+# Transient "the bot is preparing the next screen" copy ("⏳ Setting things
+# up…") the bot shows between a tap (Try Another Offer / Try Again / Change
+# Number / Normal) and the offer that follows it. It normally lasts a second or
+# two, but can outlive a whole step timeout when the bot throttles after many
+# rerolls - it must be waited through, never read as a dead end.
+S_WORKING = "working"
 S_LINKED = "linked"
 S_WRONG_OTP = "wrong_otp"
 S_EXPIRED = "otp_expired"
@@ -215,6 +221,50 @@ _CHECKING_HINTS = (
     "checking", "please wait", "just a moment", "one moment", "processing",
     "searching", "looking up", "fetching", "wait a", "hold on",
 )
+
+# -- login number-prompt wording ---------------------------------------------
+#
+# classify() only recognises the offer/number prompt through the "Try Another
+# Offer" button or "10-digit mobile" + "continue" copy. Bot revisions whose
+# prompt is worded differently (no reroll button, "Enter the mobile number you
+# want to link", a translated copy, ...) land on S_UNKNOWN - which used to make
+# the Change Number recovery give up, drop the bot back to the main menu and
+# re-roll the offer from scratch (slow, and it burns the paid number's OTP
+# window). These hints let that screen be recognised as the prompt it is; they
+# can be extended per bot revision with meesho_bot.number_prompt_hints.
+NUMBER_PROMPT_HINTS = (
+    "10-digit mobile", "10 digit mobile", "10digit mobile",
+    "10-digit number", "10 digit number", "10digit number",
+    "mobile number", "phone number", "enter your number", "send your number",
+    "type your number", "paste your number", "enter the number",
+    "send the number", "number to link", "number you want to link",
+    "number you wish to link", "link your number", "new number",
+    "another number", "different number",
+)
+_NUMBER_ASK_WORDS = ("enter", "send", "type", "paste", "provide", "share",
+                     "give", "input", "submit", "your", "new", "another")
+# The "⚠️ Failed to fetch offer" three-button variant (🔄 Try Again /
+# ➡️ Continue without offer / ❌ Cancel). It is a reroll screen, NOT a number
+# prompt, even though it carries price lines.
+_OFFER_VARIANT_HINTS = (
+    "failed to fetch offer", "couldn't load", "could not load", "unable to load",
+    "offer · null", "offer null", "continue without offer", "try again to retry",
+)
+# The bot's "I am fetching the next offer right now" copy, shown as an edit
+# between a reroll tap and the offer screen.
+WORKING_HINTS = (
+    "setting things up", "setting up", "setting-up", "setup in progress",
+    "preparing", "loading", "working on it", "working on your",
+    "hold on", "please wait", "just a moment", "one moment", "wait a moment",
+    "wait a sec", "fetching your offer", "getting your offer",
+    "finding the best offer", "looking for an offer", "checking offers",
+    "grabbing your offer",
+)
+# Wording that belongs to the bot CHECKER, not to the login flow. A cold read
+# (no tap context) must never type a paid number into the checker's "send the
+# number" prompt, and that prompt is worded almost exactly like the login
+# prompt - the check/verify/registration vocabulary is what tells them apart.
+_CHECKER_WORD_HINTS = ("check", "verify", "registered", "registration")
 
 # A short hint (a single short word) is matched on word boundaries so e.g.
 # "no" can never match inside "notification".
@@ -353,6 +403,70 @@ class Screen:
                 if _REROLL_TRY_AGAIN_RE.match(normalize_label(label)):
                     return r, c, label
         return None
+
+    # -- login number prompt -----------------------------------------------
+
+    def looks_like_number_prompt(self, extra_hints=(), require_offer_marker=False):
+        """
+        True when this screen is the LOGIN number prompt - the offer screen the
+        bot shows before it sends the OTP - including revisions whose copy or
+        buttons classify() does not recognise as S_OFFER (the real one e.g. is
+        "✏️ Change Number - Send the 10-digit mobile number you'd like to use
+        instead." with a lone Cancel button).
+
+        `require_offer_marker` is the COLD-READ mode (no tap context: the
+        coordinator asking "may I send a number here?", or a login deciding to
+        reuse the screen the bot sits on). The one screen it must never accept
+        is the bot CHECKER's "send the number to check" prompt - worded almost
+        exactly like the login prompt - so checker vocabulary
+        (check/verify/registered) rules it out there. Configured
+        `extra_hints` always win, in both modes.
+
+        Known screens (menu, login mode, referral, OTP-wait, linked, blocked,
+        the transient "sending/verifying/preparing" ones) are never a number
+        prompt, and neither is the "⚠️ Failed to fetch offer / 🔄 Try Again"
+        variant: it carries a decoy price and must be rerolled, not typed into.
+        """
+        state = self.classify()
+        if state == S_OFFER:
+            return True
+        if state != S_UNKNOWN:
+            return False
+        text = normalize_label(self.text)
+        if self.looks_like_checking():
+            return False
+        if self.check_verdict() is not None:
+            return False
+        # The offer-fetch variant asks for a tap, not for a number: it carries
+        # a decoy price ("Offer · Null" next to "UPI · ₹83") and must be
+        # rerolled, never typed into.
+        if self.reroll_button() is not None and any(
+                hint in text for hint in _OFFER_VARIANT_HINTS):
+            return False
+        # Explicit per-revision hints win in both modes.
+        if extra_hints and _hint_match(text, tuple(extra_hints)):
+            return True
+        # Cold read: the checker's prompt is worded like the login prompt; its
+        # check/verify/registration vocabulary is what tells them apart.
+        if require_offer_marker and _hint_match(text, _CHECKER_WORD_HINTS):
+            return False
+        if _hint_match(text, NUMBER_PROMPT_HINTS):
+            return True
+        # Unlisted copy: an ask-for-a-number sentence on a screen that carries
+        # an offer marker ("Enter the mobile no. to continue with this offer").
+        marker = (
+            self.reroll_button() is not None
+            or self.upi_price is not None
+            or "offer" in text
+            or self.has_button("continue", "change number", "submit", "next")
+        )
+        if require_offer_marker and not marker:
+            return False
+        return bool(
+            marker
+            and any(word in text for word in ("number", "mobile", "phone"))
+            and any(word in text for word in _NUMBER_ASK_WORDS)
+        )
 
     # -- referral screen ---------------------------------------------------
 
@@ -664,6 +778,14 @@ class Screen:
             t.startswith("checking your code") or t.startswith("confirming your code")
         ):
             return S_VERIFYING
+        # Transient: the bot is fetching the next screen ("⏳ Setting things
+        # up…") between a tap and the offer it produces. Checked before the
+        # offer heuristics so such an edit is waited through instead of being
+        # read as a dead end; a screen carrying a price or a reroll button is
+        # offer family and keeps its own classification.
+        if (self.upi_price is None and self.reroll_button() is None
+                and _hint_match(t, WORKING_HINTS)):
+            return S_WORKING
         # Menu / login-mode / offer screens claim priority over the referral
         # check: only the dedicated promotion screen may classify as referral.
         if self.has_button("try another offer") or (
@@ -716,6 +838,59 @@ class MeeshoBotClient:
         self.max_change_number = int(conf.get("max_change_number", 5))
         self.step_timeout = float(conf.get("step_timeout_seconds", 60))
         self.poll_interval = float(conf.get("poll_interval_seconds", 1.2))
+
+        # Change Number recovery tuning. The number prompt normally appears a
+        # second or two after the tap, so it gets its own (short) settle budget
+        # instead of the full step timeout, and a tap the bot ignores is
+        # retried: both are far cheaper than the alternative - dropping back to
+        # the main menu, walking Add Account -> Login with Number -> Normal and
+        # re-rolling the offer while the paid number's OTP window runs.
+        self.change_number_retries = max(0, int(conf.get("change_number_retries", 2)))
+        try:
+            change_timeout = float(conf.get("change_number_timeout_seconds", 0) or 0)
+        except (TypeError, ValueError):
+            change_timeout = 0.0
+        self.change_number_timeout = (
+            change_timeout if change_timeout > 0
+            else max(5.0, min(self.step_timeout, 20.0))
+        )
+        self.change_number_variant_taps = max(
+            0, int(conf.get("change_number_variant_taps", 3)))
+        # Extra wait rounds for the transient "⏳ Setting things up…" screen the
+        # bot shows between a reroll tap and the offer it produces. It is
+        # normally over in a second, but a throttled bot (many rerolls in a row)
+        # can hold it longer than one step timeout - that must not kill a paid
+        # number with "Offer screen has no reroll button".
+        self.working_screen_waits = max(0, int(conf.get("working_screen_waits", 2)))
+        # Overall cap for one Change Number recovery (taps + waits together), so
+        # the retry loop can never take longer than the single full-step wait it
+        # replaces. 0 = auto: 30-45s, whatever is closest to the step timeout.
+        try:
+            change_budget = float(conf.get("change_number_budget_seconds", 0) or 0)
+        except (TypeError, ValueError):
+            change_budget = 0.0
+        self.change_number_budget = (
+            change_budget if change_budget > 0
+            else max(30.0, min(self.step_timeout, 45.0))
+        )
+        # Extra wording for the login number prompt (per bot revision), on top
+        # of NUMBER_PROMPT_HINTS.
+        self.number_prompt_hints = tuple(conf.get("number_prompt_hints") or ())
+        # Reuse a number prompt the bot is already sitting on instead of
+        # restarting the flow from the main menu.
+        self.reuse_number_prompt = bool(conf.get("reuse_number_prompt", True))
+        # What the coordinator does when Change Number cannot be recovered:
+        #   "auto"   - reset to the main menu only when the bot checker is
+        #              needed for the next number check (checker.mode "bot", or
+        #              "auto" while the checker API is down / cooling down);
+        #              with a working API the bot stays in-flow.
+        #   "always" - always reset (the old behaviour).
+        #   "never"  - never reset from here (prepare_login still walks back to
+        #              the menu itself when the bot really is lost).
+        policy = str(conf.get("reset_to_menu_on_change_failure", "auto")
+                     or "auto").strip().lower()
+        self.menu_reset_policy = policy if policy in ("auto", "always", "never") else "auto"
+
         # Hang watchdog for a whole bot flow. A flow is aborted only when it
         # stops making progress for this long (a single Telethon request may
         # legitimately be slow, but every screen poll / tap / settle step that
@@ -1268,12 +1443,16 @@ class MeeshoBotClient:
 
     # -- step settling -------------------------------------------------------
 
-    async def _settle(self, screen, states, timeout=None):
+    async def _settle(self, screen, states, timeout=None, accept_prompt=False):
         """
         Poll the newest screens until one of `states` shows, answering the
         referral prompt whenever it interrupts (the bot inserts it between
         "Login with Number" and the login-mode/offer steps, and can re-offer it
         later in the flow).
+
+        accept_prompt also stops on a number prompt that classify() does not
+        recognise as S_OFFER (bot revisions with different copy) - without it
+        such a screen burns the whole timeout before the caller can see it.
 
         Returns the matching screen, or whatever is on screen at the deadline -
         callers decide whether that is an error.
@@ -1281,6 +1460,12 @@ class MeeshoBotClient:
         timeout = timeout or self.step_timeout
         deadline = time.time() + timeout
         current = screen
+
+        def wanted(screen_):
+            if screen_.classify() in states:
+                return True
+            return accept_prompt and self._at_number_prompt(screen_)
+
         while True:
             self._progress()
             if current.classify() == S_REFERRAL:
@@ -1294,7 +1479,7 @@ class MeeshoBotClient:
                 else:
                     current = await self._a_resolve_referral(current)
                     continue
-            if current.classify() in states:
+            if wanted(current):
                 return current
             if time.time() >= deadline:
                 return current
@@ -1302,6 +1487,42 @@ class MeeshoBotClient:
             current = await self._latest_screen()
 
     # -- high-level flow -----------------------------------------------------
+
+    def _at_number_prompt(self, screen, require_marker=False):
+        """
+        True when `screen` is the login number prompt - classify()'s S_OFFER or
+        a revision copy recognised by looks_like_number_prompt().
+        """
+        return screen.classify() == S_OFFER or screen.looks_like_number_prompt(
+            self.number_prompt_hints, require_offer_marker=require_marker
+        )
+
+    def _reusable_prompt(self, screen):
+        """
+        True when a fresh login may send its number from this screen instead of
+        walking back to the main menu and re-rolling the offer.
+
+        Only a prompt the offer loop can actually work with is reused: one whose
+        price already fits the target, or one that can be rerolled in place (the
+        loop taps "Try Another Offer" / "Try Again" until the price fits). An
+        unpriced prompt is reused only when its wording is an explicit number
+        prompt - the price cannot be verified then, so the recognition has to be
+        unambiguous (never the bot checker's "send the number" prompt).
+        """
+        if not self.reuse_number_prompt:
+            return False
+        if not self._at_number_prompt(screen, require_marker=True):
+            return False
+        price = screen.upi_price
+        reroll = screen.reroll_button() is not None
+        if price is not None:
+            return price <= self.target_upi_price or reroll
+        if reroll:
+            return True
+        return bool(_hint_match(
+            normalize_label(screen.text),
+            tuple(self.number_prompt_hints) + NUMBER_PROMPT_HINTS,
+        ))
 
     async def _a_prepare_login(self, number, continue_from_prompt=False):
         """
@@ -1312,6 +1533,7 @@ class MeeshoBotClient:
         """
         rerolls = 0
         result = {"rerolls": 0, "upi": None}
+        reused_prompt = False
         self._note("starting the login flow" if not continue_from_prompt
                    else "resuming at the number prompt")
 
@@ -1329,7 +1551,9 @@ class MeeshoBotClient:
             # number. Never type a paid 10-digit number into something else -
             # in particular the referral prompt, which would read it as a link
             # and burn the activation. Settle the screen first.
-            screen = await self._settle(screen, (S_OFFER, S_OTP_WAIT, S_BLOCKED, S_LINKED))
+            screen = await self._settle(
+                screen, (S_OFFER, S_OTP_WAIT, S_BLOCKED, S_LINKED), accept_prompt=True
+            )
             state = screen.classify()
             if state in (S_OTP_WAIT, S_LINKED, S_BLOCKED):
                 # The number was already submitted (retry after a timeout, or
@@ -1349,41 +1573,73 @@ class MeeshoBotClient:
                     "number - the replacement number was NOT typed",
                     screen.text, screen.button_labels,
                 )
-            if state != S_OFFER:
+            if not self._at_number_prompt(screen):
                 raise MeeshoBotUnknownScreen(
                     "Expected the number prompt before sending the replacement number",
                     screen.text, screen.button_labels,
                 )
         else:
             state = screen.classify()
-            if state != S_MENU:
+            if state != S_MENU and self._reusable_prompt(screen):
+                # The bot is ALREADY sitting on a usable number prompt - e.g. a
+                # Change Number that reported "unknown" but worked, or a flow the
+                # coordinator deliberately left in place because the checker API
+                # (not the bot) answers the number checks. Send the number from
+                # here: no main-menu restart, no Add Account / Login with Number
+                # / Normal walk and no offer reroll (the loop below still
+                # rerolls in place when the price is above the target).
+                reused_prompt = True
+                price = screen.upi_price
+                self._log("[MEESHO-BOT] Bot is already at the number prompt "
+                          f"(UPI ₹{price if price is not None else 'n/a'}); reusing "
+                          "it - no main-menu restart, no offer reroll.")
+                self._note("reusing the number prompt the bot is already on")
+                screen = await self._settle(
+                    screen, (S_OFFER, S_OTP_WAIT, S_BLOCKED, S_LINKED),
+                    accept_prompt=True, timeout=self.change_number_timeout,
+                )
+                state = screen.classify()
+                if state in (S_OTP_WAIT, S_LINKED, S_BLOCKED):
+                    self._log(f"[MEESHO-BOT] Bot moved to '{state}' while the "
+                              f"number prompt was reused; not typing the number.")
+                    result.update({
+                        "upi": screen.upi_price,
+                        "rerolls": 0,
+                        "reused_prompt": True,
+                        "referral_action": self.last_referral_action,
+                        "message": screen.text,
+                        "stage": "blocked" if state == S_BLOCKED else "otp_sent",
+                    })
+                    return result
+            elif state != S_MENU:
                 screen = await self._cancel_to_menu()
 
-            # Add Account
-            if screen.classify() != S_LINK_CHOICE:
+            # Add Account (skipped when the number prompt above is reused).
+            if screen.classify() != S_LINK_CHOICE and not self._at_number_prompt(screen):
                 screen = await self._click(screen, "add account")
-            screen = await self._settle(screen, (S_LINK_CHOICE,))
-            if screen.classify() != S_LINK_CHOICE:
-                raise MeeshoBotUnknownScreen(
-                    "Expected 'How would you like to link'",
-                    screen.text, screen.button_labels,
-                )
+            if not self._at_number_prompt(screen):
+                screen = await self._settle(screen, (S_LINK_CHOICE,))
+                if screen.classify() != S_LINK_CHOICE:
+                    raise MeeshoBotUnknownScreen(
+                        "Expected 'How would you like to link'",
+                        screen.text, screen.button_labels,
+                    )
 
-            # Login with Number -> referral screen (🔗 Set Refer Link /
-            # 🎁 Referral link?) -> login mode. The referral step sits between
-            # these two on current bot revisions; _settle answers it whenever
-            # it appears, so both orderings work.
-            screen = await self._click(screen, "login with numb")
-            screen = await self._settle(screen, (S_LOGIN_MODE,))
-            if screen.classify() != S_LOGIN_MODE:
-                raise MeeshoBotUnknownScreen(
-                    "Expected 'Choose login mode'",
-                    screen.text, screen.button_labels,
-                )
+                # Login with Number -> referral screen (🔗 Set Refer Link /
+                # 🎁 Referral link?) -> login mode. The referral step sits between
+                # these two on current bot revisions; _settle answers it whenever
+                # it appears, so both orderings work.
+                screen = await self._click(screen, "login with numb")
+                screen = await self._settle(screen, (S_LOGIN_MODE,))
+                if screen.classify() != S_LOGIN_MODE:
+                    raise MeeshoBotUnknownScreen(
+                        "Expected 'Choose login mode'",
+                        screen.text, screen.button_labels,
+                    )
 
-            # Normal mode
-            self._log("[MEESHO-BOT] Tapping the 'Normal' login mode.")
-            screen = await self._click(screen, "normal")
+                # Normal mode
+                self._log("[MEESHO-BOT] Tapping the 'Normal' login mode.")
+                screen = await self._click(screen, "normal")
 
         # Offer screen + reroll until UPI price target is met. The reroll
         # button is normally "Try Another Offer"; some bot revisions show a
@@ -1391,6 +1647,11 @@ class MeeshoBotClient:
         # way. Variant screens that appear while waiting for an offer are
         # also tapped inside _settle_offer (bounded by the reroll budget).
         screen = await self._settle_offer(screen, self.max_offer_rerolls)
+        # A prompt with no readable price may only be accepted when the offer
+        # was already agreed (Change Number / a reused prompt) and cannot be
+        # rerolled - a fresh flow keeps insisting on a price it can compare
+        # with target_upi_price.
+        price_optional = bool(continue_from_prompt or reused_prompt)
         while True:
             self._progress()
             self._note(f"rolling offers for a UPI price ≤ ₹{self.target_upi_price} "
@@ -1398,10 +1659,28 @@ class MeeshoBotClient:
             state = screen.classify()
             if state in (S_BLOCKED, S_LINKED, S_OTP_WAIT, S_WRONG_OTP, S_EXPIRED):
                 break
+            if state == S_WORKING:
+                # The preparing screen outlived every wait round: the next
+                # offer never appeared (a throttled bot after many rerolls).
+                # Say exactly that instead of "no reroll button".
+                first_line = (screen.text or "").strip().splitlines()
+                raise MeeshoBotUnknownScreen(
+                    f"The bot stayed on its preparing screen "
+                    f"({first_line[0][:60] if first_line else 'working'}) through "
+                    f"{self.working_screen_waits + 1} wait round(s) after reroll "
+                    f"#{rerolls} - the next offer never appeared",
+                    screen.text, screen.button_labels,
+                )
             upi = screen.upi_price
             result["upi"] = upi
-            if state == S_OFFER and upi is not None and upi <= self.target_upi_price:
-                break
+            if self._at_number_prompt(screen):
+                if upi is not None and upi <= self.target_upi_price:
+                    break
+                if upi is None and price_optional and screen.reroll_button() is None:
+                    self._log("[MEESHO-BOT] Number prompt without a readable UPI "
+                              "price and no reroll button; the offer already "
+                              "stood, so it is accepted as it is.")
+                    break
             if rerolls >= self.max_offer_rerolls:
                 raise MeeshoBotUnknownScreen(
                     f"UPI price never reached ₹{self.target_upi_price} after {rerolls} rerolls",
@@ -1423,6 +1702,7 @@ class MeeshoBotClient:
 
         result["rerolls"] = rerolls
         result["upi"] = screen.upi_price
+        result["reused_prompt"] = reused_prompt
         result["referral_action"] = self.last_referral_action
 
         state = screen.classify()
@@ -1431,7 +1711,7 @@ class MeeshoBotClient:
             result["message"] = screen.text
             return result
 
-        if state != S_OFFER:
+        if not self._at_number_prompt(screen):
             raise MeeshoBotUnknownScreen(
                 "Expected offer/number-prompt screen", screen.text, screen.button_labels
             )
@@ -1471,7 +1751,7 @@ class MeeshoBotClient:
         result["message"] = screen.text
         return result
 
-    async def _settle_offer(self, screen, extra_taps=0):
+    async def _settle_offer(self, screen, extra_taps=0, timeout=None):
         """
         After a click that should lead to an offer, wait for the offer screen.
         Handles two interruptions:
@@ -1480,13 +1760,34 @@ class MeeshoBotClient:
             instead of an offer (no price on the screen): it waits for a tap,
             so it is tapped like "Try Another Offer" and waited on again -
             bounded by extra_taps so a stuck bot cannot spin the flow forever.
+        `timeout` shortens the wait for callers that must not sit idle (the
+        Change Number recovery, where a paid number's OTP window is running).
         Returns the settled screen; callers decide whether it is an error.
         """
         states = (S_OFFER, S_BLOCKED, S_LINKED, S_OTP_WAIT, S_LOGIN_MODE, S_LINK_CHOICE)
         taps = 0
+        working = 0
         while True:
-            if (screen.classify() not in states
-                    and screen.classify() != S_REFERRAL
+            state = screen.classify()
+            if state == S_WORKING:
+                # "⏳ Setting things up…": the next offer is being fetched. Wait
+                # it out (bounded) instead of returning a screen the caller can
+                # only misread as a dead end.
+                if working >= self.working_screen_waits:
+                    return screen
+                working += 1
+                first_line = (screen.text or "").strip().splitlines()
+                self._log(f"[MEESHO-BOT] Bot is preparing the next offer "
+                          f"({first_line[0][:60] if first_line else 'working'}); waiting "
+                          f"it out (round {working}/{self.working_screen_waits}).")
+                self._note(f"waiting for the offer behind the preparing screen "
+                           f"(round {working}/{self.working_screen_waits})")
+                screen = await self._settle(screen, states, timeout=timeout,
+                                            accept_prompt=True)
+                continue
+            if (state not in states
+                    and not self._at_number_prompt(screen)
+                    and state != S_REFERRAL
                     and screen.reroll_button() is not None):
                 # A non-offer screen that offers to reroll is the "Try Again"
                 # variant: tapping it now is faster (and more correct) than
@@ -1501,8 +1802,9 @@ class MeeshoBotClient:
                 screen = await self._click(screen, label)
                 taps += 1
                 continue
-            screen = await self._settle(screen, states)
-            if screen.classify() in states:
+            screen = await self._settle(screen, states, timeout=timeout,
+                                        accept_prompt=True)
+            if screen.classify() in states or self._at_number_prompt(screen):
                 return screen
             reroll = (None if screen.classify() == S_REFERRAL
                       else screen.reroll_button())
@@ -1588,31 +1890,98 @@ class MeeshoBotClient:
         Tap Change Number from the OTP-wait screen and (optionally) submit the
         replacement number, returning once the bot shows OTP-on-its-way again.
         Without a number, returns once the number-prompt/offer screen is shown.
+
+        Getting back to the number prompt is worth a bounded amount of effort:
+        the alternative is a full flow from the main menu (Add Account -> Login
+        with Number -> Normal -> offer rerolls), which is minutes slower and
+        burns the paid number's OTP window. So
+
+          * a prompt is recognised with looks_like_number_prompt() as well, not
+            only through classify()'s S_OFFER heuristics (bot revisions word it
+            differently - the old code gave up on those with "got unknown");
+          * a tap the bot ignores (it is still on the OTP screen, or still
+            working) is retried up to change_number_retries times;
+          * the waits use the short change_number_timeout / overall
+            change_number_budget instead of the full step timeout;
+          * only when the bot really left the login flow (main menu / link
+            choice / login mode) is "needs_full_flow" reported.
         """
         self._note("tapping Change Number")
         screen = await self._latest_screen()
-        state = screen.classify()
+        max_taps = max(1, self.change_number_retries + 1)
+        max_waits = max(1, self.change_number_retries)
+        taps = 0
+        waits = 0
+        deadline = time.time() + self.change_number_budget
 
-        if state == S_OFFER:
-            pass  # already at the number prompt
-        elif screen.has_button("change number"):
-            screen = await self._click(screen, "change number")
-            screen = await self._settle_offer(screen, self.max_offer_rerolls)
-        else:
-            # Unexpected place: rebuild a full flow instead.
-            screen = await self._cancel_to_menu()
-            if new_number is None:
-                return {"stage": "needs_full_flow"}
-            return await self._a_prepare_login(new_number)
+        def remaining(default=None):
+            """Time left in the recovery budget (never below a second)."""
+            default = self.change_number_timeout if default is None else default
+            return max(1.0, min(default, deadline - time.time()))
 
-        if screen.classify() != S_OFFER:
+        def give_up(state, why):
             raise MeeshoBotUnknownScreen(
-                f"Expected number prompt after Change Number, got {screen.classify()}",
+                f"Expected number prompt after Change Number, got {state} ({why}). "
+                "If this screen IS the bot's number prompt, add its wording to "
+                "meesho_bot.number_prompt_hints",
                 screen.text, screen.button_labels,
             )
 
+        while True:
+            if self._at_number_prompt(screen):
+                break  # the bot is asking for the number
+
+            state = screen.classify()
+
+            if state in (S_MENU, S_LINK_CHOICE, S_LOGIN_MODE):
+                # The bot left the login flow by itself (its OTP prompt expired,
+                # a manual /start, ...): the next number needs a full flow.
+                self._log("[MEESHO-BOT] Change Number: the bot is back at the "
+                          f"menu/login steps ('{state}'); a full flow is needed.")
+                if new_number is None:
+                    return {"stage": "needs_full_flow", "screen": screen.text}
+                return await self._a_prepare_login(new_number)
+
+            if state in (S_LINKED, S_BLOCKED):
+                # The previous number already produced an outcome: report it
+                # instead of tapping on - there is nothing to change.
+                return {"stage": "blocked" if state == S_BLOCKED else "linked",
+                        "message": screen.text, "screen": screen.text}
+
+            if time.time() >= deadline:
+                give_up(state, f"recovery budget of {self.change_number_budget:.0f}s spent")
+
+            if screen.has_button("change number"):
+                if taps >= max_taps:
+                    give_up(state, f"Change Number tapped {taps} time(s)")
+                taps += 1
+                self._note(f"tapping Change Number (attempt {taps}/{max_taps})")
+                if taps > 1:
+                    self._log(f"[MEESHO-BOT] Change Number tap #{taps}/{max_taps}: "
+                              f"the bot is still on '{state}' - tapping again.")
+                screen = await self._click(screen, "change number")
+                screen = await self._settle_offer(
+                    screen, self.change_number_variant_taps, timeout=remaining(),
+                )
+                continue
+
+            # Not the prompt, not the menu and no Change Number button: the bot
+            # may still be working (a transient screen, a slow in-place edit).
+            # Wait - briefly - and look again.
+            if waits >= max_waits:
+                give_up(state, "no Change Number button and the screen never settled")
+            waits += 1
+            self._note(f"waiting for the number prompt (round {waits}/{max_waits})")
+            screen = await self._settle(
+                screen,
+                (S_OFFER, S_MENU, S_LINK_CHOICE, S_LOGIN_MODE, S_OTP_WAIT,
+                 S_LINKED, S_BLOCKED),
+                timeout=remaining(), accept_prompt=True,
+            )
+
         if new_number is None:
-            return {"stage": "prompt", "screen": screen.text, "upi": screen.upi_price}
+            return {"stage": "prompt", "screen": screen.text, "upi": screen.upi_price,
+                    "taps": taps}
 
         self._note(f"sending replacement number {new_number} to the bot")
         screen = await self._send_text(str(new_number))
@@ -1875,6 +2244,22 @@ class MeeshoBotClient:
         with self._flow_lock:
             return self._run(self._latest_screen()).classify()
 
+    def at_number_prompt(self):
+        """
+        Read-only: True when the bot currently sits on the LOGIN number prompt
+        (the offer screen), including a revision copy classify() reports as
+        "unknown". The offer marker is required here - a cold read cannot tell
+        from context whether the bot is in the login flow, and the bot CHECKER's
+        "send the number to check" prompt must never be mistaken for it.
+
+        Lets the coordinator keep a flow it deliberately left in place (checker
+        API answering, so no main-menu reset was needed) instead of paying for a
+        full restart.
+        """
+        with self._flow_lock:
+            screen = self._run(self._latest_screen())
+        return self._at_number_prompt(screen, require_marker=True)
+
     def check_registration(self, number, overrides=None):
         """
         Ask the bot's own checker whether `number` is registered on Meesho.
@@ -1918,6 +2303,8 @@ class MeeshoBotClient:
 def _dump_screen(screen, title, checker=None):
     print(f"\n--- {title} ---")
     print(f"classified : {screen.classify()}")
+    print(f"number prompt: {screen.looks_like_number_prompt()} "
+          f"(strict/offer-marker: {screen.looks_like_number_prompt(require_offer_marker=True)})")
     print(f"referral   : {screen.is_referral} "
           f"(prompt={screen.referral_prompt}, rejected={screen.referral_rejected})")
     skip = screen.referral_skip_button()

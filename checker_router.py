@@ -283,6 +283,41 @@ class CheckerRouter:
         return self.mode in (MODE_BOT, MODE_AUTO)
 
     @property
+    def bot_check_needed(self):
+        """
+        True when the NEXT number check has to go through the PRIMES bot - i.e.
+        when the bot must be sitting on its main menu (check_registration walks
+        back to the menu itself, taps the checker button and returns there).
+
+        False when the checker API can answer the check: the login flow may then
+        stay where it is, so a failed Change Number does not have to be paid for
+        with a main-menu restart and a fresh offer reroll.
+        """
+        if self.mode == MODE_BOT:
+            return True
+        if self.mode == MODE_API:
+            return False
+        # auto: the bot is only needed while the API cannot answer.
+        if not self.api_ready:
+            return True
+        return self.cooldown_remaining() > 0
+
+    @property
+    def bot_check_reason(self):
+        """Why bot_check_needed is what it is (for logs and notifications)."""
+        if self.mode == MODE_BOT:
+            return "checker.mode is 'bot' - every check runs through the PRIMES bot"
+        if self.mode == MODE_API:
+            return "checker.mode is 'api' - the checker API answers every check"
+        if not self.api_ready:
+            return "no checker API keys configured - checks fall back to the PRIMES bot"
+        remaining = self.cooldown_remaining()
+        if remaining > 0:
+            return (f"the checker API is cooling down ({remaining:.0f}s left) - "
+                    f"checks currently go through the PRIMES bot")
+        return "the checker API is answering - the PRIMES bot is not needed for checks"
+
+    @property
     def key_count(self):
         try:
             return self.api.key_count()

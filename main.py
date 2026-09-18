@@ -264,7 +264,9 @@ class ParallelAutomationCoordinator:
             f"  Accounts linked: {s['accounts_linked']}\n"
             f"  Targets found: {s['targets_found']} | OTPs received: {s['otp_received']}\n"
             f"  Wrong OTP: {s['otp_wrong']} | Expired: {s['otp_expired']} | Blocked: {s['user_blocked']}\n"
-            f"  OTP timeouts: {s['otp_timeout']} | Change-number: {s['change_number']}\n"
+            f"  OTP timeouts: {s['otp_timeout']} | Change-number: {s['change_number']} "
+            f"(menu resets: {s.get('bot_menu_resets', 0)} | "
+            f"kept in-flow: {s.get('bot_flow_kept', 0)})\n"
             f"  Referral step: {s.get('referral_pasted', 0)} pasted | "
             f"{s.get('referral_skipped', 0)} skipped | {s.get('offer_rerolls', 0)} offer rerolls\n"
             f"  Checks: {s.get('checker_api_checks', 0)} via API | "
@@ -370,6 +372,18 @@ class ParallelAutomationCoordinator:
             else:
                 lines.append(f"PRIMES bot checker: ⚪ not ready "
                              f"({self.checker.bot.unavailable_reason or 'unknown reason'})")
+        # Whether the login flow must be able to fall back to the main menu:
+        # the bot checker works from there, the API checker does not need it.
+        needed = self._bot_checker_needed()
+        why = str(getattr(self.checker, "bot_check_reason", "") or "").strip()
+        lines.append(
+            f"Checks need the bot at its main menu: {'YES' if needed else 'NO'}"
+            + (f" ({why})" if why else "")
+            + ("\n→ a failed Change Number resets the bot to the menu"
+               if needed else
+               "\n→ a failed Change Number keeps the bot in-flow (no menu restart, "
+               "no offer reroll)")
+        )
         s = self.stats.snapshot()
         lines.append(
             f"Checks so far: {s.get('checker_api_checks', 0)} via API | "
@@ -860,6 +874,18 @@ class ParallelAutomationCoordinator:
         number = context.clean_number
         pname = context.provider_name.upper()
         self.worker_statuses[context.provider_name] = f"Bot: entering {number}"
+        if from_prompt and not self._bot_at_prompt():
+            # The coordinator believes the bot is waiting for a number, but it
+            # is not on the prompt anymore: a bot number check resets the bot to
+            # its main menu (checker.mode "bot" / an "auto" fallback), its prompt
+            # may also have expired. Ask read-only and take the full flow
+            # instead of typing a paid number into whatever is on screen now -
+            # and instead of failing and cancelling the number. The full flow
+            # reuses the prompt anyway when the bot happens to be on one.
+            log("Bot is no longer at the number prompt; running the full flow "
+                "instead of continuing from the prompt.", prefix=pname)
+            from_prompt = False
+            self.bot_at_number_prompt = False
         log(f"Driving PRIMES bot for {number} (from_prompt={from_prompt})...", prefix=pname)
         try:
             if from_prompt:
@@ -1128,39 +1154,163 @@ class ParallelAutomationCoordinator:
             )
         return status
 
+    def _bot_at_prompt(self):
+        """
+        Read-only: is the bot sitting on the login number prompt right now?
+        Never taps or types, so it is safe to ask between recovery steps.
+        """
+        try:
+            probe = getattr(self.bot, "at_number_prompt", None)
+            if callable(probe):
+                return bool(probe())
+            return self.bot.screen_state() == "offer"
+        except Exception as exc:
+            log(f"Could not read the bot screen: {exc}")
+            return False
+
+    def _bot_checker_needed(self):
+        """
+        True when the PRIMES bot (not the checker API) has to answer the next
+        number check - and therefore has to sit on its main menu.
+        """
+        needed = getattr(self.checker, "bot_check_needed", None)
+        if needed is None:
+            # A checker without the property (older stubs): assume the bot is
+            # needed whenever the mode wants it.
+            return bool(getattr(self.checker, "mode_wants_bot", False))
+        return bool(needed)
+
+    def _bot_menu_reset_needed(self):
+        """
+        (reset?, why) for a Change Number that could not be recovered.
+
+        The main menu is only worth the restart when the bot checker needs it:
+        with the checker API answering, dropping the bot out of the login flow
+        buys nothing and costs a full Add Account -> Login with Number -> Normal
+        -> offer-reroll walk on the next number.
+        """
+        policy = str(getattr(self.bot, "menu_reset_policy", "auto") or "auto").strip().lower()
+        if policy == "always":
+            return True, "meesho_bot.reset_to_menu_on_change_failure is 'always'"
+        if policy == "never":
+            return False, "meesho_bot.reset_to_menu_on_change_failure is 'never'"
+        why = str(getattr(self.checker, "bot_check_reason", "") or "").strip()
+        if self._bot_checker_needed():
+            return True, why or "the PRIMES bot checker is needed for the next number check"
+        return False, why or "the checker API is answering, so the bot is not needed on its main menu"
+
+    def _bot_menu_reset(self, pname, why):
+        """Drop the bot back to its main menu (best effort)."""
+        log(f"Resetting the bot to the main menu ({why}).", prefix=pname)
+        try:
+            self.bot.cancel_flow()
+        except Exception as exc:
+            log(f"Reset of the bot flow failed ({exc}); a manual /start may be needed.",
+                prefix=pname)
+        self.bot_at_number_prompt = False
+
     def _bot_prepare_change_number(self, context):
         """
         Tell the PRIMES bot to Change Number so the next found number is sent
         straight to the number prompt. Cancels/refunds the provider activation
-        via the caller. Returns True if the bot now awaits a new number.
+        via the caller.
+
+        Returns {"prompt_ready", "menu_reset", "reason"}:
+          * prompt_ready - the bot now awaits the replacement number;
+          * menu_reset   - the bot was dropped back to the main menu, so the
+            next number runs the full flow (offer rerolls included).
+
+        A Change Number the bot does not answer is retried INSIDE the bot client
+        (bounded by meesho_bot.change_number_* settings), and a failure no
+        longer automatically means "restart from the main menu": see
+        _bot_menu_reset_needed().
         """
         pname = context.provider_name.upper()
         self.bot_change_attempts += 1
-        if self.bot_change_attempts > self.bot.max_change_number:
-            log("Change Number attempt cap reached; resetting bot to main menu.", prefix=pname)
-            try:
-                self.bot.cancel_flow()
-            except Exception:
-                pass
-            self.bot_at_number_prompt = False
-            self.bot_change_attempts = 0
-            return False
+        outcome = {"prompt_ready": False, "menu_reset": False, "reason": ""}
 
+        if self.bot_change_attempts > self.bot.max_change_number:
+            log(f"Change Number attempt cap ({self.bot.max_change_number}) reached.",
+                prefix=pname)
+            self._bot_menu_reset(pname, "the Change Number attempt cap was reached")
+            self.bot_change_attempts = 0
+            outcome.update(menu_reset=True, reason="Change Number attempt cap reached")
+            return outcome
+
+        # The bot may already sit on the number prompt - a previous Change
+        # Number that reported "unknown" can still have worked. Asking is
+        # read-only and much cheaper than tapping again.
+        if self._bot_at_prompt():
+            self.bot_at_number_prompt = True
+            log("Bot is already at the number prompt; no Change Number tap needed.",
+                prefix=pname)
+            outcome.update(prompt_ready=True, reason="already at the number prompt")
+            return outcome
+
+        failure = "the bot did not reach its number prompt"
+        # Short label for the notification: the full error (with the screen text
+        # and the hint to extend) goes to the log, not to Telegram.
+        short = "the bot never showed its number prompt"
         try:
             res = self.bot.change_number(None)
             self.stats.increment("change_number")
-            if res.get("stage") in ("prompt", "needs_full_flow"):
-                self.bot_at_number_prompt = res.get("stage") == "prompt"
-                log(f"Bot ready for replacement number (attempt {self.bot_change_attempts}).", prefix=pname)
-                return self.bot_at_number_prompt
+            stage = res.get("stage")
+            if stage == "prompt":
+                self.bot_at_number_prompt = True
+                log(f"Bot ready for replacement number (attempt {self.bot_change_attempts}).",
+                    prefix=pname)
+                outcome.update(prompt_ready=True,
+                               reason="the bot is waiting for the replacement number")
+                return outcome
+            if stage == "needs_full_flow":
+                # The bot left the login flow by itself (its OTP prompt expired,
+                # a manual /start): it is already where a full flow starts, so
+                # there is nothing to reset.
+                log("Bot needs the full flow again (it is back at the menu/login steps).",
+                    prefix=pname)
+                self.bot_at_number_prompt = False
+                outcome.update(reason="the bot left the login flow, so the full flow is needed")
+                return outcome
+            failure = f"Change Number returned stage '{stage}'"
+            short = f"the bot answered Change Number with stage '{stage}'"
+            log(f"{failure}.", prefix=pname)
+        except MeeshoBotUnknownScreen as exc:
+            failure = f"Change Number failed in bot: {exc}"
+            short = "the bot showed an unrecognised screen after Change Number"
+            log(f"{failure}; screen: {(exc.screen_text or '')[:300]}", prefix=pname)
         except MeeshoBotError as exc:
-            log(f"Change Number failed in bot: {exc}; full flow will restart.", prefix=pname)
-            try:
-                self.bot.cancel_flow()
-            except Exception:
-                pass
-            self.bot_at_number_prompt = False
-        return False
+            failure = f"Change Number failed in bot: {exc}"
+            short = "the bot did not answer the Change Number tap"
+            log(failure, prefix=pname)
+        except Exception as exc:
+            failure = f"Change Number failed in bot: {exc!r}"
+            short = "the bot did not answer the Change Number tap"
+            log(failure, prefix=pname)
+
+        # A failure can still have landed on the prompt (a slow edit, a copy
+        # classify() does not know): look once more before giving up on it.
+        if self._bot_at_prompt():
+            self.stats.increment("change_number")
+            self.bot_at_number_prompt = True
+            log("Bot reached the number prompt after all; continuing in-flow.",
+                prefix=pname)
+            outcome.update(prompt_ready=True,
+                           reason="the bot reached the number prompt on a second look")
+            return outcome
+
+        self.bot_at_number_prompt = False
+        reset, why = self._bot_menu_reset_needed()
+        if reset:
+            self.stats.increment("bot_menu_resets")
+            self._bot_menu_reset(pname, why)
+            outcome.update(menu_reset=True, reason=f"{short}; {why}")
+        else:
+            self.stats.increment("bot_flow_kept")
+            log(f"{failure}; keeping the bot in-flow ({why}). The next number is sent "
+                f"from the number prompt when the bot is on one - no main-menu "
+                f"restart and no offer reroll.", prefix=pname)
+            outcome.update(reason=f"{short}; bot kept in-flow ({why})")
+        return outcome
 
     def wait_for_manual_trigger(self, context):
         wait_seconds = self.settings.get("trigger_wait_seconds", 300)
@@ -1558,6 +1708,18 @@ class ParallelAutomationCoordinator:
            stands, no salvaged OTP, automation not stopping) does the bot tap
            Change Number and the workers resume hunting.
 
+        A Change Number the bot does not answer is retried inside the bot
+        client (meesho_bot.change_number_retries, within its own short budget).
+        If it still fails, the bot is dropped back to the main menu ONLY when
+        the bot checker is needed for the next number check (checker.mode
+        "bot", or "auto" while the checker API is down / cooling down / has no
+        keys) - the main menu is where the bot checker works from, so the reset
+        costs nothing extra then. With the checker API answering, the bot stays
+        in-flow: the next login reuses the number prompt it is sitting on
+        instead of paying for Add Account -> Login with Number -> Normal ->
+        offer rerolls again, and only walks back to the menu itself if the bot
+        really is lost (see meesho_bot.reset_to_menu_on_change_failure).
+
         The old order tapped Change Number first: when the OTP then arrived
         during the cancellation race, the screen to enter it was already
         gone - money spent, no refund, account not added, and even manual
@@ -1629,15 +1791,24 @@ class ParallelAutomationCoordinator:
             self.bot_change_attempts = 0
             return
 
-        prompt_ready = False
+        outcome = {"prompt_ready": False, "menu_reset": False, "reason": ""}
         if self.bot.ready:
-            prompt_ready = self._bot_prepare_change_number(target)
+            outcome = self._bot_prepare_change_number(target) or {}
+            if outcome.get("prompt_ready"):
+                detail = "The bot is waiting for the replacement number."
+            elif outcome.get("menu_reset"):
+                detail = ("The bot flow will restart from the menu "
+                          f"({outcome.get('reason') or 'reset to the main menu'}).")
+            else:
+                detail = ("The bot stays in-flow - no main-menu restart and no offer "
+                          f"reroll ({outcome.get('reason') or 'the checker API is answering'}); "
+                          "the next number is sent from the number prompt when the bot "
+                          "is on one.")
             self.notify.send(
                 "🔄 Changing number",
-                (f"{target.clean_number} ({reason}). The bot is waiting for the replacement number."
-                 if prompt_ready else
-                 f"{target.clean_number} ({reason}). The bot flow will restart from the menu.")
+                f"{target.clean_number} ({reason}). {detail}"
             )
+        return outcome
 
 
 def load_config():
