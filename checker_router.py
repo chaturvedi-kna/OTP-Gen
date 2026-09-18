@@ -489,6 +489,11 @@ class BotChecker:
             f"this check waits for it instead of tapping over it (a dedicated "
             f"checker bot - checker.telegram_bot - would avoid the wait).")
 
+    def _is_floodwait(self, exc):
+        """True if exc is Telegram FloodWait (same account, both bots share limit)."""
+        msg = str(exc).lower()
+        return ("wait of" in msg and "seconds is required" in msg) or "floodwait" in msg or ("flood" in msg and "wait" in msg)
+
     def check(self, number, service=None):
         # Dedicated checker bot first: it has its own conversation and never
         # touches the PRIMES login flow, so a mid-flight OTP is never at risk
@@ -497,12 +502,24 @@ class BotChecker:
         if self.preferred_ready and not self.preferred_shares_login(self.preferred_client):
             try:
                 return self.check_preferred_batched(number, service=service)
-            except CheckerError:
+            except CheckerError as exc:
+                if self._is_floodwait(exc):
+                    self._log(
+                        f"Dedicated checker bot hit FloodWait ({exc}); NOT trying "
+                        f"PRIMES bot as fallback (same Telegram account shares the limit) - "
+                        f"cancelling with refund.")
+                    raise
                 # Fall through: try PRIMES as the last resort when there is one.
                 self._log(
-                    f"Dedicated checker bot failed to answer; "
+                    f"Dedicated checker bot failed to answer ({exc}); "
                     f"trying the PRIMES bot as the last resort.")
             except Exception as exc:
+                if self._is_floodwait(exc):
+                    self._log(
+                        f"Dedicated checker bot hit FloodWait ({exc}); NOT trying "
+                        f"PRIMES bot as fallback (same account) - cancelling with refund.")
+                    raise CheckerUnavailable(
+                        f"Dedicated checker bot FloodWait: {exc}") from exc
                 self._log(
                     f"Dedicated checker bot failed ({exc}); "
                     f"trying the PRIMES bot as the last resort.")

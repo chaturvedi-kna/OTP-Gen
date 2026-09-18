@@ -1267,8 +1267,16 @@ class ParallelAutomationCoordinator:
                     return
                 continue
             except (CheckerUnavailable, CheckerError) as exc:
-                log(f"Checker error (mode {self.checker.mode}): {exc}. "
-                    f"Cancelling number...", prefix=pname)
+                msg = str(exc)
+                is_flood = ("wait of" in msg.lower() and "seconds is required" in msg.lower()) or "floodwait" in msg.lower()
+                if is_flood:
+                    log(f"Checker error (mode {self.checker.mode}): Telegram FloodWait - {exc}. "
+                        f"Both dedicated checker and PRIMES share the same Telegram account, "
+                        f"so they share the rate limit. Cancelling {clean_number} with refund - "
+                        f"wait for the cooldown to expire.", prefix=pname)
+                else:
+                    log(f"Checker error (mode {self.checker.mode}): {exc}. "
+                        f"Cancelling number...", prefix=pname)
                 self.handle_cancellation(client, activation_id, clean_number, f"Checker error: {exc}")
                 if self.stop_requested.is_set():
                     return

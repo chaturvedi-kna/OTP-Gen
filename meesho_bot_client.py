@@ -1162,6 +1162,12 @@ class MeeshoBotClient:
         # calling another one from the same thread.
         self._flow_lock = threading.RLock()
 
+        # Telegram FloodWait tracking: same account drives both PRIMES and
+        # dedicated checker bot, so a FloodWait on one applies to the other.
+        # _floodwait_until = timestamp until which we should not send.
+        self._floodwait_until = 0.0
+        self._floodwait_lock = threading.RLock()
+
         # Per-login referral bookkeeping (reset by _a_prepare_login).
         self._referral_events = 0
         self._referral_pastes_in_flow = 0
@@ -1506,7 +1512,49 @@ class MeeshoBotClient:
             last_screen.text, last_screen.button_labels,
         )
 
+    def _check_floodwait(self):
+        """Raise if we are still in FloodWait cooldown."""
+        with self._floodwait_lock:
+            until = self._floodwait_until
+        if until > time.time():
+            remaining = int(until - time.time())
+            raise MeeshoBotError(
+                f"A wait of {remaining} seconds is required (FloodWait cooldown, "
+                f"until {time.strftime('%H:%M:%S', time.localtime(until))})"
+            )
+
+    def _set_floodwait(self, seconds):
+        """Record FloodWait so both PRIMES and dedicated checker share the limit."""
+        seconds = max(0, int(seconds or 0))
+        if seconds <= 0:
+            return
+        with self._floodwait_lock:
+            self._floodwait_until = max(self._floodwait_until, time.time() + seconds)
+        self._log(f"[MEESHO-BOT] Telegram FloodWait: {seconds}s - pausing all bot checks "
+                  f"until {time.strftime('%H:%M:%S', time.localtime(self._floodwait_until))}")
+
+    @staticmethod
+    def _extract_floodwait_seconds(exc):
+        """Extract seconds from FloodWaitError or its message."""
+        # Telethon FloodWaitError has .seconds attribute
+        try:
+            secs = getattr(exc, "seconds", None)
+            if secs is not None:
+                return int(secs)
+        except Exception:
+            pass
+        # Parse from message: \"A wait of X seconds is required\"
+        import re as _re
+        m = _re.search(r"wait of (\d+)", str(exc), _re.IGNORECASE)
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                pass
+        return None
+
     async def _click(self, screen, *needles):
+        self._check_floodwait()
         found = screen.find_button(*needles)
         if not found:
             raise MeeshoBotUnknownScreen(
@@ -1529,14 +1577,35 @@ class MeeshoBotClient:
             )
 
         before = await self._signatures()
-        await target_msg.click(i=row, j=col)
+        try:
+            await target_msg.click(i=row, j=col)
+        except Exception as exc:
+            secs = self._extract_floodwait_seconds(exc)
+            if secs is not None:
+                self._set_floodwait(secs)
+                raise MeeshoBotError(
+                    f"A wait of {secs} seconds is required (caused by "
+                    f"{type(exc).__name__}: {exc})"
+                ) from exc
+            raise
         self._progress()
         self._human_delay()
         return await self._wait_new_screen(before)
 
     async def _send_text(self, text, timeout=None):
+        self._check_floodwait()
         before = await self._signatures()
-        await self._client.send_message(self._bot_entity, str(text))
+        try:
+            await self._client.send_message(self._bot_entity, str(text))
+        except Exception as exc:
+            secs = self._extract_floodwait_seconds(exc)
+            if secs is not None:
+                self._set_floodwait(secs)
+                raise MeeshoBotError(
+                    f"A wait of {secs} seconds is required (caused by "
+                    f"{type(exc).__name__}: {exc})"
+                ) from exc
+            raise
         self._progress()
         self._human_delay()
         return await self._wait_new_screen(before, timeout=timeout)
