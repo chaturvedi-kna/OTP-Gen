@@ -348,12 +348,65 @@ def scenario_late_otp_during_wait():
     check("late otp: not counted as a missing refund",
           snapshot["refunds_missing"] == 0 and not coordinator.stopped,
           coordinator.stopped)
+    # A cancel was refused (ERROR) and the OTP still arrived: the complaint
+    # record must be persisted for that activation.
+    disputes = coordinator.pending_cancels.disputes.records()
+    entries = [e for e in disputes if e.get("activation_id") == "act-otp"]
+    check("complaint: the refused-cancel + OTP event is persisted",
+          len(entries) == 1, disputes)
+    check("complaint: the record carries number, code and provider",
+          entries and entries[0].get("number") == "9999999999"
+          and entries[0].get("otp_code") == "482913"
+          and entries[0].get("provider") == "tempora"
+          and entries[0].get("source") == "immediate_salvage",
+          entries)
+
     # consume the deferred activation like its resolution does
     client.get_balance()
     check("late otp: the held amount for this activation is gone",
           coordinator.pending_cancel_hold("tempora")[0] == 0.0
           or coordinator.pending_cancel_hold("tempora", exclude="act-otp")[0] == 0.0,
           coordinator.pending_cancel_hold("tempora"))
+
+
+# ---------------------------------------------------------------------------
+# 3b. the deferred watcher also files the complaint record on a late OTP
+# ---------------------------------------------------------------------------
+
+def scenario_deferred_otp_record():
+    coordinator = build_coordinator(cancel_error_expiry_seconds=600,
+                                    cancel_error_poll_interval_seconds=0.05,
+                                    cancel_salvage_probes=0)
+    client = FakeProvider(
+        cancel_script=[{"type": "ERROR"}],
+        status_script=[{"type": "STATUS_OK", "code": "777222",
+                        "sms": "777222 is your OTP"}],
+    )
+    coordinator.clients = [client]
+    coordinator._note_balance("tempora", 100.0)
+
+    result = coordinator.handle_cancellation(client, "act-watch", "8888888888",
+                                             "not registered")
+    check("watcher: the refused cancel is deferred (no immediate salvage)",
+          result.get("deferred") is True, result)
+
+    resolved = wait_until(
+        lambda: coordinator.pending_cancels.store.get("act-watch") is None,
+        timeout=30)
+    check("watcher: the late OTP resolved the deferred cancellation",
+          resolved, coordinator.pending_cancels.pending())
+
+    disputes = coordinator.pending_cancels.disputes.records()
+    entries = [e for e in disputes if e.get("activation_id") == "act-watch"]
+    check("watcher: the complaint record is persisted by the watcher",
+          len(entries) == 1, disputes)
+    check("watcher: the record carries the code and points at the watcher",
+          entries and entries[0].get("otp_code") == "777222"
+          and entries[0].get("source") == "deferred_cancel_watch",
+          entries)
+    snapshot = coordinator.stats.snapshot()
+    check("watcher: the late OTP is counted like before",
+          snapshot["cancel_deferred_otp"] == 1, snapshot)
 
 
 # ---------------------------------------------------------------------------
@@ -492,6 +545,7 @@ def main():
     scenario_defer_instead_of_stop()
     scenario_retry_at_expiry()
     scenario_late_otp_during_wait()
+    scenario_deferred_otp_record()
     scenario_unknown_hold()
     scenario_persistence_and_resume()
     scenario_opt_out()

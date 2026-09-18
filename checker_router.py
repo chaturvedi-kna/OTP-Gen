@@ -159,6 +159,52 @@ def resolve_fallback(conf):
     return settings
 
 
+class _BotBatch:
+    """
+    One batch window: worker threads join with their number, the first one
+    (the leader) closes the window at size/wait, sends ALL numbers in a
+    single comma-separated message to the checker bot, and publishes a
+    per-number result (the bot's reply order differs from the input order,
+    so results are matched by number, never by position).
+    """
+
+    def __init__(self, size):
+        self.size = size
+        self.lock = threading.Lock()
+        self.entries = {}   # number -> threading.Event
+        self.results = {}   # number -> result dict
+        self.error = None   # failure shared by the whole batch
+        self.full = False
+
+    def join(self, number):
+        with self.lock:
+            event = self.entries.get(number)
+            leader = not self.entries
+            if event is None:
+                event = threading.Event()
+                self.entries[number] = event
+                if len(self.entries) >= self.size:
+                    self.full = True
+            return event, leader
+
+    def finish(self):
+        for event in self.entries.values():
+            event.set()
+
+    def result_for(self, number):
+        key = str(number)
+        if key in self.results:
+            return self.results[key]
+        if self.error is not None:
+            if isinstance(self.error, CheckerError):
+                raise self.error
+            raise CheckerUnavailable(
+                f"Batched checker request failed: {self.error}") from self.error
+        raise CheckerUnavailable(
+            "The dedicated checker bot's batch reply had no verdict for "
+            f"{key}.")
+
+
 class BotChecker:
     """
     Adapter that calls a Telethon userbot's own number checker.
@@ -184,6 +230,11 @@ class BotChecker:
         self._preferred_getter = preferred_getter
         self._preferred_username = (preferred_username or "").lstrip("@").strip()
         self._preferred_name = (preferred_name or "checker bot").strip()
+        # Batch-check bookkeeping (telegram_bot.batch_*): one shared window
+        # that several worker threads' checks join so ONE bot visit answers
+        # them all (the dedicated bot accepts comma-separated numbers).
+        self._batch_lock = threading.Lock()
+        self._batch = None  # the currently open _BotBatch, or None
 
     def _log(self, message):
         if self._log_fn:
@@ -300,12 +351,109 @@ class BotChecker:
             return True, f"gate error ({exc})"
         return bool(allowed), str(reason or "")
 
+    def _batch_conf(self):
+        """(size, wait_seconds) when telegram_bot batching is on, else None."""
+        if not bool(self.conf.get("batch_enabled", False)):
+            return None
+        try:
+            size = int(self.conf.get("batch_size", 3))
+        except (TypeError, ValueError):
+            size = 3
+        size = max(2, min(size, 10))
+        try:
+            wait = float(self.conf.get("batch_wait_seconds", 6.0))
+        except (TypeError, ValueError):
+            wait = 6.0
+        return size, max(1.0, wait)
+
+    def check_preferred_batched(self, number, service=None):
+        """
+        Ask the dedicated checker bot, batching several workers' pending
+        numbers into ONE comma-separated request when telegram_bot.batching
+        is enabled. Verdicts come back keyed by number (the bot's reply is
+        not ordered), so every participant gets exactly its own result.
+        """
+        conf = self._batch_conf()
+        client = self.preferred_client
+        many = getattr(client, "check_registration_many", None)
+        if conf is None or client is None or not callable(many):
+            return self.check_preferred(number, service=service)
+
+        size, wait = conf
+        my_key = str(number)
+        with self._batch_lock:
+            batch = self._batch
+            if batch is None or batch.full:
+                batch = _BotBatch(size)
+                self._batch = batch
+            event, leader = batch.join(my_key)
+
+        if leader:
+            deadline = time.monotonic() + wait
+            while not batch.full and time.monotonic() < deadline:
+                time.sleep(0.05)
+            with self._batch_lock:
+                batch.full = True  # seal the window
+                numbers = list(batch.entries)
+            if len(numbers) < 2:
+                # Nobody joined: a normal single check costs the same.
+                try:
+                    data = self.check_preferred(numbers[0], service=service)
+                    batch.results[numbers[0]] = data
+                except Exception as exc:
+                    batch.error = exc
+            else:
+                self._log(f"Batched checker request: {len(numbers)} numbers "
+                          f"in one message to {self._preferred_name}.")
+                if not self.preferred_ready:
+                    batch.error = CheckerUnavailable(
+                        "Dedicated checker bot unavailable: "
+                        f"{self.preferred_unavailable_reason}")
+                else:
+                    try:
+                        data = many(numbers)
+                        verdicts = (data or {}).get("verdicts") or {}
+                        for digits, verdict in verdicts.items():
+                            batch.results[str(digits)] = {
+                                "success": True,
+                                "is_registered": bool(verdict),
+                                "source": "telegram_checker",
+                                "checker_name": self._preferred_name,
+                                "checker_username": self._preferred_username,
+                                "number": str(digits),
+                                "batched": len(numbers),
+                            }
+                        missing = [n for n in numbers if n not in batch.results]
+                        if missing:
+                            batch.error = batch.error or CheckerUnavailable(
+                                "The dedicated checker bot's batch reply was "
+                                f"missing a verdict for {', '.join(missing)}.")
+                    except Exception as exc:
+                        batch.error = exc
+            batch.finish()
+            with self._batch_lock:
+                if self._batch is batch:
+                    self._batch = None
+            return batch.result_for(my_key)
+
+        # Not the leader: wait for the batch leader to publish the verdict.
+        margin = 30.0 + wait
+        try:
+            step_timeout = float(self.conf.get("step_timeout_seconds", 25.0))
+        except (TypeError, ValueError):
+            step_timeout = 25.0
+        ok = event.wait(wait + step_timeout + margin)
+        if not ok:
+            raise CheckerUnavailable(
+                "Batched checker request timed out waiting for the bot's reply.")
+        return batch.result_for(my_key)
+
     def check(self, number, service=None):
         # Dedicated checker bot first: it has its own conversation and never
         # touches the PRIMES login flow, so a mid-flight OTP is never at risk.
         if self.preferred_ready:
             try:
-                return self.check_preferred(number, service=service)
+                return self.check_preferred_batched(number, service=service)
             except CheckerError:
                 # Fall through: try PRIMES as the last resort when there is one.
                 self._log(

@@ -43,7 +43,8 @@ import threading
 import time
 from datetime import datetime, timezone
 
-from runtime import DEFAULT_PENDING_FILE, namespaced_name
+from runtime import (DEFAULT_PENDING_FILE, DEFAULT_DISPUTE_FILE,
+                     namespaced_name, dispute_filename)
 
 # setStatus answers that mean "the activation is closed / refunded".
 CANCEL_SUCCESS_TYPES = {
@@ -102,6 +103,54 @@ def resolve_settings(settings):
                 "cancel_error_max_wait_seconds"):
         merged[key] = max(0.0, float(merged[key]))
     return merged
+
+
+class DisputeLog:
+    """
+    Persistent, append-only complaint evidence: every time the provider
+    REFUSES a cancellation (cancel returned ERROR) and an OTP still arrives
+    for that activation, one full record per activation is appended here so
+    the user can later raise a complaint with the provider (proof that the
+    number that could not be cancelled did receive its SMS).
+
+    JSONL (one JSON object per line), namespaced per instance like the other
+    runtime files so parallel tabs never share it.
+    """
+
+    def __init__(self, filename=DEFAULT_DISPUTE_FILE, instance=None):
+        if instance and filename == DEFAULT_DISPUTE_FILE:
+            filename = namespaced_name(filename, instance)
+        self.path = filename
+        self._lock = threading.Lock()
+
+    def append(self, record):
+        entry = {"recorded_at": now()}
+        entry.update(record or {})
+        entry.setdefault("type", "otp_after_cancel_refused")
+        line = json.dumps(entry, ensure_ascii=False)
+        with self._lock:
+            try:
+                with open(self.path, "a", encoding="utf-8") as handle:
+                    handle.write(line + "\n")
+            except Exception:
+                pass
+        return entry
+
+    def records(self):
+        entries = []
+        try:
+            with open(self.path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entries.append(json.loads(line))
+                    except Exception:
+                        continue
+        except OSError:
+            pass
+        return entries
 
 
 class PendingCancelStore:
@@ -202,9 +251,13 @@ class CancelWatchManager:
       critical_stop(title, message)       - hard stop + alert
     """
 
-    def __init__(self, owner, store=None, log_fn=None):
+    def __init__(self, owner, store=None, log_fn=None, disputes=None):
         self.owner = owner
         self.store = store or PendingCancelStore()
+        if disputes is None:
+            instance = getattr(owner, "instance", None)
+            disputes = DisputeLog(dispute_filename(instance))
+        self.disputes = disputes
         self._log_fn = log_fn or (lambda message, prefix="": None)
         self._threads = {}
         self._lock = threading.Lock()
@@ -522,6 +575,27 @@ class CancelWatchManager:
                 )
             except Exception:
                 pass
+
+        # Complaint evidence: the provider refused to cancel this activation
+        # (cancel returned ERROR) and the OTP arrived anyway - keep a full,
+        # persistent record so the user can raise a complaint later.
+        try:
+            self.disputes.append({
+                "provider": str(record.get("provider", "")),
+                "activation_id": activation_id,
+                "number": number,
+                "reason": record.get("reason"),
+                "deferred_at": record.get("at"),
+                "otp_code": code,
+                "otp_sms": sms,
+                "otp_received_at": now(),
+                "expected_balance": record.get("expected_balance"),
+                "source": "deferred_cancel_watch",
+            })
+            self._log(f"Complaint record saved for activation {activation_id} "
+                      f"({self.disputes.path}).", pname)
+        except Exception:
+            pass
 
         # The money for this activation is spent: the live balance is the
         # baseline for everything that follows.

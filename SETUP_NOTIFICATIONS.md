@@ -159,6 +159,22 @@ and forgotten; it is handed to a background watcher (see `cancel_watch.py`):
 
 `/status` shows a section for deferred cancellations while any are open.
 
+**Complaint evidence (`cancel_refused_otp.jsonl`).** When a cancel was refused
+with `ERROR` and an OTP STILL arrives afterwards - right away or while the
+watcher is waiting - the event is both notified AND persisted, one full
+record per activation, so a complaint can be raised with the provider later:
+
+```json
+{"recorded_at": "...", "provider": "tempora", "activation_id": "123456",
+ "number": "9876543210", "reason": "otp_timeout", "otp_code": "482913",
+ "otp_sms": "482913 is your code", "otp_received_at": "...",
+ "expected_balance": 100.0, "source": "deferred_cancel_watch"}
+```
+
+The file is append-only JSONL (one record per line), kept forever, and - like
+every other runtime file - namespaced per instance
+(`cancel_refused_otp.tempora.jsonl`, `cancel_refused_otp.vsimpro.jsonl`).
+
 ---
 
 ## Parallel runs (two Termux tabs: one for TemporaSMS, one for VSImpro)

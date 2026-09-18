@@ -114,6 +114,55 @@ can be tuned exactly. The flow is: it asks the bot for the 10-digit number,
 reads `"registered" / "not registered" from the screen (matching the hints),
 then optionally goes back to its main menu before it searches for another.
 
+### The "Meesho Xxpress Manish" bot (tuned defaults)
+
+`config.json` -> `checker.telegram_bot` ships pre-tuned for the second
+checker bot from the screenshots — set `enabled: true` and its `username`
+(the bot's @handle; the display name "Meesho Xxpress Manish" is not the
+username), and nothing else needs changing:
+
+* `button_hints`: `"Check Number"` — the reply-keyboard button on the
+  welcome screen (tapping it sends the label itself; no inline buttons);
+* `number_prompt_hints`: the bot's Hinglish ask
+  ("Meesho Number Check", "Ek ya kai phone numbers bhejo",
+  "Cancel likho to exit", ...);
+* verdict hints cover `NOT REGISTERED (NEW USER)` / `— REGISTERED`; the
+  🆕 / ✅ badges are recognised even without any hint;
+* the transient `⏳ Checking N number(s) on Meesho...` screen is waited out.
+
+> If the bot gates you with "Join Channel" / "✅ I've Joined", do that ONCE
+> by hand from the userbot's own Telegram account — afterwards the checker
+> runs unassisted.
+
+### Batch verification (`batch_enabled` / `batch_size` / `batch_wait_seconds`)
+
+The bot accepts SEVERAL comma-separated numbers in one message
+(`9876543210, 9123456789, ...`). Turn it on to answer up to `batch_size`
+concurrent number checks with a single bot visit:
+
+```json
+"telegram_bot": {
+  "enabled": true,
+  "username": "@MeeshoXxpressManishBot",
+  "batch_enabled": true,
+  "batch_size": 3,
+  "batch_wait_seconds": 6.0
+}
+```
+
+* When one worker asks for a check, a short window (`batch_wait_seconds`)
+  stays open for other workers' checks to join; the window also closes early
+  once `batch_size` numbers have joined. One comma-separated message is sent,
+  one reply answers the whole batch — much faster than sequential visits.
+* **Matching is by number, never by position**: the bot's reply
+  (`📋 Number Check Results ...`) lists its verdicts in a DIFFERENT order
+  than the input (observed in the screenshots). Every participant is handed
+  exactly the verdict for its own number; a number the bot forgot to answer
+  fails just that one check (the usual cancel-and-refund path), not the batch.
+* With batching off (default), every check is its own bot visit — same
+  behaviour as before. A lone check with batching on simply runs as a single
+  visit after the window closes.
+
 `checker.fallback` (all default `true` except `rate_limit`):
 
 | Key (aliases) | Trigger |

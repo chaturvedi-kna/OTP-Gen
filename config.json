@@ -1,6 +1,5 @@
 {
   "active_otp_provider": "tempora,vsimpro",
-
   "otpcart": {
     "enabled": true,
     "base_url": "https://api.otpcart.xyz",
@@ -12,7 +11,6 @@
     "max_attempts": 500,
     "balance_update_delay_seconds": 80.0
   },
-
   "tempora": {
     "enabled": true,
     "base_url": "https://api.temporasms.com/stubs/handler_api.php",
@@ -24,7 +22,6 @@
     "max_attempts": 1000,
     "operator_services": {}
   },
-
   "otp": {
     "enabled": true,
     "base_url": "https://otpdoctor.in/stubs/handler_api.php",
@@ -34,7 +31,6 @@
     "max_price": 12,
     "max_attempts": 500
   },
-
   "vsimpro": {
     "enabled": true,
     "base_url": "https://api.vsimpro.com/stubs/handler_api.php",
@@ -46,7 +42,6 @@
     "max_attempts": 1000,
     "operator_services": {}
   },
-
   "checker": {
     "mode": "auto",
     "base_url": "https://superassets.in",
@@ -59,7 +54,6 @@
     "min_interval_seconds": 1.0,
     "rate_limit_buffer_seconds": 0.5,
     "network_backoff_seconds": 1.5,
-
     "fallback": {
       "is_down": true,
       "read_timeout": true,
@@ -70,7 +64,6 @@
       "cooldown_seconds": 60,
       "max_cooldown_seconds": 600
     },
-
     "bot": {
       "entry": "auto",
       "command": "",
@@ -84,23 +77,41 @@
       "stop_after_failures": 3,
       "claim_timeout_seconds": 60
     },
-
     "telegram_bot": {
       "enabled": false,
       "username": "",
-      "name": "checker bot",
+      "name": "Meesho Xxpress Manish",
       "entry": "auto",
       "command": "",
-      "button_hints": [],
-      "number_prompt_hints": [],
-      "registered_hints": [],
-      "not_registered_hints": [],
+      "button_hints": [
+        "Check Number",
+        "🔍 Check Number"
+      ],
+      "number_prompt_hints": [
+        "Meesho Number Check",
+        "Ek ya kai phone numbers bhejo",
+        "comma ya space se alag",
+        "Bina OTP ke",
+        "Cancel likho to exit"
+      ],
+      "registered_hints": [
+        "— REGISTERED",
+        "REGISTERED (EXISTING",
+        "Ye number Meesho pe registered hai"
+      ],
+      "not_registered_hints": [
+        "NOT REGISTERED (NEW USER)",
+        "— NEW USER",
+        "Meesho pe ye number NAYA hai"
+      ],
       "step_timeout_seconds": 30,
       "max_attempts": 2,
-      "reset_after_check": true
+      "reset_after_check": true,
+      "batch_enabled": false,
+      "batch_size": 3,
+      "batch_wait_seconds": 6.0
     }
   },
-
   "balance_guard": {
     "enabled": true,
     "tolerance": 0.5,
@@ -108,7 +119,6 @@
     "poll_interval_seconds": 3,
     "min_balance": 5
   },
-
   "meesho_bot": {
     "enabled": false,
     "api_id": 0,
@@ -136,21 +146,20 @@
     "step_timeout_seconds": 60,
     "flow_timeout_seconds": 0,
     "poll_interval_seconds": 1.2,
-    "human_delay_seconds": [1.0, 2.5]
+    "human_delay_seconds": [
+      1.0,
+      2.5
+    ]
   },
-
   "termux": {
     "enabled": true
   },
-
   "instances": {},
-
   "telegram": {
     "enabled": true,
     "bot_token": "8670376621:AAEoyDlUzzKZshZEkJfxiyVtSWm-nvUDbXU",
     "chat_id": "883480917"
   },
-
   "automation": {
     "target_registered": false,
     "max_attempts": 200,
@@ -169,10 +178,8 @@
     "timeout_salvage_delay": 2.0,
     "cancel_salvage_probes": 2,
     "cancel_salvage_delay": 1.5,
-
     "prewarm_offer": true,
     "prewarm_reroll_budget": 0,
-
     "defer_refused_cancels": true,
     "cancel_error_expiry_seconds": 900,
     "cancel_error_grace_seconds": 10,

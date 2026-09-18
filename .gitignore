@@ -22,3 +22,7 @@ pending_cancels.*.tmp
 .signals/
 .signals-*/
 .venv/
+
+# Persistent complaint evidence (cancel refused + late OTP), per-instance too.
+cancel_refused_otp.jsonl
+cancel_refused_otp.*.jsonl

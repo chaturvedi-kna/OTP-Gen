@@ -776,6 +776,26 @@ class ParallelAutomationCoordinator:
                 "the activation stays open. The PRIMES bot may still be waiting "
                 "for this code."
             )
+            # Complaint evidence: provider refused to cancel (ERROR) and the
+            # OTP still arrived - persist a record for a provider complaint.
+            try:
+                from cancel_watch import now as _cw_now
+                self.pending_cancels.disputes.append({
+                    "provider": str(getattr(client, "name", "") or ""),
+                    "activation_id": activation_id,
+                    "number": number,
+                    "reason": reason,
+                    "otp_code": code,
+                    "otp_sms": sms,
+                    "otp_received_at": _cw_now(),
+                    "expected_balance": expected_balance,
+                    "cancel_response": cancel_res,
+                    "source": "immediate_salvage",
+                })
+                log(f"Complaint record saved for activation {activation_id}.",
+                    prefix=pname)
+            except Exception:
+                pass
             refund_delay = self.settings.get("refund_check_delay_seconds", 2)
             if refund_delay > 0:
                 time.sleep(refund_delay)

@@ -46,6 +46,7 @@ import re
 DEFAULT_STATS_FILE = "stats.json"
 DEFAULT_STATE_FILE = "state.json"
 DEFAULT_PENDING_FILE = "pending_cancels.json"
+DEFAULT_DISPUTE_FILE = "cancel_refused_otp.jsonl"
 DEFAULT_SIGNAL_DIR = ".signals"
 
 # An instance name becomes part of a file name, so keep it boring.
@@ -116,6 +117,11 @@ def state_filename(instance):
 
 def pending_filename(instance):
     return namespaced_name(DEFAULT_PENDING_FILE, instance)
+
+
+def dispute_filename(instance=None):
+    """Persistent per-activation complaint records (cancel refused + OTP)."""
+    return namespaced_name(DEFAULT_DISPUTE_FILE, instance)
 
 
 def signal_dirname(instance):
