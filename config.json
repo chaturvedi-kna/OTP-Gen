@@ -106,7 +106,9 @@
       ],
       "step_timeout_seconds": 30,
       "max_attempts": 2,
-      "reset_after_check": true,
+      "reset_after_check": false,
+      "continuous": true,
+      "reuse_checker": true,
       "batch_enabled": false,
       "batch_size": 3,
       "batch_wait_seconds": 6.0

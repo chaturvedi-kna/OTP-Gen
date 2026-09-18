@@ -220,7 +220,7 @@ class FakeBot(object):
     # -- bot behaviour -----------------------------------------------------
 
     async def on_tap(self, label):
-        if "Check Number" in label or "Number Status" in label:
+        if "Check Number" in label or "Number Status" in label or "Check Another" in label:
             self.state = "check_prompt"
             self._edit_last(self._prompt_screen())
         elif "Main Menu" in label:
@@ -237,7 +237,8 @@ class FakeBot(object):
             number = "".join(ch for ch in stripped if ch.isdigit())[-10:]
             await self._run_check(number)
             return
-        if stripped.isdigit() and len(stripped) == 10 and self.state == "check_prompt":
+        if stripped.isdigit() and len(stripped) == 10 and self.state in ("check_prompt", "result"):
+            # Dedicated checker bots accept the next number directly from result
             self.sent_numbers.append(stripped)
             await self._run_check(stripped)
             return

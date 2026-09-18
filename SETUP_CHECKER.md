@@ -114,6 +114,16 @@ can be tuned exactly. The flow is: it asks the bot for the 10-digit number,
 reads `"registered" / "not registered" from the screen (matching the hints),
 then optionally goes back to its main menu before it searches for another.
 
+**Continuous checking (dedicated checker bot improvement):** after every number
+check there is **no need for tapping Start** - it can directly give another
+number. The dedicated bot stays at its result/prompt screen and the next
+number is sent straight away without navigating via Main Menu / Check Number.
+`reset_after_check: false` + `continuous: true` (the new defaults for
+`checker.telegram_bot`) enables this. A "Check Another" button
+(`check_another_hints`) is used as fallback when direct send is not accepted.
+`checker.bot` (PRIMES) still defaults to `reset_after_check: true` because
+that bot shares the login conversation.
+
 ### The "Meesho Xxpress Manish" bot (tuned defaults)
 
 `config.json` -> `checker.telegram_bot` ships pre-tuned for the second
@@ -160,8 +170,10 @@ concurrent number checks with a single bot visit:
   exactly the verdict for its own number; a number the bot forgot to answer
   fails just that one check (the usual cancel-and-refund path), not the batch.
 * With batching off (default), every check is its own bot visit — same
-  behaviour as before. A lone check with batching on simply runs as a single
-  visit after the window closes.
+  behaviour as before, but with `continuous: true` the dedicated bot accepts
+  the next number directly without tapping Start. A lone check with batching
+  on simply runs as a single visit after the window closes, and stays ready
+  for the next batch.
 
 ### When the dedicated checker bot is NOT used (and why)
 
@@ -286,7 +298,9 @@ locked in by `test_bot_checker_flow.py`):
 | `registered_hints` / `not_registered_hints` | `[]` | Extra result wording for registered / not-registered screens |
 | `step_timeout_seconds` | `30` | Budget for one screen/step of the check |
 | `max_attempts` | `2` | How many times the number may be sent if the bot keeps re-asking |
-| `reset_after_check` | `true` | Return to the main menu after the verdict |
+| `reset_after_check` | `true` (PRIMES) / `false` (dedicated) | Return to the main menu after the verdict. For dedicated checker bot `false` keeps it ready for direct next number |
+| `continuous` / `reuse_checker` | `false` (PRIMES) / `true` (dedicated) | Stay at result/prompt so next number is sent directly without tapping Start. Dedicated bot improvement |
+| `check_another_hints` | `[]` | Extra labels for "Check Another Number" button (fallback when direct send fails) |
 | `stop_after_failures` | `3` | Consecutive failed checks (bot mode / bot fallback) after which the whole run stops with a 🛑 alert instead of buying numbers only to cancel them. `0` = never stop |
 
 Matching is done on emoji-stripped, lowercased labels, so hints are plain text

@@ -179,6 +179,15 @@ DEFAULT_CHECK_BUTTON_EXCLUDE = (
     "support", "help", "referr", "invite", "menu", "cancel", "back", "otp",
 )
 
+# Buttons that open the next check directly from a result screen (e.g.
+# "Check Another Number" / "Check Another"). Used for continuous checking
+# so a dedicated checker bot can receive the next number without tapping
+# Start / Main Menu again.
+DEFAULT_CHECK_ANOTHER_HINTS = (
+    "check another", "check again", "another number", "another check",
+    "check another number", "next number", "new check",
+)
+
 # Text on the screen that asks for the number to check.
 DEFAULT_CHECK_PROMPT_HINTS = (
     "send the number", "send your number", "send number", "send me the number",
@@ -604,6 +613,26 @@ class Screen:
 
         return pick(tuple(extra_hints or ()) + tuple(DEFAULT_CHECK_BUTTON_HINTS)) \
             or pick(fallback_hints)
+
+    def check_another_button(self, extra_hints=()):
+        """
+        (row, col, label) of a button that starts the NEXT check directly
+        from a result screen (e.g. "Check Another Number"), or None.
+
+        Used for continuous checking so the next number can be sent without
+        tapping Start / Main Menu. For bots that accept a number directly at
+        the result screen, this is a fallback when direct send doesn't work.
+        """
+        hints = tuple(extra_hints or ()) + tuple(DEFAULT_CHECK_ANOTHER_HINTS)
+        for hint in hints:
+            norm_hint = normalize_label(hint)
+            if not norm_hint:
+                continue
+            for r, row in enumerate(self.buttons):
+                for c, label in enumerate(row):
+                    if norm_hint in normalize_label(label):
+                        return r, c, label
+        return None
 
     def looks_like_check_prompt(self, extra_hints=()):
         """
@@ -2535,6 +2564,25 @@ class MeeshoBotClient:
             attempts = max(1, int(conf.get("max_attempts", 2)))
         except (TypeError, ValueError):
             attempts = 2
+        # For dedicated checker bots (telegram_bot) continuous checking is
+        # preferred: after a result you can directly send another number
+        # without tapping Start. reset_after_check=False enables that, but
+        # we also keep the screen so next check reuses prompt/result.
+        # `continuous` / `reuse_checker` / `direct_next` are aliases.
+        continuous = conf.get("continuous")
+        if continuous is None:
+            continuous = conf.get("reuse_checker")
+        if continuous is None:
+            continuous = conf.get("direct_next")
+        if continuous is None:
+            # If reset_after_check is explicitly False, that's continuous.
+            # Otherwise default True for PRIMES, False for dedicated bots
+            # is decided by caller; here we keep the raw flag but also expose
+            # continuous for logic.
+            continuous = not bool(conf.get("reset_after_check", True))
+        else:
+            continuous = bool(continuous)
+
         return {
             "entry": entry,
             "command": str(conf.get("command") or "").strip(),
@@ -2546,9 +2594,12 @@ class MeeshoBotClient:
             "prompt_hints": tuple(conf.get("number_prompt_hints") or ()),
             "registered_hints": tuple(conf.get("registered_hints") or ()),
             "not_registered_hints": tuple(conf.get("not_registered_hints") or ()),
+            "check_another_hints": tuple(conf.get("check_another_hints")
+                                         or conf.get("another_button_hints") or ()),
             "step_timeout": step_timeout,
             "attempts": attempts,
             "reset_after_check": bool(conf.get("reset_after_check", True)),
+            "continuous": bool(continuous),
             "poll_interval": float(getattr(self, "poll_interval", 2.0) or 2.0),
         }
 
@@ -2569,6 +2620,17 @@ class MeeshoBotClient:
 
     def _login_in_progress(self, screen):
         """True when the bot is mid-login and must not be navigated away."""
+        # Checker screens must never be treated as a login in progress:
+        # their wording ("already registered") overlaps with S_BLOCKED.
+        # For continuous checking we are at S_CHECK_RESULT and want to send
+        # the next number directly - that must not be refused.
+        try:
+            # If checker hints are available, use them to exclude checker.
+            # Fallback to generic detection: check_verdict or prompt/checking.
+            if screen.check_verdict() is not None or screen.looks_like_check_prompt() or screen.looks_like_checking():
+                return False
+        except Exception:
+            pass
         state = screen.classify()
         if state in self.LOGIN_IN_FLIGHT_STATES:
             return True
@@ -2655,6 +2717,13 @@ class MeeshoBotClient:
         - the same shape the API checker returns, so callers can treat both
         the same way. Raises MeeshoBotError subclasses when no verdict can be
         read; the caller (checker_router) turns those into CheckerUnavailable.
+
+        Dedicated checker bot improvement: after every number check there is
+        no need for tapping Start - the next number can be given directly.
+        If the bot is already at its check prompt or result screen, the
+        number is sent straight away without navigating via Main Menu /
+        Check Number. A "Check Another" button is used as fallback when
+        direct send is not accepted.
         """
         # A check that drives the SHARED login conversation must not run while
         # the pre-warm / a login owns it: both would tap in the same chat.
@@ -2673,48 +2742,85 @@ class MeeshoBotClient:
                   f"(entry: {conf['entry']}){(' in ' + where) if where else ''}.")
 
         screen = await self._latest_screen()
+        initial_state = self._check_state(screen, conf)
+        already_in_checker = False
         button = None
-        if conf["entry"] in ("auto", "button"):
-            if screen.classify() != S_MENU:
-                # A number check must never walk the bot out of a login flow:
-                # that would throw away the OTP screen of a PAID number (its
-                # OTP could then not even be entered by hand) just to ask
-                # whether some other number is registered. The coordinator
-                # normally prevents this (a login claims the bot), so getting
-                # here means the flow drifted - fail the check, not the login.
-                if self._login_in_progress(screen):
-                    raise MeeshoBotError(
-                        "Refusing to run a number check: the bot is in the "
-                        f"middle of a login flow ({screen.classify()}). Cancel "
-                        "the check instead of losing the number that is "
-                        "waiting for its OTP."
-                    )
-                # Never type a number into a leftover login/OTP screen.
-                screen = await self._cancel_to_menu()
-            button = screen.checker_button(
-                conf["button_hints"], conf["button_fallbacks"], conf["button_exclude"]
-            )
-
         command_sent = False
-        if button is not None:
-            self._log(f"[MEESHO-BOT] Bot checker: tapping '{button[2]}'.")
-            screen = await self._click(screen, button[2])
-        elif conf["command"] and conf["entry"] in ("auto", "command"):
-            text = conf["command"].format(number=digits)
-            self._log(f"[MEESHO-BOT] Bot checker: sending command '{text}'.")
-            screen = await self._send_text(text, timeout=conf["step_timeout"])
-            command_sent = True
-        else:
-            raise MeeshoBotUnknownScreen(
-                "No bot-checker menu button found and checker.bot.command is "
-                "empty. Add the checker button's exact label to "
-                "checker.bot.button_hints (or set checker.bot.command, e.g. "
-                "'/check {number}') - see SETUP_CHECKER.md.",
-                screen.text, screen.button_labels,
-            )
 
-        screen = await self._settle_check(screen, conf, want_result=False)
-        verdict = self._check_verdict(screen, conf)
+        # ---- Continuous / reuse path ------------------------------------
+        # If the bot is already sitting on its checker prompt, result or
+        # transient checking screen, reuse it directly - no need to tap
+        # Start / Main Menu / Check Number again. This is the requested
+        # improvement for the dedicated checker bot.
+        if initial_state in (S_CHECK_PROMPT, S_CHECK_RESULT, S_CHECKING):
+            if initial_state == S_CHECKING:
+                self._log("[MEESHO-BOT] Bot checker: already checking - waiting for its result before next number.")
+                screen = await self._settle_check(screen, conf, want_result=True)
+                initial_state = self._check_state(screen, conf)
+
+            if initial_state in (S_CHECK_PROMPT, S_CHECK_RESULT):
+                already_in_checker = True
+                self._log(f"[MEESHO-BOT] Bot checker: already at {initial_state} - sending {digits} directly, no Start tap.")
+                # For result screens that don't accept direct numbers, we will
+                # try tapping "Check Another" later if direct send fails.
+            else:
+                # Settled but not at prompt/result (e.g. drifted) - need fresh start
+                already_in_checker = False
+
+        # ---- Normal entry path (not already in checker) ------------------
+        if not already_in_checker:
+            if conf["entry"] in ("auto", "button"):
+                if screen.classify() != S_MENU:
+                    # A number check must never walk the bot out of a login flow:
+                    # that would throw away the OTP screen of a PAID number (its
+                    # OTP could then not even be entered by hand) just to ask
+                    # whether some other number is registered. The coordinator
+                    # normally prevents this (a login claims the bot), so getting
+                    # here means the flow drifted - fail the check, not the login.
+                    if self._login_in_progress(screen):
+                        raise MeeshoBotError(
+                            "Refusing to run a number check: the bot is in the "
+                            f"middle of a login flow ({screen.classify()}). Cancel "
+                            "the check instead of losing the number that is "
+                            "waiting for its OTP."
+                        )
+                    # Never type a number into a leftover login/OTP screen.
+                    screen = await self._cancel_to_menu()
+                button = screen.checker_button(
+                    conf["button_hints"], conf["button_fallbacks"], conf["button_exclude"]
+                )
+
+            if button is not None:
+                self._log(f"[MEESHO-BOT] Bot checker: tapping '{button[2]}'.")
+                screen = await self._click(screen, button[2])
+            elif conf["command"] and conf["entry"] in ("auto", "command"):
+                # If we are already in checker but entry is command-only,
+                # still send the command only when not already at prompt/result
+                text = conf["command"].format(number=digits)
+                self._log(f"[MEESHO-BOT] Bot checker: sending command '{text}'.")
+                screen = await self._send_text(text, timeout=conf["step_timeout"])
+                command_sent = True
+            elif already_in_checker:
+                # Already at prompt/result, no button/command needed - will send number directly
+                pass
+            else:
+                raise MeeshoBotUnknownScreen(
+                    "No bot-checker menu button found and checker.bot.command is "
+                    "empty. Add the checker button's exact label to "
+                    "checker.bot.button_hints (or set checker.bot.command, e.g. "
+                    "'/check {number}') - see SETUP_CHECKER.md.",
+                    screen.text, screen.button_labels,
+                )
+
+            screen = await self._settle_check(screen, conf, want_result=False)
+
+        # When we are reusing a RESULT screen for the NEXT number (continuous
+        # mode), the verdict on that screen belongs to the PREVIOUS number and
+        # must not be returned for the new one. Force a fresh send.
+        if already_in_checker and initial_state == S_CHECK_RESULT:
+            verdict = None
+        else:
+            verdict = self._check_verdict(screen, conf)
 
         def no_result_error():
             if self._check_state(screen, conf) == S_CHECKING:
@@ -2731,13 +2837,30 @@ class MeeshoBotClient:
                 screen.text, screen.button_labels,
             )
 
+        # If verdict already matches current digits (e.g. bot already answered
+        # same number), we can return it; otherwise we must send.
+        # For continuous reuse we always send because the screen is old.
+        if verdict is not None and not already_in_checker:
+            # Fresh check that already produced verdict (e.g. command included number)
+            pass
+        elif verdict is None or (already_in_checker and initial_state == S_CHECK_RESULT):
+            # Need to send number (or next number directly from result)
+            pass
+        # unify: if verdict is None -> enter sending loop, else skip
         if verdict is None:
-            # A prompt is always answered with the number (also when the
-            # configured command /check carried it and the bot asked again).
+            # If we are at prompt, send the number. If we are at result,
+            # dedicated checker bots allow directly sending another number
+            # without tapping Start / Check Another - try that first.
             state = self._check_state(screen, conf)
             if state == S_CHECKING:
                 raise no_result_error()
-            if state != S_CHECK_PROMPT:
+
+            # For result screen: try direct send first (continuous mode)
+            if state == S_CHECK_RESULT and already_in_checker:
+                self._log(f"[MEESHO-BOT] Bot checker: at result, trying direct send of {digits} without tapping Start.")
+                # Fall through to attempt loop which will send directly
+
+            if state not in (S_CHECK_PROMPT, S_CHECK_RESULT):
                 if command_sent:
                     raise MeeshoBotUnknownScreen(
                         f"The bot did not answer the checker command "
@@ -2752,16 +2875,30 @@ class MeeshoBotClient:
                     "checker.bot.number_prompt_hints - see SETUP_CHECKER.md.",
                     screen.text, screen.button_labels,
                 )
+
+            # Attempt to get verdict by sending number (direct next number)
             for attempt in range(conf["attempts"]):
                 if verdict is not None:
                     break
                 if self._login_in_progress(screen):
-                    # Last line of defence: never type a number to check into a
-                    # screen that belongs to a login flow.
                     raise MeeshoBotError(
                         "Refusing to send a number to check: the bot is in the "
                         f"middle of a login flow ({screen.classify()})."
                     )
+
+                # If we are still at result and direct send hasn't worked,
+                # try tapping "Check Another" as fallback before sending again
+                current_state = self._check_state(screen, conf)
+                if current_state == S_CHECK_RESULT and attempt > 0:
+                    another = screen.check_another_button(conf.get("check_another_hints", ()))
+                    if another is not None:
+                        self._log(f"[MEESHO-BOT] Bot checker: direct send didn't yield result, tapping '{another[2]}' to get fresh prompt.")
+                        try:
+                            screen = await self._click(screen, another[2])
+                            screen = await self._settle_check(screen, conf, want_result=False)
+                        except MeeshoBotError as exc:
+                            self._log(f"[MEESHO-BOT] Bot checker: could not tap '{another[2]}' ({exc}), trying direct send anyway.")
+
                 self._note(f"sending {digits} to the bot checker")
                 self._log(f"[MEESHO-BOT] Bot checker: sending number {digits}"
                           + ("" if attempt == 0 else f" (attempt {attempt + 1})") + ".")
@@ -2787,15 +2924,25 @@ class MeeshoBotClient:
         self._log(f"[MEESHO-BOT] Bot checker: {digits} -> "
                   f"{'REGISTERED' if verdict else 'NOT registered'}.")
 
+        # Continuous mode: stay at result/prompt so next number can be sent directly
+        # without tapping Start. Only reset when explicitly configured.
         if conf["reset_after_check"]:
-            try:
-                await self._cancel_to_menu()
-                self._note("bot checker: back at the main menu")
-            except MeeshoBotError as exc:
-                # The verdict is already known; a failed reset is not worth
-                # failing the check (the login flow resets itself anyway).
-                self._log(f"[MEESHO-BOT] Bot checker: could not return to the "
-                          f"main menu after the check ({exc}).")
+            # If continuous is also True, we keep the result screen for direct next
+            # number but still note that a reset would be needed for PRIMES.
+            # For dedicated checker bots, reset_after_check should be False.
+            if conf.get("continuous"):
+                self._log("[MEESHO-BOT] Bot checker: continuous mode - staying at result, next number will be sent directly (no Start tap).")
+            else:
+                try:
+                    await self._cancel_to_menu()
+                    self._note("bot checker: back at the main menu")
+                except MeeshoBotError as exc:
+                    self._log(f"[MEESHO-BOT] Bot checker: could not return to the "
+                              f"main menu after the check ({exc}).")
+        else:
+            self._log("[MEESHO-BOT] Bot checker: staying at result/prompt - next check will send directly without Start.")
+            self._note("bot checker: staying at checker for direct next number")
+
         return result
 
     async def _a_check_registration_many(self, numbers, overrides=None):
@@ -2805,6 +2952,10 @@ class MeeshoBotClient:
         number). Returns {"success": True, "verdicts": {digits: bool}, ...} -
         verdicts are keyed BY NUMBER because the bot's reply is not ordered.
         Raises MeeshoBotError subclasses when no/all verdicts can be read.
+
+        Dedicated checker bot improvement: if the bot is already at its check
+        prompt/result screen, the batch payload is sent directly without
+        tapping Start / Main Menu again.
         """
         # Same guard as the single check: never navigate the shared PRIMES
         # chat while the pre-warm / a login is driving it.
@@ -2828,53 +2979,104 @@ class MeeshoBotClient:
                   f"(entry: {conf['entry']}){(' in ' + where) if where else ''}.")
 
         screen = await self._latest_screen()
+        initial_state = self._check_state(screen, conf)
+        already_in_checker = False
         button = None
-        if conf["entry"] in ("auto", "button"):
-            if screen.classify() != S_MENU:
-                if self._login_in_progress(screen):
-                    raise MeeshoBotError(
-                        "Refusing to run a batch check: the bot is in the "
-                        f"middle of a login flow ({screen.classify()})."
-                    )
-                screen = await self._cancel_to_menu()
-            button = screen.checker_button(
-                conf["button_hints"], conf["button_fallbacks"], conf["button_exclude"]
-            )
 
-        if button is not None:
-            self._log(f"[MEESHO-BOT] Bot checker: tapping '{button[2]}'.")
-            screen = await self._click(screen, button[2])
-        elif conf["command"] and conf["entry"] in ("auto", "command"):
-            text = conf["command"].format(number=targets[0])
-            self._log(f"[MEESHO-BOT] Bot checker: sending command '{text}'.")
-            screen = await self._send_text(text, timeout=conf["step_timeout"])
-        else:
-            raise MeeshoBotUnknownScreen(
-                "No bot-checker menu button found (batch check). See "
-                "checker.bot.button_hints in SETUP_CHECKER.md.",
-                screen.text, screen.button_labels,
-            )
+        # ---- Continuous / reuse path ------------------------------------
+        if initial_state in (S_CHECK_PROMPT, S_CHECK_RESULT, S_CHECKING):
+            if initial_state == S_CHECKING:
+                self._log("[MEESHO-BOT] Bot checker (batch): already checking - waiting for its result before next batch.")
+                screen = await self._settle_check(screen, conf, want_result=True)
+                initial_state = self._check_state(screen, conf)
+            if initial_state in (S_CHECK_PROMPT, S_CHECK_RESULT):
+                already_in_checker = True
+                self._log(f"[MEESHO-BOT] Bot checker (batch): already at {initial_state} - sending {len(targets)} numbers directly, no Start tap.")
+            else:
+                already_in_checker = False
 
-        screen = await self._settle_check(screen, conf, want_result=False)
+        if not already_in_checker:
+            if conf["entry"] in ("auto", "button"):
+                if screen.classify() != S_MENU:
+                    if self._login_in_progress(screen):
+                        raise MeeshoBotError(
+                            "Refusing to run a batch check: the bot is in the "
+                            f"middle of a login flow ({screen.classify()})."
+                        )
+                    screen = await self._cancel_to_menu()
+                button = screen.checker_button(
+                    conf["button_hints"], conf["button_fallbacks"], conf["button_exclude"]
+                )
+
+            if button is not None:
+                self._log(f"[MEESHO-BOT] Bot checker: tapping '{button[2]}'.")
+                screen = await self._click(screen, button[2])
+            elif conf["command"] and conf["entry"] in ("auto", "command"):
+                text = conf["command"].format(number=targets[0])
+                self._log(f"[MEESHO-BOT] Bot checker: sending command '{text}'.")
+                screen = await self._send_text(text, timeout=conf["step_timeout"])
+            else:
+                raise MeeshoBotUnknownScreen(
+                    "No bot-checker menu button found (batch check). See "
+                    "checker.bot.button_hints in SETUP_CHECKER.md.",
+                    screen.text, screen.button_labels,
+                )
+
+            screen = await self._settle_check(screen, conf, want_result=False)
+
         state = self._check_state(screen, conf)
-        if state != S_CHECK_PROMPT:
+
+        # If we were at result and want to send a new batch directly, try that.
+        # For bots that require "Check Another" tap, fallback if direct send fails.
+        if state == S_CHECK_RESULT and already_in_checker:
+            self._log(f"[MEESHO-BOT] Bot checker (batch): at result, trying direct send of {len(targets)} numbers without Start.")
+            # We'll attempt direct send; if it doesn't settle to prompt, we'll
+            # tap Check Another below.
+        elif state != S_CHECK_PROMPT and state != S_CHECK_RESULT:
             raise MeeshoBotUnknownScreen(
                 "Expected the bot to ask for the numbers to check, got an "
                 "unreadable screen (batch check). Add its wording to "
                 "checker.bot.number_prompt_hints - see SETUP_CHECKER.md.",
                 screen.text, screen.button_labels,
             )
-        if self._login_in_progress(screen):
-            raise MeeshoBotError(
-                "Refusing to send numbers to check: the bot is in the middle "
-                f"of a login flow ({screen.classify()})."
-            )
+
+        # If we are at result and the bot needs an explicit "Check Another",
+        # try direct send first, then fallback to button tap on retry.
+        if state == S_CHECK_RESULT:
+            # Attempt direct send; _send_text will produce new screen
+            pass
+        else:
+            # Normal prompt path
+            if self._login_in_progress(screen):
+                raise MeeshoBotError(
+                    "Refusing to send numbers to check: the bot is in the middle "
+                    f"of a login flow ({screen.classify()})."
+                )
 
         payload = ", ".join(targets)
         self._note(f"sending {len(targets)} numbers to the bot checker")
         self._log(f"[MEESHO-BOT] Bot checker: sending {payload}.")
         screen = await self._send_text(payload, timeout=conf["step_timeout"])
         screen = await self._settle_check(screen, conf, want_result=True)
+
+        # If direct send from result didn't produce verdict, try Check Another
+        if self._check_state(screen, conf) != S_CHECK_RESULT:
+            # Check if we got stuck still at result/prompt without verdicts
+            # Try tapping Check Another if available
+            maybe_verdicts = screen.parse_check_verdicts(
+                conf["registered_hints"], conf["not_registered_hints"]
+            )
+            if not maybe_verdicts and already_in_checker:
+                another = screen.check_another_button(conf.get("check_another_hints", ()))
+                if another is not None:
+                    self._log(f"[MEESHO-BOT] Bot checker (batch): direct send didn't yield result, tapping '{another[2]}' then resending.")
+                    try:
+                        screen = await self._click(screen, another[2])
+                        screen = await self._settle_check(screen, conf, want_result=False)
+                        screen = await self._send_text(payload, timeout=conf["step_timeout"])
+                        screen = await self._settle_check(screen, conf, want_result=True)
+                    except MeeshoBotError as exc:
+                        self._log(f"[MEESHO-BOT] Bot checker (batch): could not tap '{another[2]}' ({exc}).")
 
         # Collect per-number verdicts. The reply order is NOT the input order,
         # so verdicts come out of parse_check_verdicts keyed by number, and we
@@ -2910,12 +3112,19 @@ class MeeshoBotClient:
                   + ".")
 
         if conf["reset_after_check"]:
-            try:
-                await self._cancel_to_menu()
-                self._note("bot checker: back at the main menu")
-            except MeeshoBotError as exc:
-                self._log(f"[MEESHO-BOT] Bot checker: could not return to the "
-                          f"main menu after the batch check ({exc}).")
+            if conf.get("continuous"):
+                self._log("[MEESHO-BOT] Bot checker (batch): continuous mode - staying at result for direct next batch.")
+            else:
+                try:
+                    await self._cancel_to_menu()
+                    self._note("bot checker: back at the main menu")
+                except MeeshoBotError as exc:
+                    self._log(f"[MEESHO-BOT] Bot checker: could not return to the "
+                              f"main menu after the batch check ({exc}).")
+        else:
+            self._log("[MEESHO-BOT] Bot checker (batch): staying at result/prompt - next batch will send directly without Start.")
+            self._note("bot checker: staying at checker for direct next batch")
+
         return {
             "success": True,
             "verdicts": {d: bool(v) for d, v in verdicts.items()},
@@ -3045,7 +3254,14 @@ class CheckerBotClient:
         if not username.startswith("@"):
             username = "@" + username
         self.bot_username = username
-        self.conf = dict(conf or {})
+        # Dedicated checker bot defaults to continuous checking: after every
+        # number check there is no need for tapping Start - next number can be
+        # given directly. reset_after_check=False enables that.
+        base_conf = dict(conf or {})
+        base_conf.setdefault("reset_after_check", False)
+        base_conf.setdefault("continuous", True)
+        base_conf.setdefault("reuse_checker", True)
+        self.conf = base_conf
 
     # -- pass-through to the shared session --------------------------------
 
