@@ -42,6 +42,8 @@ from checker_client import (
     CheckerUnavailable
 )
 from checker_router import (
+    BotBusy,
+    CheckerBotBusy,
     CheckerRouter,
     MODE_BOT,
     MODE_AUTO,
@@ -50,6 +52,19 @@ from checker_router import (
 from state import StateStore
 from stats import StatsStore
 from balance_guard import BalanceGuard
+from runtime import (
+    apply_instance_overrides,
+    pending_filename,
+    resolve_instance,
+    state_filename,
+    stats_filename,
+)
+from cancel_watch import (
+    CANCEL_RETRY_TYPES,
+    CancelWatchManager,
+    PendingCancelStore,
+    resolve_settings as resolve_cancel_settings,
+)
 from meesho_bot_client import (
     MeeshoBotClient,
     MeeshoBotError,
@@ -88,30 +103,141 @@ class NumberContext:
         self.acquired_at = now()
 
 
+class _BotClaim:
+    """
+    Exclusive claim on the PRIMES bot conversation (see the coordinator).
+
+    One Telegram chat with the bot is shared by three kinds of work:
+
+      * "login"  - driving a paid number through login -> OTP -> link;
+      * "check"  - asking the bot whether a number is registered;
+      * "prewarm"- parking the bot on an agreed offer before a number exists.
+
+    Only one may run at a time, and a login outranks the rest: a number check
+    that starts while a login waits for its OTP walks the bot back to its main
+    menu and types the number to check into the checker prompt - the paid
+    number's OTP screen is gone, the OTP (if it lands) cannot be entered and
+    the money is wasted. So a non-login claim never queues behind a login:
+    it either waits a bounded time for the bot to become free, or reports
+    "busy" and the number is cancelled with a refund instead.
+    """
+
+    def __init__(self, coordinator, owner, timeout=0.0, wait=False):
+        self.coordinator = coordinator
+        self.owner = owner
+        self.timeout = max(0.0, float(timeout or 0.0))
+        self.wait = bool(wait)
+        self.held = False
+
+    def __enter__(self):
+        coord = self.coordinator
+        lock = coord._bot_claim_lock
+        if not self.wait:
+            acquired = lock.acquire(blocking=False)
+        else:
+            acquired = lock.acquire(blocking=True, timeout=self.timeout)
+        if not acquired:
+            raise BotBusy(
+                f"the PRIMES bot is busy (owner: {coord._bot_claim_owner or 'unknown'})"
+            )
+        try:
+            if self.owner == "login":
+                coord._bot_login_depth += 1
+                coord.bot_login_active = True
+                coord._bot_claim_owner = "login"
+            elif coord.bot_login_active:
+                raise BotBusy("a login flow is using the PRIMES bot")
+            else:
+                coord._bot_claim_owner = self.owner
+            self.held = True
+            return coord
+        except Exception:
+            lock.release()
+            raise
+
+    def __exit__(self, exc_type, exc, tb):
+        coord = self.coordinator
+        if not self.held:
+            return False
+        self.held = False
+        try:
+            if self.owner == "login":
+                coord._bot_login_depth = max(0, coord._bot_login_depth - 1)
+                if coord._bot_login_depth == 0:
+                    coord.bot_login_active = False
+            if coord._bot_login_depth == 0:
+                coord._bot_claim_owner = None
+        finally:
+            coord._bot_claim_lock.release()
+        return False
+
+
 class ParallelAutomationCoordinator:
 
-    def __init__(self, config, provider_override=None):
+    def __init__(self, config, provider_override=None, instance=None):
         self.config = config
         self.provider_override = provider_override
+
+        # Parallel runs (one Termux tab per provider) get their own instance
+        # name: it namespaces stats/state/pending-cancel files and the signal
+        # directory, and merges an optional config["instances"][name] block.
+        self.instance = resolve_instance(instance, provider_override)
+        # A parallel run may bring its own settings (userbot session, Telegram
+        # command bot, provider selection): config["instances"][name] is merged
+        # over the shared config for this instance only.
+        config = apply_instance_overrides(config, self.instance)
+        self.config = config
 
         self.checker_conf = config.get("checker", {})
         self.settings = config.get("automation", {})
 
-        self.state = StateStore()
-        self.stats = StatsStore()
+        self.state = StateStore(filename=state_filename(self.instance))
+        self.stats = StatsStore(filename=stats_filename(self.instance))
         self.guard = BalanceGuard(config.get("balance_guard", {}), log_fn=log)
-        self.notify = Notifier(config)
+        self.notify = Notifier(config, instance=self.instance)
         self.bot = MeeshoBotClient(config, log_fn=log)
 
         # Number checking strategy: API only, PRIMES bot only, or API with an
         # automatic bot fallback (checker.mode in config.json - see
         # SETUP_CHECKER.md). The bot is looked up lazily so replacing
         # self.bot at runtime (tests) is picked up.
+        # Dedicated checker bot (config "checker" -> "telegram_bot"): the same
+        # logged-in Telegram account drives a SECOND bot conversation, so a
+        # number check never walks the PRIMES login bot out of a waiting OTP
+        # screen. It never takes the login claim; PRIMES is only the last
+        # resort when nothing else can answer.
+        self._dedicated_checker_client = None
+        checker_bot_conf = config.get("checker", {}).get("telegram_bot") or {}
+        checker_bot_username = (
+            checker_bot_conf.get("username") or checker_bot_conf.get("bot_username") or ""
+        )
+        if checker_bot_conf.get("enabled", False) is False:
+            # Disabled dedicated checker bot: do not build the client.
+            checker_bot_username = ""
+        if checker_bot_username:
+            try:
+                from meesho_bot_client import CheckerBotClient
+                self._dedicated_checker_client = CheckerBotClient(
+                    self.bot,
+                    username=checker_bot_username,
+                    conf=checker_bot_conf,
+                    log_fn=log,
+                )
+            except Exception as exc:
+                log(f"Checker: could not set up the dedicated checker bot "
+                    f"({exc}); it is not available.")
+                self._dedicated_checker_client = None
+
         self.checker = CheckerRouter(
             config,
             bot_getter=lambda: self.bot,
             log_fn=log,
-            stats=self.stats
+            stats=self.stats,
+            gate=self._bot_check_allowed,
+            claim=self._bot_check_claim,
+            checker_bot_getter=(lambda: self._dedicated_checker_client)
+                if self._dedicated_checker_client is not None else None,
+            checker_bot_username=checker_bot_username or None,
         )
         self.checker_service = self.checker_conf.get("service", "meesho")
         self.target_registered = self.settings.get("target_registered", False)
@@ -145,6 +271,36 @@ class ParallelAutomationCoordinator:
         self.bot_at_number_prompt = False  # bot sitting on offer/number prompt after Change Number
         self.bot_change_attempts = 0
         self._bot_warned = False
+
+        # One PRIMES conversation, claimed exclusively (see _BotClaim): a login
+        # flow owns the bot, so a number check can never be typed into - or
+        # walk the bot away from - a login that is waiting for its OTP.
+        self._bot_claim_lock = threading.RLock()
+        self._bot_claim_owner = None
+        self._bot_login_depth = 0
+        self.bot_login_active = False
+        # Offer pre-warm: the bot is walked to an agreed offer while the
+        # workers are still hunting, so a found number is sent straight away
+        # instead of waiting for Add Account -> ... -> offer rerolls.
+        self.bot_warm = {"ready": False, "upi": None, "at": 0.0, "rerolls": 0}
+        self.prewarm_enabled = bool(self.settings.get("prewarm_offer", True))
+        self.warm_refresh_seconds = self._warm_refresh_seconds()
+
+        # Deferred cancellations: a provider that refuses a cancel with ERROR
+        # (TemporaSMS / VSImpro) keeps the activation (and the money) open, so
+        # the cancel is retried in the background at activation expiry while
+        # the worker keeps hunting - see cancel_watch.py.
+        self.pending_cancels = CancelWatchManager(
+            self,
+            store=PendingCancelStore(filename=pending_filename(self.instance)),
+            log_fn=log,
+        )
+        # Providers whose refund tally is suspended because a deferred
+        # cancellation holds an unknown amount (the balance could not be read
+        # when the cancel was deferred). Suspending beats critical-stopping on
+        # a difference that is fully explained by the pending refund.
+        self._tally_suspended = set()
+        self._tally_suspension_lock = threading.Lock()
 
         # Build active clients
         self.clients = create_otp_clients(config, provider_override=provider_override)
@@ -187,9 +343,71 @@ class ParallelAutomationCoordinator:
             entry["number"] = number
 
     def _expected_balance(self, name, activation_id):
+        """
+        The balance this provider should be back at once the activation is
+        refunded - minus the money still held by deferred cancellations.
+
+        Without the deduction, a number bought while a refused cancel is still
+        waiting for expiry would always look like a refund mismatch (the
+        deferred activation's price is still missing from the balance), which
+        critical-stopped the run over a timing problem.
+        """
         with self.ledger_lock:
             entry = self.ledger.get(name, {})
-            return entry.get("expected_balance")
+            base = entry.get("expected_balance")
+        if base is None:
+            return None
+        hold, _unknown = self.pending_cancels.hold_total(name, exclude=activation_id)
+        return base - hold
+
+    # -- hooks for the deferred-cancellation watcher (cancel_watch.py) -------
+
+    def client_by_name(self, name):
+        for client in self.clients:
+            if client.name == name:
+                return client
+        return None
+
+    def expected_balance(self, name, activation_id=None):
+        return self._expected_balance(name, activation_id)
+
+    def note_balance(self, name, balance):
+        return self._note_balance(name, balance)
+
+    def critical_stop(self, title, message):
+        return self._critical_stop(title, message)
+
+    def pending_cancel_hold(self, name=None, exclude=None):
+        """(amount still held, whether any of it is unknown) - see cancel_watch."""
+        return self.pending_cancels.hold_total(name, exclude=exclude)
+
+    def _suspend_tally(self, name, reason):
+        """
+        Stop running refund tallies for `name` until its deferred cancellations
+        are resolved: the balance holds money whose amount is unknown, so any
+        comparison would be guesswork (and a guessed mismatch stops the run).
+        """
+        with self._tally_suspension_lock:
+            fresh = name not in self._tally_suspended
+            self._tally_suspended.add(name)
+        if fresh:
+            log(f"Refund tally suspended for {name.upper()} ({reason}); it resumes "
+                f"when the pending cancellation is resolved.", prefix=name.upper())
+            self.notify.alert(
+                f"⏳ [{name.upper()}] Refund tally suspended",
+                f"{reason}\\n\\nUntil that money is back, cancellations on "
+                f"{name.upper()} are not compared against the expected balance "
+                f"(a comparison could not tell a missing refund from the pending "
+                f"one). Everything else continues normally."
+            )
+
+    def _clear_tally_suspension(self, name):
+        with self._tally_suspension_lock:
+            self._tally_suspended.discard(name)
+
+    def _tally_is_suspended(self, name):
+        with self._tally_suspension_lock:
+            return name in self._tally_suspended
 
     def _note_checker_failure(self):
         """Count one more consecutive failed check; returns the streak."""
@@ -227,6 +445,10 @@ class ParallelAutomationCoordinator:
         lines = [
             f"🤖 Meesho Automation: {state_str}",
             f"Mode: {self.config.get('active_otp_provider', 'both').upper()}",
+        ]
+        if self.instance:
+            lines.append(f"Instance: {self.instance} (own stats / state / signals)")
+        lines += [
             f"PRIMES bot automation: {'🟢 ON' if self.bot.ready else '⚪ manual'}",
             f"Checker: {self.checker.describe()}",
         ]
@@ -257,6 +479,17 @@ class ParallelAutomationCoordinator:
             lines.append("\nWorkers:")
             for name, st in self.worker_statuses.items():
                 lines.append(f"  • {name.upper()}: {st}")
+
+        pending = self.pending_cancels.pending()
+        if pending:
+            lines.append("\n⏳ Cancellations deferred to activation expiry:")
+            for record in pending:
+                hold = record.get("hold")
+                hold_text = "amount unknown" if hold is None else f"holding {float(hold):.4f}"
+                lines.append(
+                    f"  • {str(record.get('provider', '')).upper()}: {record.get('number')} "
+                    f"- retried in {record.get('seconds_to_expiry', 0):.0f}s ({hold_text})"
+                )
 
         s = self.stats.snapshot()
         lines.append(
@@ -366,6 +599,9 @@ class ParallelAutomationCoordinator:
             remaining = self.checker.cooldown_remaining()
             if remaining > 0:
                 lines.append(f"⚠️ API cooling down right now - bot checks for ~{remaining:.0f}s")
+        bot = self.checker.bot
+        if bot.has_preferred:
+            lines.append(f"Dedicated checker bot (PRIMES-safe): {bot.describe_preferred()}")
         if self.checker.mode_wants_bot:
             if self.checker.bot_ready:
                 lines.append("PRIMES bot checker: 🟢 ready")
@@ -465,10 +701,12 @@ class ParallelAutomationCoordinator:
         log(f"Cancelling activation {activation_id} for number {number} (Reason: {reason})...", prefix=pname)
 
         cancel_res = None
+        cancel_error = ""
         try:
             cancel_res = client.cancel(activation_id)
             log(f"Cancellation response: {cancel_res}", prefix=pname)
         except Exception as exc:
+            cancel_error = str(exc)
             log(f"Error while cancelling activation {activation_id}: {exc}", prefix=pname)
 
         # Handle provider cooldowns (e.g. WAIT_CANCEL:120 on OtpDoctor)
@@ -492,7 +730,62 @@ class ParallelAutomationCoordinator:
                 cancel_res = client.cancel(activation_id)
                 log(f"Cancellation response after cooldown: {cancel_res}", prefix=pname)
             except Exception as exc:
+                cancel_error = str(exc)
                 log(f"Error while retrying cancellation {activation_id}: {exc}", prefix=pname)
+
+        # A cancel the provider refuses (TemporaSMS / VSImpro answer a plain
+        # {"type": "ERROR"} while the activation is young) is NOT a refund: the
+        # activation - and the money - stay open. It is handed to a background
+        # watcher that retries at activation expiry and reports a late OTP,
+        # instead of running the refund tally now and critical-stopping the run
+        # over money that is simply still pending.
+        _probes = self.settings.get("cancel_salvage_probes", 2)
+        if expect_refund and self._should_defer_cancel(cancel_res, cancel_error):
+            # One last chance for an OTP that landed while the cancel was in
+            # flight: it is used as usual (the charge stands) instead of being
+            # parked behind a deferred cancellation.
+            salvaged_now = None
+            if _probes > 0:
+                try:
+                    salvaged_now = self.guard.salvage_late_otp(
+                        client, activation_id,
+                        probes=_probes,
+                        delay=self.settings.get("cancel_salvage_delay", 1.5),
+                        prefix=pname,
+                    )
+                except Exception:
+                    salvaged_now = None
+            if not salvaged_now:
+                return self._defer_cancellation(
+                    client, activation_id, number, reason, expected_balance,
+                    cancel_res=cancel_res, cancel_error=cancel_error,
+                )
+            # The SMS arrived on a number whose cancel was refused: the charge
+            # stands and the code is reported immediately.
+            self.stats.increment("late_otp_salvaged")
+            self.stats.increment("numbers_consumed")
+            code = salvaged_now.get("code")
+            sms = salvaged_now.get("sms", "")
+            log(f"🚨 OTP arrived despite the refused cancel! Code: {code}", prefix=pname)
+            self.notify.alert(
+                f"🚨 [{pname}] OTP on a number whose cancel was refused",
+                f"Number: {number}\nActivation: {activation_id}\nReason: {reason}\n\n"
+                f"Code: `{code}`\nSMS: {sms}\n\n"
+                "The provider refused the cancel, but the OTP arrived anyway - "
+                "the SMS was delivered, so this charge stands (no refund) and "
+                "the activation stays open. The PRIMES bot may still be waiting "
+                "for this code."
+            )
+            refund_delay = self.settings.get("refund_check_delay_seconds", 2)
+            if refund_delay > 0:
+                time.sleep(refund_delay)
+            try:
+                actual_balance = client.get_balance()
+                self._note_balance(client.name, actual_balance)
+            except Exception:
+                pass
+            return {"tally_ok": True, "deferred": False, "salvaged": salvaged_now,
+                    "balance": actual_balance}
 
         self.stats.increment("numbers_cancelled")
 
@@ -516,15 +809,16 @@ class ParallelAutomationCoordinator:
             log(f"Number consumed (SMS delivered); new balance baseline: {actual_balance}", prefix=pname)
         else:
             # Salvage race: an OTP may have landed as the cancel was processed.
-            try:
-                salvaged = self.guard.salvage_late_otp(
-                    client, activation_id,
-                    probes=self.settings.get("cancel_salvage_probes", 2),
-                    delay=self.settings.get("cancel_salvage_delay", 1.5),
-                    prefix=pname,
-                )
-            except Exception:
-                salvaged = None
+            if _probes > 0:
+                try:
+                    salvaged = self.guard.salvage_late_otp(
+                        client, activation_id,
+                        probes=_probes,
+                        delay=self.settings.get("cancel_salvage_delay", 1.5),
+                        prefix=pname,
+                    )
+                except Exception:
+                    salvaged = None
             if salvaged:
                 self.stats.increment("late_otp_salvaged")
                 code = salvaged.get("code")
@@ -565,11 +859,26 @@ class ParallelAutomationCoordinator:
                 if refund_delay > 0:
                     time.sleep(refund_delay)
 
-                tally_ok, actual_balance = self.guard.verify_refund(
-                    client, expected_balance,
-                    activation_id=activation_id, number=number,
-                    stop_event=self.stop_requested, prefix=pname,
-                )
+                if expected_balance is not None and self._tally_is_suspended(client.name):
+                    # A deferred cancellation on this provider is holding an
+                    # amount that could not be measured, so the expected
+                    # balance is a guess: re-baseline instead of stopping the
+                    # run over a difference that is probably just that money.
+                    try:
+                        actual_balance = client.get_balance()
+                        self._note_balance(client.name, actual_balance)
+                    except Exception:
+                        actual_balance = None
+                    log(f"Refund tally skipped (suspended while a deferred "
+                        f"cancellation is pending); new balance baseline: "
+                        f"{actual_balance}", prefix=pname)
+                    tally_ok = True
+                else:
+                    tally_ok, actual_balance = self.guard.verify_refund(
+                        client, expected_balance,
+                        activation_id=activation_id, number=number,
+                        stop_event=self.stop_requested, prefix=pname,
+                    )
 
                 if expected_balance is not None and tally_ok:
                     self.stats.increment("refunds_verified")
@@ -606,6 +915,103 @@ class ParallelAutomationCoordinator:
             "cancelled_at": now()
         })
         return result
+
+    # -- Deferred cancellations (provider refused the cancel) ----------------
+
+    def _should_defer_cancel(self, cancel_res, cancel_error):
+        """
+        True when a cancel must be retried later instead of tallied now.
+
+        TemporaSMS / VSImpro answer a cancel that arrives before the activation
+        is old enough with a plain {"type": "ERROR"}: the activation stays open
+        and the money stays deducted. Tallies against the balance right now can
+        only fail, so the cancellation is deferred to the activation expiry.
+        """
+        if not self.settings.get("defer_refused_cancels", True):
+            return False
+        if cancel_res is None:
+            # The cancel call itself failed (network / provider error): the
+            # activation is almost certainly still open.
+            return bool(cancel_error)
+        return cancel_res.get("type") in CANCEL_RETRY_TYPES
+
+    def _defer_cancellation(self, client, activation_id, number, reason,
+                            expected_balance, cancel_res=None, cancel_error=""):
+        """
+        Hand a refused cancellation to the background watcher (cancel_watch.py)
+        and let the caller carry on with the next number.
+        """
+        pname = client.name.upper()
+        hold = None
+        balance = None
+        try:
+            balance = float(client.get_balance())
+        except Exception as exc:
+            log(f"Could not read the balance for the deferred cancel: {exc}", prefix=pname)
+
+        if balance is not None and expected_balance is not None:
+            # How much of the expected balance is still tied up in this
+            # activation: every later refund tally is measured against the
+            # expected balance minus this hold.
+            hold = max(0.0, round(float(expected_balance) - balance, 6))
+
+        detail = " ".join(part for part in (str(cancel_error or ""), str(cancel_res or "")) if part)
+        record = self.pending_cancels.defer(
+            client, activation_id, number, reason, expected_balance,
+            hold=hold, error_detail=detail,
+        )
+
+        if hold is None:
+            self._suspend_tally(
+                client.name,
+                f"the deferred cancellation of {number} holds an amount that "
+                f"could not be measured (the balance could not be read)"
+            )
+
+        settings = resolve_cancel_settings(self.settings)
+        self.state.save({
+            "status": "CANCEL_DEFERRED",
+            "provider": client.name,
+            "activation_id": activation_id,
+            "number": number,
+            "reason": reason,
+            "expected_balance": expected_balance,
+            "hold": hold,
+            "retry_at": record.get("expiry_at"),
+            "deferred_at": now()
+        })
+        self.notify.send(
+            f"⏳ [{pname}] Cancel refused - deferred",
+            f"Number: {number}\nActivation: {activation_id}\nReason: {reason}\n\n"
+            f"The provider answered `{detail or 'ERROR'}`, so the activation is "
+            f"still open. It is retried in ~{settings['cancel_error_expiry_seconds']:.0f}s "
+            f"(activation expiry) in the background; this worker keeps hunting "
+            f"and the refund is tallied after the retry."
+            + ("" if hold else "\n\n⚠️ The balance could not be read, so the "
+               "refund tally for this provider is suspended until it resolves.")
+        )
+        return {
+            "tally_ok": True,
+            "deferred": True,
+            "salvaged": None,
+            "balance": balance,
+            "record": record,
+        }
+
+    def on_pending_resolved(self, provider):
+        """A deferred cancellation finished: refresh the ledger bookkeeping."""
+        _hold, unknown = self.pending_cancels.hold_total(provider)
+        if unknown:
+            self._suspend_tally(
+                provider,
+                "another deferred cancellation still holds an amount that could "
+                "not be measured"
+            )
+        else:
+            self._clear_tally_suspension(provider)
+            remaining = self.pending_cancels.hold_total(provider)[0]
+            log(f"Deferred cancellation resolved; remaining held on "
+                f"{provider.upper()}: {remaining:.4f}", prefix=provider.upper())
 
     # -- Parallel Worker Loop ------------------------------------------------
 
@@ -795,6 +1201,18 @@ class ParallelAutomationCoordinator:
                 f"(mode: {self.checker.mode})...", prefix=pname)
             try:
                 check = self.checker.check(self.checker_service, clean_number)
+            except CheckerBotBusy as exc:
+                # The bot is busy with a login: the number is cancelled with a
+                # refund (never typed into a screen that is waiting for an
+                # OTP), and this does NOT count as a broken checker.
+                log(f"Checker: the PRIMES bot is busy ({exc}); cancelling "
+                    f"{clean_number} with a refund instead...", prefix=pname)
+                self.stats.increment("bot_claims_denied")
+                self.handle_cancellation(client, activation_id, clean_number,
+                                         f"Checker busy: {exc}")
+                if self.stop_requested.is_set():
+                    return
+                continue
             except (CheckerUnavailable, CheckerError) as exc:
                 log(f"Checker error (mode {self.checker.mode}): {exc}. "
                     f"Cancelling number...", prefix=pname)
@@ -822,6 +1240,10 @@ class ParallelAutomationCoordinator:
             self._reset_checker_failures()
             is_registered = check.get("is_registered", False)
             checker_source = check.get("source", "api")
+            if checker_source == "bot":
+                # A bot check navigates the bot (menu -> checker -> menu), so a
+                # parked offer is gone: re-arm it before the next number.
+                self._release_bot_warm()
             log(f"Checker result via {checker_source}: is_registered={is_registered} "
                 f"(Target: {self.target_registered})", prefix=pname)
 
@@ -1312,6 +1734,123 @@ class ParallelAutomationCoordinator:
             outcome.update(reason=f"{short}; bot kept in-flow ({why})")
         return outcome
 
+    # -- PRIMES bot: exclusive claim, offer pre-warm -------------------------
+
+    def _warm_refresh_seconds(self):
+        """How often a parked offer prompt is re-verified (meesho_bot)."""
+        conf = self.config.get("meesho_bot", {}) or {}
+        try:
+            value = float(conf.get("offer_warm_refresh_seconds", 90) or 0)
+        except (TypeError, ValueError):
+            value = 90.0
+        return value if value > 0 else 90.0
+
+    def _bot_check_allowed(self):
+        """
+        (allowed, reason) - may the PRIMES bot be used for a number check now?
+
+        A login/OTP flow outranks a check: the check would navigate the bot
+        away from the OTP screen and the paid number would be lost.
+        """
+        if not self.bot.ready:
+            return False, "the PRIMES userbot is not connected"
+        if self.bot_login_active:
+            return False, "a login flow is using the PRIMES bot"
+        if self.target_found_event.is_set():
+            return False, "a target number is being driven through the login flow"
+        return True, ""
+
+    def _bot_check_claim(self):
+        """Claim the bot for one number check (waits, but never for a login)."""
+        conf = self.checker_conf.get("bot") or {}
+        try:
+            timeout = float(conf.get("claim_timeout_seconds", 60) or 0)
+        except (TypeError, ValueError):
+            timeout = 60.0
+        return _BotClaim(self, "check", timeout=timeout, wait=timeout > 0)
+
+    def _bot_login_claim(self):
+        """Claim the bot for a whole login/OTP/recovery flow (blocking)."""
+        return _BotClaim(self, "login", timeout=0, wait=True)
+
+    def _bot_warm_loop(self):
+        """
+        Keep the PRIMES bot parked on an agreed offer while workers hunt.
+
+        The offer reroll (Add Account -> Login with Number -> Normal -> reroll
+        until UPI <= target) normally runs AFTER a number was found, while its
+        paid OTP window is ticking. Here it runs before there is a number, so
+        the found number is typed into a screen that is already waiting for it.
+        """
+        last_verified = 0.0
+        while not self.stop_requested.is_set():
+            self.stop_requested.wait(1.0)
+            if self.stop_requested.is_set():
+                break
+            if not (self.prewarm_enabled and self.bot.ready):
+                continue
+            # Never touch the bot while a target is being processed (or between
+            # "target found" and the coordinator picking it up).
+            if self.target_found_event.is_set() or self.bot_login_active:
+                last_verified = 0.0
+                continue
+
+            if self.bot_at_number_prompt:
+                now_ts = time.time()
+                if now_ts - last_verified < self.warm_refresh_seconds:
+                    continue
+                if self._bot_at_prompt():
+                    last_verified = now_ts
+                    continue
+                # The parked prompt is gone (bot timeout, manual /start): warm
+                # again instead of typing the next number into a wrong screen.
+                log("Parked offer prompt is gone; re-arming the PRIMES bot.")
+                self.bot_at_number_prompt = False
+            self._bot_warm_once()
+            last_verified = time.time()
+
+    def _bot_warm_once(self):
+        """Walk the bot to an agreed offer and park it there (best effort)."""
+        prepare = getattr(self.bot, "prepare_offer", None)
+        if not callable(prepare):
+            return
+        try:
+            with _BotClaim(self, "prewarm", timeout=0, wait=False):
+                res = prepare()
+        except BotBusy:
+            return
+        except Exception as exc:
+            log(f"Offer pre-warm failed: {exc}")
+            self.bot_at_number_prompt = False
+            return
+
+        stage = (res or {}).get("stage")
+        if stage and stage != "offer":
+            log(f"Offer pre-warm ended on stage '{stage}'; the next number runs "
+                f"the full flow.")
+            self.bot_at_number_prompt = False
+            return
+
+        upi = (res or {}).get("upi")
+        rerolls = (res or {}).get("rerolls", 0)
+        if rerolls:
+            self.stats.increment("offer_rerolls", rerolls)
+        self.bot_warm = {
+            "ready": True,
+            "upi": upi,
+            "at": time.time(),
+            "rerolls": rerolls,
+        }
+        self.bot_at_number_prompt = True
+        self.stats.increment("offer_prewarmed")
+        log(f"PRIMES bot is parked on an agreed offer (UPI ₹{upi}, {rerolls} "
+            f"reroll(s)) - the next number is sent straight to it.")
+
+    def _release_bot_warm(self):
+        """The parked offer was consumed or lost: the warm loop re-arms it."""
+        self.bot_warm = {"ready": False, "upi": None, "at": 0.0, "rerolls": 0}
+        self.bot_at_number_prompt = False
+
     def wait_for_manual_trigger(self, context):
         wait_seconds = self.settings.get("trigger_wait_seconds", 300)
         poll_interval = self.settings.get("trigger_poll_interval_seconds", 2)
@@ -1442,6 +1981,18 @@ class ParallelAutomationCoordinator:
         log("=" * 60)
         log("STARTING PARALLEL MEESHO OTP AUTOMATION")
         log(f"Active Providers: {', '.join(c.name.upper() for c in self.clients)}")
+        if self.instance:
+            log(f"Instance: {self.instance} "
+                f"(stats: {self.stats.path.name}, state: {self.state.path.name}, "
+                f"signals: {self.notify.signal_dir.name})")
+
+        # Cancellations a previous run could not finish (the provider refused
+        # them) still hold money: pick them up instead of losing it.
+        leftover = self.pending_cancels.pending()
+        if leftover:
+            log(f"Resuming {len(leftover)} deferred cancellation(s) from a "
+                f"previous run.")
+            self.pending_cancels.resume()
 
         # Start the PRIMES userbot (optional; falls back to manual trigger).
         if self.bot.enabled:
@@ -1511,6 +2062,17 @@ class ParallelAutomationCoordinator:
             workers.append(t)
             t.start()
 
+        # Keep the PRIMES bot parked on an agreed offer while the workers hunt,
+        # so a found number does not wait for the offer rerolls.
+        warm_thread = None
+        if use_bot and self.prewarm_enabled:
+            warm_thread = threading.Thread(target=self._bot_warm_loop,
+                                           name="BotOfferWarm", daemon=True)
+            warm_thread.start()
+            log(f"Offer pre-warm: ON (the bot waits on an agreed offer with "
+                f"UPI <= Rs.{self.bot.target_upi_price}; re-verified every "
+                f"{self.warm_refresh_seconds:.0f}s).")
+
         try:
             while not self.stop_requested.is_set():
                 alive_workers = [t for t in workers if t.is_alive()]
@@ -1546,7 +2108,15 @@ class ParallelAutomationCoordinator:
                     self.stats.increment("targets_found")
                     log(f"\n>>> PROCESSING TARGET: {target.clean_number} ({target.provider_name.upper()}) <<<\n")
                     try:
-                        cont = self._process_target(target, use_bot)
+                        if use_bot:
+                            # The login/OTP/recovery flow owns the PRIMES bot
+                            # for as long as this number is in play: no number
+                            # check may walk the bot away from its OTP screen
+                            # (see _BotClaim).
+                            with self._bot_login_claim():
+                                cont = self._process_target(target, use_bot)
+                        else:
+                            cont = self._process_target(target, use_bot)
                     except Exception as exc:
                         # Last-resort net: nothing may ever crash the whole
                         # automation run again (a bare TimeoutError from the
@@ -1913,6 +2483,12 @@ def main():
     parser.add_argument("--provider",
                         help="Provider(s): tempora, vsimpro, otpdoctor, otpcart, 'all', or comma-combinations "
                              "e.g. 'tempora,vsimpro'")
+    parser.add_argument("--instance",
+                        help="Name of this run, for parallel copies (e.g. one Termux tab per provider). "
+                             "Namespaces stats.json / state.json / pending_cancels.json / .signals/ "
+                             "(stats.<name>.json, ...) and applies the matching config.json "
+                             '"instances" block. Defaults to the provider name when --provider '
+                             "names exactly one provider.")
     parser.add_argument("--balance", action="store_true", help="Print live balances for all providers and exit")
     parser.add_argument("--daemon", action="store_true", help="Keep Telegram command listener alive after runs")
     parser.add_argument("--set-referral-link",
@@ -1980,7 +2556,15 @@ def main():
         log(f"Fatal: {exc}")
         return
 
-    coordinator = ParallelAutomationCoordinator(config, provider_override=args.provider)
+    # Parallel copies (two Termux tabs) must not share runtime files, and each
+    # may bring its own Telegram userbot session / command bot: --instance
+    # namespaces the files and merges config["instances"][name] over the config.
+    instance = resolve_instance(args.instance, args.provider)
+    config = apply_instance_overrides(config, instance)
+
+    coordinator = ParallelAutomationCoordinator(
+        config, provider_override=args.provider, instance=instance
+    )
 
     if args.balance:
         print(coordinator.get_balances_summary())

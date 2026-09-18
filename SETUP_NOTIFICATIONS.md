@@ -139,3 +139,49 @@ The system supports running **both providers in parallel on independent worker t
   }
 }
 ```
+
+---
+
+## Deferred cancellations (provider refuses the cancel)
+
+TemporaSMS and VSImpro answer a cancel that arrives while the activation is
+still young with `{"type": "ERROR"}`. That number is NO LONGER critical-stopped
+and forgotten; it is handed to a background watcher (see `cancel_watch.py`):
+
+* the worker keeps hunting immediately (no waiting for the activation to
+  expire),
+* the amount still held is booked so later refund tallies stay correct,
+* an OTP that lands while waiting is reported with its code (the SMS was
+  delivered, so the charge legitimately stands - no cancel is retried),
+* at expiry (assumed 15 minutes from the refuse, per your instruction) the
+  cancel is retried and the refund tallied - only THEN is an imbalance a real
+  `REFUND DID NOT TALLY` critical stop.
+
+`/status` shows a section for deferred cancellations while any are open.
+
+---
+
+## Parallel runs (two Termux tabs: one for TemporaSMS, one for VSImpro)
+
+By default, running `python main.py` in two tabs in the same directory would
+have BOTH tabs write to the same `stats.json`, `state.json`, `pending_cancels.json`
+and `.signals/`, so the runs would merge or lose each other's updates.
+
+Each copy now gets its own **instance** name. Because you run exactly one
+provider per tab, it is derived automatically:
+
+    python main.py --provider tempora     # stats.tempora.json, .signals-tempora, ...
+    python main.py --provider vsimpro    # stats.vsimpro.json, .signals-vsimpro, ...
+
+To override that (or give any tab a standalone name):
+
+    python main.py --instance tab1 --provider all
+
+Optionally, a per-instance block in `config.json` under `"instances"` is merged
+over the top-level config for that instance only (useful if the two tabs
+should use different userbot sessions or a different command bot):
+
+    "instances": {
+      "tempora": { "meesho_bot": { "session_file": "userbot.tempora.session.txt" } },
+      "vsimpro": { "meesho_bot": { "session_file": "userbot.vsimpro.session.txt" } }
+    }

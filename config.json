@@ -81,7 +81,23 @@
       "step_timeout_seconds": 30,
       "max_attempts": 2,
       "reset_after_check": true,
-      "stop_after_failures": 3
+      "stop_after_failures": 3,
+      "claim_timeout_seconds": 60
+    },
+
+    "telegram_bot": {
+      "enabled": false,
+      "username": "",
+      "name": "checker bot",
+      "entry": "auto",
+      "command": "",
+      "button_hints": [],
+      "number_prompt_hints": [],
+      "registered_hints": [],
+      "not_registered_hints": [],
+      "step_timeout_seconds": 30,
+      "max_attempts": 2,
+      "reset_after_check": true
     }
   },
 
@@ -106,6 +122,8 @@
     "max_referral_events": 4,
     "target_upi_price": 47,
     "max_offer_rerolls": 30,
+    "warmup_max_offer_rerolls": 0,
+    "offer_warm_refresh_seconds": 90,
     "max_change_number": 5,
     "change_number_retries": 2,
     "change_number_timeout_seconds": 0,
@@ -124,6 +142,8 @@
   "termux": {
     "enabled": true
   },
+
+  "instances": {},
 
   "telegram": {
     "enabled": true,
@@ -148,6 +168,17 @@
     "timeout_salvage_probes": 3,
     "timeout_salvage_delay": 2.0,
     "cancel_salvage_probes": 2,
-    "cancel_salvage_delay": 1.5
+    "cancel_salvage_delay": 1.5,
+
+    "prewarm_offer": true,
+    "prewarm_reroll_budget": 0,
+
+    "defer_refused_cancels": true,
+    "cancel_error_expiry_seconds": 900,
+    "cancel_error_grace_seconds": 10,
+    "cancel_error_poll_interval_seconds": 20,
+    "cancel_error_retry_attempts": 3,
+    "cancel_error_retry_delay_seconds": 30,
+    "cancel_error_max_wait_seconds": 1800
   }
 }

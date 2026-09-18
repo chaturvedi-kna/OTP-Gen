@@ -6,7 +6,19 @@ userbot.session.txt
 *.session
 *.session-journal
 
-# Local runtime stats
+# Local runtime stats / state / deferred-cancel records / file signals.
+# Per-instance names (stats.tempora.json, .signals-tempora, ...) are covered too.
 stats.json
+stats.*.json
 stats.tmp
+stats.*.tmp
+state.json
+state.*.json
+state.tmp
+state.*.tmp
+pending_cancels.json
+pending_cancels.*.json
+pending_cancels.*.tmp
 .signals/
+.signals-*/
+.venv/

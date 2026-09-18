@@ -11,6 +11,7 @@ navigation, referral handling and OTP submission paths are exercised end to end.
 """
 
 import asyncio
+import atexit
 import sys
 import threading
 import time
@@ -475,6 +476,15 @@ class FakeTelegramClient:
         return self.bot.last
 
 
+def _close_loop(loop):
+    """Close a harness event loop at interpreter shutdown (best effort)."""
+    try:
+        if not loop.is_closed():
+            loop.close()
+    except Exception:
+        pass
+
+
 def build_client(referral_link="", referral_script="save",
                  referral_failure_action="stop", retry_after=None,
                  variant_first=False, otp_transition="instant",
@@ -515,6 +525,11 @@ def build_client(referral_link="", referral_script="save",
         return client._loop.run_until_complete(coro)
 
     client._run = _run
+
+    # The harness loop is never stopped; without this, every client leaks one
+    # and the interpreter prints "Exception ignored in BaseEventLoop.__del__"
+    # at shutdown (noise that hides real errors).
+    atexit.register(_close_loop, client._loop)
     return client, bot
 
 
