@@ -233,6 +233,9 @@ Then log in each account ONCE (each writes its own session file):
 `userbot.<instance>.session.txt`; `--session-file <path>` overrides the output
 path entirely. Skip the flag and the top-level `meesho_bot` defaults are used.)
 
-If both tabs should drive the SAME Telegram account, do nothing: the top-level
-`meesho_bot.session_file` is shared, and even that is safe now - the dedicated
-checker bot runs as its own conversation and never steals a login in flight.
+Do NOT drive the PRIMES/checker bots from BOTH tabs with the SAME Telegram
+account: the bot's chat history is shared server-side, so tab B's screen taps
+and typed numbers would interleave with tab A's login/OTP screens (the
+bot-claim lock only guards threads inside one process, not two). Give each
+tab its own account via the `instances` block above - that is exactly what it
+is for. One account + one bot-driving tab at a time stays safe.

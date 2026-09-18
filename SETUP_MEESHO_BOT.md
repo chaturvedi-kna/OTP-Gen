@@ -30,7 +30,7 @@ offer (**offer pre-warm**): the Add Account → Login with Number → Normal wal
 and the reroll to `target_upi_price` already happened **before** any number
 exists. As soon as a number is found it is typed into that parked prompt
 without waiting for an offer. The parked prompt is re-armed automatically if
-it times out. Controlled by `meesho_bot.prewarm_offer` (default on),
+it times out. Controlled by `automation.prewarm_offer` (default on),
 `meesho_bot.offer_warm_refresh_seconds` (default 90) and
 `meesho_bot.warmup_max_offer_rerolls` (0 = reuse `max_offer_rerolls`).
 
