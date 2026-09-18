@@ -6,7 +6,23 @@ userbot.session.txt
 *.session
 *.session-journal
 
-# Local runtime stats
+# Local runtime stats / state / deferred-cancel records / file signals.
+# Per-instance names (stats.tempora.json, .signals-tempora, ...) are covered too.
 stats.json
+stats.*.json
 stats.tmp
+stats.*.tmp
+state.json
+state.*.json
+state.tmp
+state.*.tmp
+pending_cancels.json
+pending_cancels.*.json
+pending_cancels.*.tmp
 .signals/
+.signals-*/
+.venv/
+
+# Persistent complaint evidence (cancel refused + late OTP), per-instance too.
+cancel_refused_otp.jsonl
+cancel_refused_otp.*.jsonl

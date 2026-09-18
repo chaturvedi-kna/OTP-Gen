@@ -1,10 +1,16 @@
-# Checker setup: modes (API / PRIMES bot / auto), rate limits, retries & keys
+# Checker setup: modes (API / dedicated checker bot / PRIMES bot / auto), rate limits & keys
 
-Two ways to validate a number before it is spent:
+Three ways to validate a number before it is spent, in preference order:
 
-* the **checker API** (superassets.in) — fast, parallel, rate limited per key;
-* the **PRIMES bot's own number checker** — driven through the same Telethon
-  userbot that runs the login flow (`SETUP_MEESHO_BOT.md`).
+1. the **checker API** (superassets.in) — fast, parallel, rate limited per key;
+2. a **dedicated Telegram checker bot** (`"checker" -> "telegram_bot"`) —
+   driven through the SAME logged-in Telegram account but a SECOND bot
+   conversation, so it never walks the PRIMES login bot out of a waiting OTP
+   screen. Fill in its username + screen hints; the same session file as
+   `meesho_bot` is used, so **no extra `login_userbot.py` is needed**;
+3. the **PRIMES login bot** as the last resort only — and never while an OTP
+   is being waited on (a mid-flight login owns the bot, so the check is
+   cancelled/refunded instead of walking away from a paid OTP).
 
 `config.json` → `"checker"` → `"mode"` picks how they are used.
 
@@ -43,10 +49,31 @@ Two ways to validate a number before it is spent:
     "not_registered_hints": [],
     "step_timeout_seconds": 30,
     "max_attempts": 2,
+    "reset_after_check": true,
+    "claim_timeout_seconds": 60
+  },
+
+  "telegram_bot": {
+    "enabled": false,
+    "username": "",
+    "name": "checker bot",
+    "entry": "auto",
+    "command": "",
+    "button_hints": [],
+    "number_prompt_hints": [],
+    "registered_hints": [],
+    "not_registered_hints": [],
+    "step_timeout_seconds": 30,
+    "max_attempts": 2,
     "reset_after_check": true
   }
 }
 ```
+
+With `"telegram_bot"` enabled, the API falls back to THAT bot (same Telegram
+account, separate conversation) before ever touching the PRIMES login bot -
+and when the PRIMES bot is in use, it is still never used to check a number
+while a login is waiting for its OTP (the check is cancelled instead).
 
 Aliases are accepted for convenience: `primes`, `primes_bot`, `bot_checker` →
 `bot`; `fallback`, `hybrid`, `both` → `auto`; `api_checker`, `http` → `api`.
@@ -67,7 +94,74 @@ python main.py --checker-status         # print the configured strategy
 
 The change is written into `config.json` and applied immediately.
 
-## 2. `auto`: which API failures switch to the bot
+## 1b. The dedicated checker bot (`checker.telegram_bot`)
+
+`telegram_bot` reuses the same `userbot.session.txt` as the login userbot -
+same `api_id`/`api_hash`, same account. You only describe WHERE the number
+goes and HOW to read the reply:
+
+* `entry` — `auto` (ask the screen, fall back to `command`), `button`, or
+  `command` (if the bot only answers to a slash command);
+* `command` — the slash command template, e.g. `"/check {number}"`;
+* `button_hints` — extra labels to try on the menu if the automatic pick is
+  not there (e.g. `"Check number"`, `"Number Check"`);
+* `number_prompt_hints` — extra wording the bot uses when asking for the
+  10-digit number;
+* `registered_hints` / `not_registered_hints` — extra wording for the verdict.
+
+Send the screenshot of the bot (or just paste its `/start` output) and these
+can be tuned exactly. The flow is: it asks the bot for the 10-digit number,
+reads `"registered" / "not registered" from the screen (matching the hints),
+then optionally goes back to its main menu before it searches for another.
+
+### The "Meesho Xxpress Manish" bot (tuned defaults)
+
+`config.json` -> `checker.telegram_bot` ships pre-tuned for the second
+checker bot from the screenshots — set `enabled: true` and its `username`
+(the bot's @handle; the display name "Meesho Xxpress Manish" is not the
+username), and nothing else needs changing:
+
+* `button_hints`: `"Check Number"` — the reply-keyboard button on the
+  welcome screen (tapping it sends the label itself; no inline buttons);
+* `number_prompt_hints`: the bot's Hinglish ask
+  ("Meesho Number Check", "Ek ya kai phone numbers bhejo",
+  "Cancel likho to exit", ...);
+* verdict hints cover `NOT REGISTERED (NEW USER)` / `— REGISTERED`; the
+  🆕 / ✅ badges are recognised even without any hint;
+* the transient `⏳ Checking N number(s) on Meesho...` screen is waited out.
+
+> If the bot gates you with "Join Channel" / "✅ I've Joined", do that ONCE
+> by hand from the userbot's own Telegram account — afterwards the checker
+> runs unassisted.
+
+### Batch verification (`batch_enabled` / `batch_size` / `batch_wait_seconds`)
+
+The bot accepts SEVERAL comma-separated numbers in one message
+(`9876543210, 9123456789, ...`). Turn it on to answer up to `batch_size`
+concurrent number checks with a single bot visit:
+
+```json
+"telegram_bot": {
+  "enabled": true,
+  "username": "@MeeshoXxpressManishBot",
+  "batch_enabled": true,
+  "batch_size": 3,
+  "batch_wait_seconds": 6.0
+}
+```
+
+* When one worker asks for a check, a short window (`batch_wait_seconds`)
+  stays open for other workers' checks to join; the window also closes early
+  once `batch_size` numbers have joined. One comma-separated message is sent,
+  one reply answers the whole batch — much faster than sequential visits.
+* **Matching is by number, never by position**: the bot's reply
+  (`📋 Number Check Results ...`) lists its verdicts in a DIFFERENT order
+  than the input (observed in the screenshots). Every participant is handed
+  exactly the verdict for its own number; a number the bot forgot to answer
+  fails just that one check (the usual cancel-and-refund path), not the batch.
+* With batching off (default), every check is its own bot visit — same
+  behaviour as before. A lone check with batching on simply runs as a single
+  visit after the window closes.
 
 `checker.fallback` (all default `true` except `rate_limit`):
 

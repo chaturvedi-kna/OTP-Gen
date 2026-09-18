@@ -1,10 +1,21 @@
+"""
+Last-known run state, used to resume/report after a crash or a restart.
+
+Parallel runs (one Termux tab per provider) each get their own file: pass
+`instance="tempora"` for state.tempora.json (see runtime.py).
+"""
+
 import json
 from pathlib import Path
+
+from runtime import DEFAULT_STATE_FILE, namespaced_name
 
 
 class StateStore:
 
-    def __init__(self, filename="state.json"):
+    def __init__(self, filename=DEFAULT_STATE_FILE, instance=None):
+        if instance and filename == DEFAULT_STATE_FILE:
+            filename = namespaced_name(filename, instance)
         self.path = Path(filename)
 
     def load(self):

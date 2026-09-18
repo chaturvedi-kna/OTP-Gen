@@ -27,6 +27,18 @@ NOTIF_ID_ACTION = "meesho-action"
 NOTIF_ID_OTP = "meesho-otp"
 
 
+def normalize_instance(value):
+    """Delegate to runtime.normalize_instance (import kept local, see signal_dir_for)."""
+    from runtime import normalize_instance as _normalize
+    return _normalize(value)
+
+
+def signal_dir_for(instance):
+    """.signals for the default instance, .signals-<instance> otherwise."""
+    from runtime import signal_dirname
+    return BASE_DIR / signal_dirname(instance)
+
+
 def _log(message):
     try:
         print(message, flush=True)
@@ -510,10 +522,16 @@ class TelegramBackend:
 
 class Notifier:
 
-    def __init__(self, config=None):
+    def __init__(self, config=None, instance=None):
         config = config or {}
         termux_conf = config.get("termux", {}) if isinstance(config, dict) else {}
         telegram_conf = config.get("telegram", {}) if isinstance(config, dict) else {}
+
+        # Parallel runs (one Termux tab per provider) must not read each
+        # other's go/skip file triggers, and must not replace each other's
+        # Android notifications: both are namespaced per instance.
+        self.instance = normalize_instance(instance)
+        self.signal_dir = signal_dir_for(self.instance)
 
         self.termux = TermuxBackend(
             enabled=termux_conf.get("enabled", True)
@@ -527,7 +545,21 @@ class Notifier:
         self.warned_termux = False
         self.warned_telegram = False
 
-        SIGNAL_DIR.mkdir(exist_ok=True)
+        try:
+            self.signal_dir.mkdir(exist_ok=True)
+        except Exception:
+            pass
+
+    def notif_id(self, base):
+        """Per-instance notification id, so parallel tabs do not overwrite.
+
+        Idempotent: send() namespaces the id it is given, so ids that were
+        already namespaced by a caller are returned unchanged.
+        """
+        if not self.instance:
+            return base
+        suffix = f"-{self.instance}"
+        return base if str(base).endswith(suffix) else f"{base}{suffix}"
 
     def set_command_callbacks(self, status_cb=None, balance_cb=None, run_cb=None,
                               stop_cb=None, referral_cb=None, checker_cb=None):
@@ -546,6 +578,9 @@ class Notifier:
              termux_buttons=None, telegram_buttons=None, ongoing=False, silent=False):
         _log(f"\n[NOTIFICATION: {title}]\n{message}\n")
 
+        # Keep every id per-instance: two tabs must not replace each other's
+        # Android notification (and notif_id() is idempotent).
+        notif_id = self.notif_id(notif_id)
         delivered = []
 
         if self.termux.send(
@@ -582,13 +617,14 @@ class Notifier:
         elif len(clean_10) >= 10:
             clean_10 = clean_10[-10:]
 
+        otp_notif_id = self.notif_id(NOTIF_ID_OTP)
         return self.alert(
             f"{p_tag}OTP: {code}",
             f"Number: `{clean_10}`\nCode: `{code}`\nSMS: {sms}",
-            notif_id=NOTIF_ID_OTP,
+            notif_id=otp_notif_id,
             termux_buttons=[
                 ("Copy OTP", self.termux.clipboard_command(code)),
-                ("Dismiss", f"termux-notification-remove {NOTIF_ID_OTP}"),
+                ("Dismiss", f"termux-notification-remove {otp_notif_id}"),
             ],
             telegram_buttons=[
                 [({"text": f"📋 Copy OTP: {code}", "copy_text": {"text": str(code)}})],
@@ -597,7 +633,7 @@ class Notifier:
         )
 
     def _signal_path(self, name):
-        return SIGNAL_DIR / f"{name}.signal"
+        return self.signal_dir / f"{name}.signal"
 
     def _clear_signals(self, names):
         for name in names:
@@ -738,7 +774,7 @@ class Notifier:
 
             time.sleep(poll_interval)
 
-        self.termux.remove(NOTIF_ID_ACTION)
+        self.termux.remove(self.notif_id(NOTIF_ID_ACTION))
         self._clear_signals(names)
 
         _log(f"Trigger gate result: {result.upper()}")

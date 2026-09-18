@@ -139,3 +139,100 @@ The system supports running **both providers in parallel on independent worker t
   }
 }
 ```
+
+---
+
+## Deferred cancellations (provider refuses the cancel)
+
+TemporaSMS and VSImpro answer a cancel that arrives while the activation is
+still young with `{"type": "ERROR"}`. That number is NO LONGER critical-stopped
+and forgotten; it is handed to a background watcher (see `cancel_watch.py`):
+
+* the worker keeps hunting immediately (no waiting for the activation to
+  expire),
+* the amount still held is booked so later refund tallies stay correct,
+* an OTP that lands while waiting is reported with its code (the SMS was
+  delivered, so the charge legitimately stands - no cancel is retried),
+* at expiry (assumed 15 minutes from the refuse, per your instruction) the
+  cancel is retried and the refund tallied - only THEN is an imbalance a real
+  `REFUND DID NOT TALLY` critical stop.
+
+`/status` shows a section for deferred cancellations while any are open.
+
+**Complaint evidence (`cancel_refused_otp.jsonl`).** When a cancel was refused
+with `ERROR` and an OTP STILL arrives afterwards - right away or while the
+watcher is waiting - the event is both notified AND persisted, one full
+record per activation, so a complaint can be raised with the provider later:
+
+```json
+{"recorded_at": "...", "provider": "tempora", "activation_id": "123456",
+ "number": "9876543210", "reason": "otp_timeout", "otp_code": "482913",
+ "otp_sms": "482913 is your code", "otp_received_at": "...",
+ "expected_balance": 100.0, "source": "deferred_cancel_watch"}
+```
+
+The file is append-only JSONL (one record per line), kept forever, and - like
+every other runtime file - namespaced per instance
+(`cancel_refused_otp.tempora.jsonl`, `cancel_refused_otp.vsimpro.jsonl`).
+
+---
+
+## Parallel runs (two Termux tabs: one for TemporaSMS, one for VSImpro)
+
+By default, running `python main.py` in two tabs in the same directory would
+have BOTH tabs write to the same `stats.json`, `state.json`, `pending_cancels.json`
+and `.signals/`, so the runs would merge or lose each other's updates.
+
+Each copy now gets its own **instance** name. Because you run exactly one
+provider per tab, it is derived automatically:
+
+    python main.py --provider tempora     # stats.tempora.json, .signals-tempora, ...
+    python main.py --provider vsimpro    # stats.vsimpro.json, .signals-vsimpro, ...
+
+To override that (or give any tab a standalone name):
+
+    python main.py --instance tab1 --provider all
+
+Optionally, a per-instance block in `config.json` under `"instances"` is merged
+over the top-level config for that instance only (useful if the two tabs
+should use different userbot sessions or a different command bot):
+
+    "instances": {
+      "tempora": { "meesho_bot": { "session_file": "userbot.tempora.session.txt" } },
+      "vsimpro": { "meesho_bot": { "session_file": "userbot.vsimpro.session.txt" } }
+    }
+
+**Two different Telegram accounts (one per tab).** It is ONE `config.json` -
+there is no conflict: only the tab's own `instances.<name>` block is merged
+over the top-level config, so tempora keeps using its session and vsimpro
+its own. Put each account's credentials in its block:
+
+    "instances": {
+      "tempora": {
+        "meesho_bot": {
+          "api_id": 1111111,
+          "api_hash": "aaaa...",
+          "session_file": "userbot.tempora.session.txt"
+        }
+      },
+      "vsimpro": {
+        "meesho_bot": {
+          "api_id": 2222222,
+          "api_hash": "bbbb...",
+          "session_file": "userbot.vsimpro.session.txt"
+        }
+      }
+    }
+
+Then log in each account ONCE (each writes its own session file):
+
+    python login_userbot.py --instance tempora
+    python login_userbot.py --instance vsimpro
+
+(`--instance` applies that instance's overrides first, so the session lands in
+`userbot.<instance>.session.txt`; `--session-file <path>` overrides the output
+path entirely. Skip the flag and the top-level `meesho_bot` defaults are used.)
+
+If both tabs should drive the SAME Telegram account, do nothing: the top-level
+`meesho_bot.session_file` is shared, and even that is safe now - the dedicated
+checker bot runs as its own conversation and never steals a login in flight.

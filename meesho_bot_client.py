@@ -710,6 +710,84 @@ class Screen:
             return True
         return None
 
+    # Matches a 10-digit number or an "+91<10 digits>" one (the dedicated
+    # checker bot prints the latter in its result lines).
+    _CHECK_NUMBER_RE = re.compile(r"(?:\+?91|91)?\D?(\d{10})(?!\d)")
+
+    @classmethod
+    def _extract_check_numbers(cls, text):
+        results = []
+        for match in cls._CHECK_NUMBER_RE.finditer(text or ""):
+            digits = match.group(1)
+            if digits not in results:
+                results.append(digits)
+        return results
+
+    def _check_line_verdict(self, line, registered_hints, not_registered_hints):
+        """
+        The verdict carried by ONE line of a checker result screen.
+
+        Lines like 'NEW +91889... — NEW USER' / '+91889... — REGISTERED' /
+        'NOT REGISTERED (NEW USER)' each say their own verdict; verdict words
+        for OTHER numbers quoted on the same line are not trusted.
+        """
+        text = normalize_label(line)
+        raw = line or ""
+        reg = tuple(DEFAULT_CHECK_REGISTERED_HINTS) + tuple(registered_hints or ())
+        unreg = tuple(DEFAULT_CHECK_NOT_REGISTERED_HINTS) + tuple(not_registered_hints or ())
+        neg = _hint_match(text, unreg)
+        pos = _hint_match(text, reg)
+        if neg and not pos:
+            return False
+        if pos and not neg:
+            return True
+        if pos and neg:
+            return False  # an explicit negative always wins
+        # Emoji badges next to the number: ✅ = registered, 🆕/❌ = fresh.
+        if any(emoji in raw for emoji in ("✅", "✔", "☑")):
+            return True
+        if any(emoji in raw for emoji in ("🆕", "🚫", "⛔", "❌", "✖", "❎")):
+            return False
+        return None
+
+    def parse_check_verdicts(self, registered_hints=(), not_registered_hints=()):
+        """
+        Extract {digits: verdict} from a checker result screen (or a small set
+        of contiguous result messages).
+
+        The dedicated checker bot reports one number per line in a MIXED
+        order (a multi-number check answers with lines like
+        '+91889... — NEW USER' / '+91889... — REGISTERED'), so the result is
+        keyed by the 10-digit number, never by position.
+        """
+        raw = self.text or ""
+        lines = [line for line in (line.strip() for line in raw.splitlines()) if line]
+        results = {}
+        all_numbers = []
+        for line in lines:
+            numbers = self._extract_check_numbers(line)
+            if not numbers:
+                continue
+            for digits in numbers:
+                if digits not in all_numbers:
+                    all_numbers.append(digits)
+            verdict = self._check_line_verdict(line, registered_hints, not_registered_hints)
+            if verdict is not None:
+                for digits in numbers:
+                    results[digits] = verdict
+
+        if not all_numbers:
+            return results
+
+        # Single-number screens ("NOT REGISTERED (NEW USER) / <number>"): the
+        # verdict is NOT on the number's own line, so read the whole screen.
+        unique = [n for n in all_numbers if n not in results]
+        if len(all_numbers) == 1 and unique:
+            verdict = self.check_verdict(registered_hints, not_registered_hints)
+            if verdict is not None:
+                results[all_numbers[0]] = verdict
+        return results
+
     def classify_check(self, registered_hints=(), not_registered_hints=(),
                        prompt_hints=()):
         """
@@ -821,7 +899,7 @@ class Screen:
 
 class MeeshoBotClient:
 
-    def __init__(self, config=None, log_fn=print):
+    def __init__(self, config=None, log_fn=print, bot_username=None):
         config = config or {}
         conf = config.get("meesho_bot", {}) or {}
         self.conf = conf
@@ -831,10 +909,28 @@ class MeeshoBotClient:
         self.api_id = conf.get("api_id")
         self.api_hash = (conf.get("api_hash") or "").strip()
         self.session_file = conf.get("session_file", "userbot.session.txt")
+        # The login bot's username. Overrides (a dedicated checker bot driven
+        # through the same Telethon account) are applied after __init__.
         self.bot_username = (conf.get("bot_username") or "").strip()
 
         self.target_upi_price = float(conf.get("target_upi_price", 47))
         self.max_offer_rerolls = int(conf.get("max_offer_rerolls", 30))
+        # Reroll budget for the OFFER PRE-WARM (the bot is parked on an agreed
+        # offer while the workers are still hunting). It has no paid number
+        # waiting, so it may use the normal budget; lower it only if the bot
+        # throttles long reroll sessions. 0 = same as max_offer_rerolls.
+        try:
+            warm_budget = int(conf.get("warmup_max_offer_rerolls", 0) or 0)
+        except (TypeError, ValueError):
+            warm_budget = 0
+        self.warmup_max_offer_rerolls = warm_budget if warm_budget > 0 else self.max_offer_rerolls
+        # How often a parked offer prompt is re-verified (seconds). The
+        # coordinator re-arms the bot when the prompt has disappeared.
+        try:
+            self.offer_warm_refresh_seconds = float(
+                conf.get("offer_warm_refresh_seconds", 90) or 0) or 90.0
+        except (TypeError, ValueError):
+            self.offer_warm_refresh_seconds = 90.0
         self.max_change_number = int(conf.get("max_change_number", 5))
         self.step_timeout = float(conf.get("step_timeout_seconds", 60))
         self.poll_interval = float(conf.get("poll_interval_seconds", 1.2))
@@ -1524,6 +1620,281 @@ class MeeshoBotClient:
             tuple(self.number_prompt_hints) + NUMBER_PROMPT_HINTS,
         ))
 
+    async def _a_reach_offer(self, screen=None, allow_reuse=True,
+                             price_optional=False, reroll_budget=None):
+        """
+        Walk the bot to a usable login number prompt with the offer agreed:
+
+            reuse a prompt it already sits on
+            -> Add Account -> Login with Number -> (referral) -> Normal
+            -> reroll the offer until UPI <= target_upi_price
+
+        No number is sent, so this can run BEFORE a number exists (offer
+        pre-warm): the coordinator parks the bot here while the provider
+        workers are still hunting, so the number that is eventually found is
+        typed into a screen that is already waiting for it instead of paying
+        for Add Account -> ... -> offer rerolls while its OTP window runs.
+
+        Returns (screen, info):
+            info["rerolls"]        - offer rerolls used
+            info["upi"]            - the agreed UPI price (None when unreadable)
+            info["reused_prompt"]  - the bot was already on a usable prompt
+            info["early_stage"]    - "otp_sent" / "blocked" when the bot is
+                                     already past the prompt, so the caller
+                                     must not type a number anymore
+        """
+        rerolls = 0
+        reused_prompt = False
+        try:
+            budget = int(reroll_budget if reroll_budget is not None
+                         else self.max_offer_rerolls)
+        except (TypeError, ValueError):
+            budget = self.max_offer_rerolls
+        budget = max(0, budget)
+        info = {"rerolls": 0, "upi": None, "reused_prompt": False,
+                "early_stage": None, "message": ""}
+
+        # Referral budget is per login: one link paste, plus a couple of
+        # interruptions, then the bot's own skip option is used. It is reset
+        # here too because a pre-warm walk answers the referral step for the
+        # login that will use this offer.
+        self._referral_events = 0
+        self._referral_pastes_in_flow = 0
+        self._last_referral_problem = None
+        self.last_referral_action = None
+
+        if screen is None:
+            screen = await self._latest_screen()
+
+        if allow_reuse:
+            state = screen.classify()
+            if state != S_MENU and self._reusable_prompt(screen):
+                # The bot is ALREADY sitting on a usable number prompt: send
+                # the number from here later - no main-menu restart, no Add
+                # Account / Login with Number / Normal walk and no reroll (the
+                # loop below still rerolls in place when the price is high).
+                reused_prompt = True
+                price = screen.upi_price
+                self._log("[MEESHO-BOT] Bot is already at the number prompt "
+                          f"(UPI Rs.{price if price is not None else 'n/a'}); reusing "
+                          "it - no main-menu restart, no offer reroll.")
+                self._note("reusing the number prompt the bot is already on")
+                screen = await self._settle(
+                    screen, (S_OFFER, S_OTP_WAIT, S_BLOCKED, S_LINKED),
+                    accept_prompt=True, timeout=self.change_number_timeout,
+                )
+                state = screen.classify()
+                if state in (S_OTP_WAIT, S_LINKED, S_BLOCKED):
+                    self._log(f"[MEESHO-BOT] Bot moved to '{state}' while the "
+                              f"number prompt was reused; not typing the number.")
+                    info.update({
+                        "upi": screen.upi_price,
+                        "reused_prompt": True,
+                        "message": screen.text,
+                        "early_stage": "blocked" if state == S_BLOCKED else "otp_sent",
+                    })
+                    return screen, info
+            elif state != S_MENU:
+                screen = await self._cancel_to_menu()
+        elif screen.classify() != S_MENU:
+            screen = await self._cancel_to_menu()
+
+        # Add Account (skipped when the number prompt above is reused).
+        if screen.classify() != S_LINK_CHOICE and not self._at_number_prompt(screen):
+            screen = await self._click(screen, "add account")
+        if not self._at_number_prompt(screen):
+            screen = await self._settle(screen, (S_LINK_CHOICE,))
+            if screen.classify() != S_LINK_CHOICE:
+                raise MeeshoBotUnknownScreen(
+                    "Expected 'How would you like to link'",
+                    screen.text, screen.button_labels,
+                )
+
+            # Login with Number -> referral screen -> login mode.
+            screen = await self._click(screen, "login with numb")
+            screen = await self._settle(screen, (S_LOGIN_MODE,))
+            if screen.classify() != S_LOGIN_MODE:
+                raise MeeshoBotUnknownScreen(
+                    "Expected 'Choose login mode'",
+                    screen.text, screen.button_labels,
+                )
+
+            # Normal mode
+            self._log("[MEESHO-BOT] Tapping the 'Normal' login mode.")
+            screen = await self._click(screen, "normal")
+
+        # Offer screen + reroll until UPI price target is met. The reroll
+        # button is normally "Try Another Offer"; some bot revisions show a
+        # three-button "Try Again" variant instead, which is tapped the same
+        # way. Variant screens that appear while waiting for an offer are
+        # also tapped inside _settle_offer (bounded by the reroll budget).
+        screen = await self._settle_offer(screen, budget)
+        # A prompt with no readable price may only be accepted when the offer
+        # was already agreed (a reused prompt) and cannot be rerolled - a
+        # fresh flow keeps insisting on a price it can compare with the target.
+        price_optional = bool(price_optional or reused_prompt)
+        while True:
+            self._progress()
+            self._note(f"rolling offers for a UPI price <= Rs.{self.target_upi_price} "
+                       f"({rerolls}/{budget} rerolls used)")
+            state = screen.classify()
+            if state in (S_BLOCKED, S_LINKED, S_OTP_WAIT, S_WRONG_OTP, S_EXPIRED):
+                break
+            if state == S_WORKING:
+                # The preparing screen outlived every wait round: the next
+                # offer never appeared (a throttled bot after many rerolls).
+                first_line = (screen.text or "").strip().splitlines()
+                raise MeeshoBotUnknownScreen(
+                    f"The bot stayed on its preparing screen "
+                    f"({first_line[0][:60] if first_line else 'working'}) through "
+                    f"{self.working_screen_waits + 1} wait round(s) after reroll "
+                    f"#{rerolls} - the next offer never appeared",
+                    screen.text, screen.button_labels,
+                )
+            upi = screen.upi_price
+            info["upi"] = upi
+            if self._at_number_prompt(screen):
+                if upi is not None and upi <= self.target_upi_price:
+                    break
+                if upi is None and price_optional and screen.reroll_button() is None:
+                    self._log("[MEESHO-BOT] Number prompt without a readable UPI "
+                              "price and no reroll button; the offer already "
+                              "stood, so it is accepted as it is.")
+                    break
+            if rerolls >= budget:
+                raise MeeshoBotUnknownScreen(
+                    f"UPI price never reached Rs.{self.target_upi_price} after {rerolls} rerolls",
+                    screen.text, screen.button_labels,
+                )
+            reroll = screen.reroll_button()
+            if reroll is None:
+                raise MeeshoBotUnknownScreen(
+                    "Offer screen has no reroll button (expected 'Try Another "
+                    "Offer' or 'Try Again')",
+                    screen.text, screen.button_labels,
+                )
+            self._log(f"[MEESHO-BOT] Reroll #{rerolls + 1} "
+                      f"(UPI Rs.{upi if upi is not None else 'n/a'} vs target "
+                      f"Rs.{self.target_upi_price}): tapping '{reroll[2]}'.")
+            screen = await self._click(screen, reroll[2])
+            screen = await self._settle_offer(screen, budget)
+            rerolls += 1
+
+        info["rerolls"] = rerolls
+        info["upi"] = screen.upi_price
+        info["reused_prompt"] = reused_prompt
+        return screen, info
+
+    async def _a_resolve_offer_to_target(self, screen, max_rerolls=None):
+        """
+        Verify the number prompt's UPI price is <= target_upi_price BEFORE a
+        paid number is typed into it (a parked pre-warmed offer may have
+        drifted, or the price line was unreadable, so the number would end up
+        at a higher UPI price).
+
+        - price readable and <= target: send is safe ("ok").
+        - price readable and > target: reroll IN PLACE until it fits; if the
+          budget is exhausted, raise UnknownScreen WITHOUT typing the number.
+        - price unreadable:
+            * with a reroll button: reroll until a price shows (same budget);
+            * without any reroll button: cannot verify - accepted as-is (a
+              genuine Change Number prompt's price was already agreed earlier).
+        Returns (screen, info): info["upi"] / info["rerolls"] / info["accepted"].
+        """
+        budget = max_rerolls if max_rerolls is not None else self.max_offer_rerolls
+        budget = max(0, int(budget))
+        rerolls = 0
+        info = {"upi": screen.upi_price, "rerolls": 0, "accepted": False}
+        while True:
+            self._progress()
+            state = screen.classify()
+            if state in (S_BLOCKED, S_LINKED, S_OTP_WAIT, S_WRONG_OTP, S_EXPIRED):
+                info["accepted"] = True
+                info["upi"] = screen.upi_price
+                return screen, info
+            upi = screen.upi_price
+            info["upi"] = upi
+            if not self._at_number_prompt(screen):
+                raise MeeshoBotUnknownScreen(
+                    "Expected the number prompt before verifying its UPI price",
+                    screen.text, screen.button_labels,
+                )
+            if upi is not None and upi <= self.target_upi_price:
+                info["accepted"] = True
+                self._log("[MEESHO-BOT] Offer price verified: "
+                          f"UPI ₹{upi} <= ₹{self.target_upi_price}.")
+                return screen, info
+            if upi is None and screen.reroll_button() is None:
+                # No price to check and nothing to reroll: the offer stood
+                # earlier in THIS login, so it is accepted as before.
+                self._log("[MEESHO-BOT] Number prompt without a readable price "
+                          "and no reroll button; price was agreed earlier in this "
+                          "login, so it is accepted as-is.")
+                info["accepted"] = True
+                return screen, info
+            if rerolls >= budget:
+                raise MeeshoBotUnknownScreen(
+                    f"Pre-warmed offer never settled at UPI ≤ ₹{self.target_upi_price} "
+                    f"(last seen: ₹{upi if upi is not None else 'unreadable'}) after "
+                    f"{rerolls} reroll(s) - the number was NOT typed",
+                    screen.text, screen.button_labels,
+                )
+            reroll = screen.reroll_button()
+            if reroll is None:
+                raise MeeshoBotUnknownScreen(
+                    f"Offer price ₹{upi} is above ₹{self.target_upi_price} and "
+                    "has no reroll button - the number was NOT typed",
+                    screen.text, screen.button_labels,
+                )
+            rerolls += 1
+            info["rerolls"] = rerolls
+            self._log(f"[MEESHO-BOT] Price check: UPI ₹{upi if upi is not None else 'unreadable'} "
+                      f"> ₹{self.target_upi_price}; reroll #{rerolls} '{reroll[2]}'.")
+            screen = await self._click(screen, reroll[2])
+            screen = await self._settle_offer(screen, budget)
+
+    async def _a_prepare_offer(self, reroll_budget=None):
+        """
+        Park the bot on an agreed offer WITHOUT sending a number (pre-warm).
+
+        Returns {"stage": "offer", "upi": <price>, "rerolls": n} - the caller
+        then only has to type the number into the prompt the bot is waiting on.
+        """
+        if reroll_budget is None:
+            reroll_budget = self.warmup_max_offer_rerolls
+        screen = await self._latest_screen()
+
+        # Already parked on an offer that fits: nothing to do.
+        if self._at_number_prompt(screen, require_marker=True):
+            price = screen.upi_price
+            if price is not None and price <= self.target_upi_price:
+                self._log("[MEESHO-BOT] Bot is already parked on an agreed offer "
+                          f"(UPI Rs.{price}); no pre-warm needed.")
+                return {"stage": "offer", "upi": price, "rerolls": 0,
+                        "reused_prompt": True}
+            self._log("[MEESHO-BOT] Bot is on an offer priced "
+                      f"Rs.{price if price is not None else 'n/a'} (target "
+                      f"Rs.{self.target_upi_price}); re-rolling it.")
+
+        screen, info = await self._a_reach_offer(
+            screen, allow_reuse=True, price_optional=False,
+            reroll_budget=reroll_budget,
+        )
+        if info.get("early_stage"):
+            return {
+                "stage": info["early_stage"],
+                "upi": info.get("upi"),
+                "rerolls": info.get("rerolls", 0),
+                "reused_prompt": info.get("reused_prompt", False),
+                "message": info.get("message", ""),
+            }
+        return {
+            "stage": "offer",
+            "upi": info.get("upi"),
+            "rerolls": info.get("rerolls", 0),
+            "reused_prompt": info.get("reused_prompt", False),
+        }
+
     async def _a_prepare_login(self, number, continue_from_prompt=False):
         """
         Full navigation up to the number being submitted and the bot showing
@@ -1533,7 +1904,6 @@ class MeeshoBotClient:
         """
         rerolls = 0
         result = {"rerolls": 0, "upi": None}
-        reused_prompt = False
         self._note("starting the login flow" if not continue_from_prompt
                    else "resuming at the number prompt")
 
@@ -1578,132 +1948,37 @@ class MeeshoBotClient:
                     "Expected the number prompt before sending the replacement number",
                     screen.text, screen.button_labels,
                 )
-        else:
-            state = screen.classify()
-            if state != S_MENU and self._reusable_prompt(screen):
-                # The bot is ALREADY sitting on a usable number prompt - e.g. a
-                # Change Number that reported "unknown" but worked, or a flow the
-                # coordinator deliberately left in place because the checker API
-                # (not the bot) answers the number checks. Send the number from
-                # here: no main-menu restart, no Add Account / Login with Number
-                # / Normal walk and no offer reroll (the loop below still
-                # rerolls in place when the price is above the target).
-                reused_prompt = True
-                price = screen.upi_price
-                self._log("[MEESHO-BOT] Bot is already at the number prompt "
-                          f"(UPI ₹{price if price is not None else 'n/a'}); reusing "
-                          "it - no main-menu restart, no offer reroll.")
-                self._note("reusing the number prompt the bot is already on")
-                screen = await self._settle(
-                    screen, (S_OFFER, S_OTP_WAIT, S_BLOCKED, S_LINKED),
-                    accept_prompt=True, timeout=self.change_number_timeout,
-                )
+            # A parked (pre-warmed) prompt may no longer be at the agreed
+            # price: NEVER type the number into an offer above the target -
+            # reroll it in place until it fits (or fail without typing).
+            screen, guard = await self._a_resolve_offer_to_target(screen)
+            if screen.classify() in (S_OTP_WAIT, S_LINKED, S_BLOCKED):
                 state = screen.classify()
-                if state in (S_OTP_WAIT, S_LINKED, S_BLOCKED):
-                    self._log(f"[MEESHO-BOT] Bot moved to '{state}' while the "
-                              f"number prompt was reused; not typing the number.")
-                    result.update({
-                        "upi": screen.upi_price,
-                        "rerolls": 0,
-                        "reused_prompt": True,
-                        "referral_action": self.last_referral_action,
-                        "message": screen.text,
-                        "stage": "blocked" if state == S_BLOCKED else "otp_sent",
-                    })
-                    return result
-            elif state != S_MENU:
-                screen = await self._cancel_to_menu()
-
-            # Add Account (skipped when the number prompt above is reused).
-            if screen.classify() != S_LINK_CHOICE and not self._at_number_prompt(screen):
-                screen = await self._click(screen, "add account")
-            if not self._at_number_prompt(screen):
-                screen = await self._settle(screen, (S_LINK_CHOICE,))
-                if screen.classify() != S_LINK_CHOICE:
-                    raise MeeshoBotUnknownScreen(
-                        "Expected 'How would you like to link'",
-                        screen.text, screen.button_labels,
-                    )
-
-                # Login with Number -> referral screen (🔗 Set Refer Link /
-                # 🎁 Referral link?) -> login mode. The referral step sits between
-                # these two on current bot revisions; _settle answers it whenever
-                # it appears, so both orderings work.
-                screen = await self._click(screen, "login with numb")
-                screen = await self._settle(screen, (S_LOGIN_MODE,))
-                if screen.classify() != S_LOGIN_MODE:
-                    raise MeeshoBotUnknownScreen(
-                        "Expected 'Choose login mode'",
-                        screen.text, screen.button_labels,
-                    )
-
-                # Normal mode
-                self._log("[MEESHO-BOT] Tapping the 'Normal' login mode.")
-                screen = await self._click(screen, "normal")
-
-        # Offer screen + reroll until UPI price target is met. The reroll
-        # button is normally "Try Another Offer"; some bot revisions show a
-        # three-button "Try Again" variant instead, which is tapped the same
-        # way. Variant screens that appear while waiting for an offer are
-        # also tapped inside _settle_offer (bounded by the reroll budget).
-        screen = await self._settle_offer(screen, self.max_offer_rerolls)
-        # A prompt with no readable price may only be accepted when the offer
-        # was already agreed (Change Number / a reused prompt) and cannot be
-        # rerolled - a fresh flow keeps insisting on a price it can compare
-        # with target_upi_price.
-        price_optional = bool(continue_from_prompt or reused_prompt)
-        while True:
-            self._progress()
-            self._note(f"rolling offers for a UPI price ≤ ₹{self.target_upi_price} "
-                       f"({rerolls}/{self.max_offer_rerolls} rerolls used)")
-            state = screen.classify()
-            if state in (S_BLOCKED, S_LINKED, S_OTP_WAIT, S_WRONG_OTP, S_EXPIRED):
-                break
-            if state == S_WORKING:
-                # The preparing screen outlived every wait round: the next
-                # offer never appeared (a throttled bot after many rerolls).
-                # Say exactly that instead of "no reroll button".
-                first_line = (screen.text or "").strip().splitlines()
-                raise MeeshoBotUnknownScreen(
-                    f"The bot stayed on its preparing screen "
-                    f"({first_line[0][:60] if first_line else 'working'}) through "
-                    f"{self.working_screen_waits + 1} wait round(s) after reroll "
-                    f"#{rerolls} - the next offer never appeared",
-                    screen.text, screen.button_labels,
-                )
-            upi = screen.upi_price
-            result["upi"] = upi
-            if self._at_number_prompt(screen):
-                if upi is not None and upi <= self.target_upi_price:
-                    break
-                if upi is None and price_optional and screen.reroll_button() is None:
-                    self._log("[MEESHO-BOT] Number prompt without a readable UPI "
-                              "price and no reroll button; the offer already "
-                              "stood, so it is accepted as it is.")
-                    break
-            if rerolls >= self.max_offer_rerolls:
-                raise MeeshoBotUnknownScreen(
-                    f"UPI price never reached ₹{self.target_upi_price} after {rerolls} rerolls",
-                    screen.text, screen.button_labels,
-                )
-            reroll = screen.reroll_button()
-            if reroll is None:
-                raise MeeshoBotUnknownScreen(
-                    "Offer screen has no reroll button (expected 'Try Another "
-                    "Offer' or 'Try Again')",
-                    screen.text, screen.button_labels,
-                )
-            self._log(f"[MEESHO-BOT] Reroll #{rerolls + 1} "
-                      f"(UPI ₹{upi if upi is not None else 'n/a'} vs target "
-                      f"₹{self.target_upi_price}): tapping '{reroll[2]}'.")
-            screen = await self._click(screen, reroll[2])
-            screen = await self._settle_offer(screen, self.max_offer_rerolls)
-            rerolls += 1
-
-        result["rerolls"] = rerolls
-        result["upi"] = screen.upi_price
-        result["reused_prompt"] = reused_prompt
-        result["referral_action"] = self.last_referral_action
+                result.update({
+                    "upi": guard.get("upi", screen.upi_price),
+                    "message": screen.text,
+                    "stage": "blocked" if state == S_BLOCKED else "otp_sent",
+                })
+                return result
+            if guard.get("rerolls"):
+                result["rerolls"] = guard["rerolls"]
+            result["upi"] = guard.get("upi", screen.upi_price)
+        else:
+            # Walk to the offer (reusing a prompt the bot already sits on).
+            screen, info = await self._a_reach_offer(screen)
+            rerolls = info["rerolls"]
+            result["rerolls"] = info["rerolls"]
+            result["upi"] = info["upi"]
+            result["reused_prompt"] = info["reused_prompt"]
+            result["referral_action"] = self.last_referral_action
+            if info.get("early_stage"):
+                # The bot is already past the prompt (a previous number's OTP
+                # screen, or a blocked/linked account): never type a number.
+                result.update({
+                    "message": info.get("message", ""),
+                    "stage": info["early_stage"],
+                })
+                return result
 
         state = screen.classify()
         if state == S_BLOCKED:
@@ -2010,6 +2285,21 @@ class MeeshoBotClient:
 
     # -- bot number checker --------------------------------------------------
 
+    def _resolve_bot_entity(self, username):
+        """Best-effort entity for a conversation on the same session."""
+        base = getattr(self, "_bot_entity", None)
+        current = getattr(self, "bot_username", "")
+        if base is not None and username and username.lstrip("@") == current.lstrip("@"):
+            return base
+        try:
+            import asyncio
+            entity = self._client.get_entity(username)
+            if asyncio.iscoroutine(entity):
+                entity = self._loop.run_until_complete(entity)
+            return entity
+        except Exception:
+            return base
+
     def _checker_settings(self, overrides=None):
         """Resolve checker.bot config (defaults + overrides) into a plain dict."""
         conf = dict(self.checker_conf)
@@ -2040,6 +2330,7 @@ class MeeshoBotClient:
             "step_timeout": step_timeout,
             "attempts": attempts,
             "reset_after_check": bool(conf.get("reset_after_check", True)),
+            "poll_interval": float(getattr(self, "poll_interval", 2.0) or 2.0),
         }
 
     @staticmethod
@@ -2050,6 +2341,19 @@ class MeeshoBotClient:
         if len(digits) == 11 and digits.startswith("0"):
             return digits[1:]
         return digits[-10:] if len(digits) >= 10 else digits
+
+    # Screens that belong to a login that is already in flight. Leaving one of
+    # these (to walk to the checker) destroys the OTP screen of a paid number.
+    LOGIN_IN_FLIGHT_STATES = (
+        S_OTP_WAIT, S_SENDING_OTP, S_VERIFYING, S_WRONG_OTP, S_EXPIRED, S_LINKED,
+    )
+
+    def _login_in_progress(self, screen):
+        """True when the bot is mid-login and must not be navigated away."""
+        state = screen.classify()
+        if state in self.LOGIN_IN_FLIGHT_STATES:
+            return True
+        return state == S_BLOCKED
 
     def _check_state(self, screen, conf):
         return screen.classify_check(
@@ -2088,7 +2392,37 @@ class MeeshoBotClient:
             self._progress()
             screen = await self._latest_screen()
 
-    async def _a_check_registration(self, number, overrides=None):
+    def _conversation_proxy(self, username):
+        """
+        Return a light proxy of THIS client whose every mutation/look-up is on
+        the base client EXCEPT the conversation pointer `_bot_entity`, which is
+        pinned to `username`. A checker conversation can then run against the
+        second bot without ever touching an in-flight login conversation that
+        reads `_bot_entity` (the previous swap-and-restore was racy).
+        """
+        base = self
+        entity = base._resolve_bot_entity(username) or None
+
+        class _ConversationProxy:
+            __slots__ = ("_base", "_entity")
+
+            def __init__(self, base, entity):
+                object.__setattr__(self, "_base", base)
+                object.__setattr__(self, "_entity", entity)
+
+            def __getattr__(self, name):
+                if name == "_bot_entity":
+                    return object.__getattribute__(self, "_entity")
+                return getattr(self._base, name)
+
+            def __setattr__(self, name, value):
+                if name == "_bot_entity":
+                    return  # never steer the shared conversation from a proxy
+                setattr(self._base, name, value)
+
+        return _ConversationProxy(base, entity)
+
+    async def _a_check_registration(self, number, overrides=None, _bot_username=None):
         """
         Ask the PRIMES bot whether `number` is registered on Meesho.
 
@@ -2097,12 +2431,23 @@ class MeeshoBotClient:
         the same way. Raises MeeshoBotError subclasses when no verdict can be
         read; the caller (checker_router) turns those into CheckerUnavailable.
         """
+        if _bot_username:
+            # Dedicated checker bot: a separate conversation on the same
+            # Telethon session - resolve it instead of the PRIMES login bot.
+            previous = self._bot_entity
+            self._bot_entity = self._resolve_bot_entity(_bot_username) or previous
+            if self._bot_entity is None:
+                self._bot_entity = previous
+                raise MeeshoBotError(
+                    f"Could not resolve the dedicated checker bot @{_bot_username.lstrip('@')} on this session"
+                )
         conf = self._checker_settings(overrides)
         digits = self._ten_digit(number)
         if len(digits) != 10:
             raise MeeshoBotError(f"Not a usable 10-digit number: {number!r}")
 
-        self._note(f"checking {digits} with the bot checker")
+        self._note(f"checking {digits} with the bot checker"
+                   + (_bot_username and f" (@{_bot_username.lstrip('@')})" or ""))
         self._log(f"[MEESHO-BOT] Bot checker: checking {digits} "
                   f"(entry: {conf['entry']}).")
 
@@ -2110,6 +2455,19 @@ class MeeshoBotClient:
         button = None
         if conf["entry"] in ("auto", "button"):
             if screen.classify() != S_MENU:
+                # A number check must never walk the bot out of a login flow:
+                # that would throw away the OTP screen of a PAID number (its
+                # OTP could then not even be entered by hand) just to ask
+                # whether some other number is registered. The coordinator
+                # normally prevents this (a login claims the bot), so getting
+                # here means the flow drifted - fail the check, not the login.
+                if self._login_in_progress(screen):
+                    raise MeeshoBotError(
+                        "Refusing to run a number check: the bot is in the "
+                        f"middle of a login flow ({screen.classify()}). Cancel "
+                        "the check instead of losing the number that is "
+                        "waiting for its OTP."
+                    )
                 # Never type a number into a leftover login/OTP screen.
                 screen = await self._cancel_to_menu()
             button = screen.checker_button(
@@ -2176,6 +2534,13 @@ class MeeshoBotClient:
             for attempt in range(conf["attempts"]):
                 if verdict is not None:
                     break
+                if self._login_in_progress(screen):
+                    # Last line of defence: never type a number to check into a
+                    # screen that belongs to a login flow.
+                    raise MeeshoBotError(
+                        "Refusing to send a number to check: the bot is in the "
+                        f"middle of a login flow ({screen.classify()})."
+                    )
                 self._note(f"sending {digits} to the bot checker")
                 self._log(f"[MEESHO-BOT] Bot checker: sending number {digits}"
                           + ("" if attempt == 0 else f" (attempt {attempt + 1})") + ".")
@@ -2211,6 +2576,126 @@ class MeeshoBotClient:
                 self._log(f"[MEESHO-BOT] Bot checker: could not return to the "
                           f"main menu after the check ({exc}).")
         return result
+
+    async def _a_check_registration_many(self, numbers, overrides=None):
+        """
+        Check several numbers in one visit to the checker bot by sending them
+        comma-separated (the dedicated bot answers with one verdict line per
+        number). Returns {"success": True, "verdicts": {digits: bool}, ...} -
+        verdicts are keyed BY NUMBER because the bot's reply is not ordered.
+        Raises MeeshoBotError subclasses when no/all verdicts can be read.
+        """
+        conf = self._checker_settings(overrides)
+        targets = []
+        seen = set()
+        for raw in numbers:
+            digits = self._ten_digit(raw)
+            if len(digits) == 10 and digits not in seen:
+                seen.add(digits)
+                targets.append(digits)
+        if not targets:
+            raise MeeshoBotError("check many: no usable 10-digit numbers given")
+
+        self._note(f"checking {len(targets)} numbers with the bot checker")
+        self._log(f"[MEESHO-BOT] Bot checker: batch of {len(targets)} "
+                  f"(entry: {conf['entry']}).")
+
+        screen = await self._latest_screen()
+        button = None
+        if conf["entry"] in ("auto", "button"):
+            if screen.classify() != S_MENU:
+                if self._login_in_progress(screen):
+                    raise MeeshoBotError(
+                        "Refusing to run a batch check: the bot is in the "
+                        f"middle of a login flow ({screen.classify()})."
+                    )
+                screen = await self._cancel_to_menu()
+            button = screen.checker_button(
+                conf["button_hints"], conf["button_fallbacks"], conf["button_exclude"]
+            )
+
+        if button is not None:
+            self._log(f"[MEESHO-BOT] Bot checker: tapping '{button[2]}'.")
+            screen = await self._click(screen, button[2])
+        elif conf["command"] and conf["entry"] in ("auto", "command"):
+            text = conf["command"].format(number=targets[0])
+            self._log(f"[MEESHO-BOT] Bot checker: sending command '{text}'.")
+            screen = await self._send_text(text, timeout=conf["step_timeout"])
+        else:
+            raise MeeshoBotUnknownScreen(
+                "No bot-checker menu button found (batch check). See "
+                "checker.bot.button_hints in SETUP_CHECKER.md.",
+                screen.text, screen.button_labels,
+            )
+
+        screen = await self._settle_check(screen, conf, want_result=False)
+        state = self._check_state(screen, conf)
+        if state != S_CHECK_PROMPT:
+            raise MeeshoBotUnknownScreen(
+                "Expected the bot to ask for the numbers to check, got an "
+                "unreadable screen (batch check). Add its wording to "
+                "checker.bot.number_prompt_hints - see SETUP_CHECKER.md.",
+                screen.text, screen.button_labels,
+            )
+        if self._login_in_progress(screen):
+            raise MeeshoBotError(
+                "Refusing to send numbers to check: the bot is in the middle "
+                f"of a login flow ({screen.classify()})."
+            )
+
+        payload = ", ".join(targets)
+        self._note(f"sending {len(targets)} numbers to the bot checker")
+        self._log(f"[MEESHO-BOT] Bot checker: sending {payload}.")
+        screen = await self._send_text(payload, timeout=conf["step_timeout"])
+        screen = await self._settle_check(screen, conf, want_result=True)
+
+        # Collect per-number verdicts. The reply order is NOT the input order,
+        # so verdicts come out of parse_check_verdicts keyed by number, and we
+        # keep polling (merging new screens) until every number has a verdict.
+        deadline = time.monotonic() + max(conf["step_timeout"], 8.0)
+        verdicts = {}
+        screen_budget = 0
+        while True:
+            found = screen.parse_check_verdicts(
+                conf["registered_hints"], conf["not_registered_hints"],
+            )
+            for digits, verdict in found.items():
+                if digits in targets and digits not in verdicts:
+                    verdicts[digits] = verdict
+            missing = [d for d in targets if d not in verdicts]
+            if not missing:
+                break
+            if time.monotonic() >= deadline or screen_budget >= 6:
+                raise MeeshoBotUnknownScreen(
+                    f"The bot's batch result is missing verdicts for "
+                    f"{', '.join(missing)} (read {len(verdicts)}/{len(targets)}). "
+                    "Add the bot's result wording to checker.bot."
+                    "registered_hints / not_registered_hints - see SETUP_CHECKER.md.",
+                    screen.text, screen.button_labels,
+                )
+            screen_budget += 1
+            await asyncio.sleep(conf["poll_interval"])
+            screen = await self._latest_screen()
+
+        self._log("[MEESHO-BOT] Bot checker (batch): "
+                  + ", ".join(f"{d}={'REG' if v else 'NEW'}"
+                              for d, v in verdicts.items())
+                  + ".")
+
+        if conf["reset_after_check"]:
+            try:
+                await self._cancel_to_menu()
+                self._note("bot checker: back at the main menu")
+            except MeeshoBotError as exc:
+                self._log(f"[MEESHO-BOT] Bot checker: could not return to the "
+                          f"main menu after the batch check ({exc}).")
+        return {
+            "success": True,
+            "verdicts": {d: bool(v) for d, v in verdicts.items()},
+            "source": "bot",
+            "message": screen.text,
+            "stage": "checked",
+        }
 
     async def _a_return_to_menu(self):
         screen = await self._latest_screen()
@@ -2275,6 +2760,19 @@ class MeeshoBotClient:
         with self._flow_lock:
             return self._run(self._a_prepare_login(number, continue_from_prompt=False))
 
+    def prepare_offer(self, reroll_budget=None):
+        """
+        Park the bot on an agreed offer (UPI <= target_upi_price) BEFORE a
+        number exists, so the number that is found next only has to be typed
+        into the prompt the bot is already waiting on.
+
+        Returns {"stage": "offer", "upi": <price>, "rerolls": n} - or
+        {"stage": "otp_sent"/"blocked", ...} when the bot is already past the
+        prompt (nothing may be typed anymore).
+        """
+        with self._flow_lock:
+            return self._run(self._a_prepare_offer(reroll_budget=reroll_budget))
+
     def continue_with_number(self, number):
         with self._flow_lock:
             return self._run(self._a_prepare_login(number, continue_from_prompt=True))
@@ -2294,6 +2792,120 @@ class MeeshoBotClient:
     def cancel_flow(self):
         with self._flow_lock:
             return self._run(self._a_cancel_flow())
+
+
+class CheckerBotClient:
+    """
+    A dedicated checker bot driven through the SAME logged-in Telegram account
+    (api_id/api_hash + userbot.session.txt) as the PRIMES login userbot - but a
+    SECOND conversation, so a number check never walks the login bot out of a
+    waiting OTP screen.
+
+    The only thing that differs from MeeshoBotClient is the conversation:
+    every call goes to the checker bot's own username, and the check-entry
+    hints come from config["checker"]["telegram_bot"] (button / command /
+    prompt / verdict wording), which need not match the PRIMES bot's copy.
+    """
+
+    def __init__(self, base_client, username, conf=None, log_fn=None):
+        self._base = base_client
+        self._log_fn = log_fn or base_client._log
+        username = (username or "").strip()
+        if not username.startswith("@"):
+            username = "@" + username
+        self.bot_username = username
+        self.conf = dict(conf or {})
+
+    # -- pass-through to the shared session --------------------------------
+
+    @property
+    def ready(self):
+        base = self._base
+        return bool(base.ready and base.enabled and base.api_id and base.api_hash
+                    and base._session_string() and base._client is not None)
+
+    @property
+    def start_error(self):
+        return self._base.start_error
+
+    @property
+    def enabled(self):
+        return self._base.enabled
+
+    def start(self):
+        return self._base.start()
+
+    def stop(self):
+        # Never stop the shared conversation: the PRIMES login may be active.
+        return True
+
+    def set_referral_link(self, *a, **k):
+        return self._base.set_referral_link(*a, **k)
+
+    def __getattr__(self, name):
+        # Anything the checker needs that we have not specialised (session
+        # access, logging, referral state, ...) is taken from the base client.
+        return getattr(self._base, name)
+
+    # -- checks against the DEDICATED bot -----------------------------------
+
+    def check_registration(self, number, overrides=None):
+        """Ask the dedicated checker bot whether `number` is registered."""
+        if not self.ready:
+            raise MeeshoBotError(
+                f"Checker bot userbot is not ready: {self._base.start_error}"
+            )
+        merged = dict(self.conf)
+        merged.update(overrides or {})
+        # Own flow lock: a checker conversation runs independently of the
+        # login conversation, so it never waits behind a login flow.
+        checker_lock = self.__dict__.get("_checker_lock")
+        if checker_lock is None:
+            import threading
+            checker_lock = threading.RLock()
+            self.__dict__["_checker_lock"] = checker_lock
+
+        client = self._base
+        username = self.bot_username
+        with checker_lock:
+            proxy = client._conversation_proxy(username)
+            return proxy._run(
+                proxy._a_check_registration(number, overrides=merged)
+            )
+
+    def check_registration_many(self, numbers, overrides=None):
+        """
+        Check several numbers in a single visit to the dedicated bot. The bot
+        accepts a comma-separated list and answers with one verdict line per
+        number, and (per the observed bot) the output order may differ from
+        the input order. Verdicts are therefore matched BY NUMBER, and the
+        result is returned as {10-digit number: True/False}.
+        """
+        numbers = [str(n).strip() for n in (numbers or []) if str(n).strip()]
+        if not numbers:
+            return {}
+        if len(numbers) == 1:
+            return {numbers[0]: self.check_registration(numbers[0], overrides=overrides)}
+        if not self.ready:
+            raise MeeshoBotError(
+                f"Checker bot userbot is not ready: {self._base.start_error}"
+            )
+        merged = dict(self.conf)
+        merged.update(overrides or {})
+        checker_lock = self.__dict__.get("_checker_lock")
+        if checker_lock is None:
+            import threading
+            checker_lock = threading.RLock()
+            self.__dict__["_checker_lock"] = checker_lock
+        client = self._base
+        username = self.bot_username
+        with checker_lock:
+            proxy = client._conversation_proxy(username)
+            return proxy._run(
+                proxy._a_check_registration_many(numbers, overrides=merged)
+            )
+
+
 
 
 # ---------------------------------------------------------------------------

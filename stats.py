@@ -3,11 +3,16 @@ Persistent run statistics for the Meesho automation.
 
 Counters survive restarts (stored atomically in stats.json) and are surfaced
 through Telegram /status and the per-event notifications.
+
+Parallel runs (one Termux tab per provider) each get their own file: pass
+`instance="tempora"` for stats.tempora.json (see runtime.py).
 """
 
 import json
 import threading
 from pathlib import Path
+
+from runtime import DEFAULT_STATS_FILE, namespaced_name
 
 
 # Canonical counters with default values.
@@ -34,12 +39,19 @@ COUNTERS = {
     "checker_api_checks": 0,   # numbers checked through the HTTP checker API
     "checker_bot_checks": 0,   # numbers checked through the PRIMES bot checker
     "checker_fallbacks": 0,    # checks that fell back from the API to the bot
+    "cancel_deferred": 0,      # cancellations the provider refused, postponed to activation expiry
+    "cancel_deferred_refunded": 0,  # deferred cancellations refunded after the retry
+    "cancel_deferred_otp": 0,  # deferred cancellations where the OTP still arrived
+    "offer_prewarmed": 0,      # PRIMES bot parked on an agreed offer before a number existed
+    "bot_claims_denied": 0,    # bot checks skipped because a login flow owned the bot
 }
 
 
 class StatsStore:
 
-    def __init__(self, filename="stats.json"):
+    def __init__(self, filename=DEFAULT_STATS_FILE, instance=None):
+        if instance and filename == DEFAULT_STATS_FILE:
+            filename = namespaced_name(filename, instance)
         self.path = Path(filename)
         self._lock = threading.Lock()
         self._counters = dict(COUNTERS)

@@ -38,6 +38,23 @@ from checker_client import (
     CheckerAuthError,
 )
 
+
+class BotBusy(Exception):
+    """
+    The PRIMES bot conversation is owned by somebody else right now.
+
+    Raised by the coordinator's bot claim when a number check wants the bot
+    while a login flow is using it (or is about to). It is turned into a
+    CheckerUnavailable by BotChecker, so the number is cancelled with a refund
+    instead of being typed into a screen that is waiting for an OTP - the
+    classic "number A was waiting for its code and number B got typed into the
+    bot" waste.
+    """
+
+
+class CheckerBotBusy(CheckerUnavailable):
+    """A checker failure that only means "the bot is busy with a login"."""
+
 MODE_API = "api"
 MODE_BOT = "bot"
 MODE_AUTO = "auto"
@@ -142,16 +159,82 @@ def resolve_fallback(conf):
     return settings
 
 
-class BotChecker:
+class _BotBatch:
     """
-    Adapter that calls MeeshoBotClient.check_registration and re-raises bot
-    failures as CheckerUnavailable, so the caller only sees checker errors.
+    One batch window: worker threads join with their number, the first one
+    (the leader) closes the window at size/wait, sends ALL numbers in a
+    single comma-separated message to the checker bot, and publishes a
+    per-number result (the bot's reply order differs from the input order,
+    so results are matched by number, never by position).
     """
 
-    def __init__(self, bot_getter, conf=None, log_fn=None):
+    def __init__(self, size):
+        self.size = size
+        self.lock = threading.Lock()
+        self.entries = {}   # number -> threading.Event
+        self.results = {}   # number -> result dict
+        self.error = None   # failure shared by the whole batch
+        self.full = False
+
+    def join(self, number):
+        with self.lock:
+            event = self.entries.get(number)
+            leader = not self.entries
+            if event is None:
+                event = threading.Event()
+                self.entries[number] = event
+                if len(self.entries) >= self.size:
+                    self.full = True
+            return event, leader
+
+    def finish(self):
+        for event in self.entries.values():
+            event.set()
+
+    def result_for(self, number):
+        key = str(number)
+        if key in self.results:
+            return self.results[key]
+        if self.error is not None:
+            if isinstance(self.error, CheckerError):
+                raise self.error
+            raise CheckerUnavailable(
+                f"Batched checker request failed: {self.error}") from self.error
+        raise CheckerUnavailable(
+            "The dedicated checker bot's batch reply had no verdict for "
+            f"{key}.")
+
+
+class BotChecker:
+    """
+    Adapter that calls a Telethon userbot's own number checker.
+
+    `bot_getter` is the PRIMES login bot; `preferred_getter` a DEDICATED
+    checker bot's client from config "checker" -> "telegram_bot". The
+    dedicated bot is used first (it never touches the PRIMES login
+    conversation, so it cannot walk the bot out of a waiting OTP); the PRIMES
+    bot is only reached when there is no dedicated checker bot configured or
+    it is unavailable - and even then only when no login flow owns it.
+    """
+
+    def __init__(self, bot_getter, conf=None, log_fn=None, gate=None, claim=None,
+                 preferred_getter=None, preferred_username=None, preferred_name="checker bot"):
         self._bot_getter = bot_getter
         self.conf = conf or {}
         self._log_fn = log_fn
+        # `gate` answers (claimed, reason) - "may the shared login bot be used?";
+        # `claim` holds it. The dedicated checker bot is its own conversation -
+        # it never takes the login claim, so it can run alongside a login.
+        self._gate = gate
+        self._claim = claim
+        self._preferred_getter = preferred_getter
+        self._preferred_username = (preferred_username or "").lstrip("@").strip()
+        self._preferred_name = (preferred_name or "checker bot").strip()
+        # Batch-check bookkeeping (telegram_bot.batch_*): one shared window
+        # that several worker threads' checks join so ONE bot visit answers
+        # them all (the dedicated bot accepts comma-separated numbers).
+        self._batch_lock = threading.Lock()
+        self._batch = None  # the currently open _BotBatch, or None
 
     def _log(self, message):
         if self._log_fn:
@@ -170,6 +253,15 @@ class BotChecker:
             return None
 
     @property
+    def preferred_client(self):
+        if self._preferred_getter is None:
+            return None
+        try:
+            return self._preferred_getter()
+        except Exception:
+            return None
+
+    @property
     def ready(self):
         client = self.client
         return bool(
@@ -179,6 +271,62 @@ class BotChecker:
             and getattr(client, "bot_username", "")
             and callable(getattr(client, "check_registration", None))
         )
+
+    @property
+    def has_preferred(self):
+        return bool(self._preferred_getter is not None or self._preferred_username)
+
+    @property
+    def preferred_ready(self):
+        client = self.preferred_client
+        return bool(
+            client is not None
+            and getattr(client, "ready", False)
+            and getattr(client, "check_registration", None)
+        )
+
+    @property
+    def preferred_unavailable_reason(self):
+        if not self.has_preferred:
+            return "no dedicated checker bot configured"
+        client = self.preferred_client
+        if client is None:
+            return "the dedicated checker bot client is not configured"
+        if not getattr(client, "ready", False):
+            return getattr(client, "start_error", "") or "the checker bot userbot is not connected"
+        if not callable(getattr(client, "check_registration", None)):
+            return "the checker bot userbot does not support number checks"
+        return ""
+
+    def describe_preferred(self):
+        """One-line summary for logs/status."""
+        if not self.has_preferred:
+            return "no dedicated checker bot"
+        if self.preferred_ready:
+            return f"{self._preferred_name} (@{self._preferred_username}) ready"
+        return (f"{self._preferred_name} (@{self._preferred_username or '?'}) "
+                f"NOT ready ({self.preferred_unavailable_reason})")
+
+    def check_preferred(self, number, service=None):
+        """Ask the dedicated checker bot; raises CheckerUnavailable on failure."""
+        if not self.preferred_ready:
+            raise CheckerUnavailable(
+                f"Dedicated checker bot unavailable: {self.preferred_unavailable_reason}"
+            )
+        try:
+            data = self.preferred_client.check_registration(number)
+        except CheckerError:
+            raise
+        except Exception as exc:
+            raise CheckerUnavailable(
+                f"Dedicated checker bot failed: {exc}") from exc
+        if not isinstance(data, dict) or "is_registered" not in data:
+            raise CheckerUnavailable(
+                f"Dedicated checker bot returned an unusable result: {data!r}")
+        data.setdefault("source", "telegram_checker")
+        data.setdefault("checker_name", self._preferred_name)
+        data.setdefault("checker_username", self._preferred_username)
+        return data
 
     @property
     def unavailable_reason(self):
@@ -193,11 +341,147 @@ class BotChecker:
             return "userbot client does not support number checks"
         return ""
 
+    def gate_state(self):
+        """(allowed, reason) - whether the bot may be used for a check now."""
+        if self._gate is None:
+            return True, ""
+        try:
+            allowed, reason = self._gate()
+        except Exception as exc:  # a broken gate must not disable the checker
+            return True, f"gate error ({exc})"
+        return bool(allowed), str(reason or "")
+
+    def _batch_conf(self):
+        """(size, wait_seconds) when telegram_bot batching is on, else None."""
+        if not bool(self.conf.get("batch_enabled", False)):
+            return None
+        try:
+            size = int(self.conf.get("batch_size", 3))
+        except (TypeError, ValueError):
+            size = 3
+        size = max(2, min(size, 10))
+        try:
+            wait = float(self.conf.get("batch_wait_seconds", 6.0))
+        except (TypeError, ValueError):
+            wait = 6.0
+        return size, max(1.0, wait)
+
+    def check_preferred_batched(self, number, service=None):
+        """
+        Ask the dedicated checker bot, batching several workers' pending
+        numbers into ONE comma-separated request when telegram_bot.batching
+        is enabled. Verdicts come back keyed by number (the bot's reply is
+        not ordered), so every participant gets exactly its own result.
+        """
+        conf = self._batch_conf()
+        client = self.preferred_client
+        many = getattr(client, "check_registration_many", None)
+        if conf is None or client is None or not callable(many):
+            return self.check_preferred(number, service=service)
+
+        size, wait = conf
+        my_key = str(number)
+        with self._batch_lock:
+            batch = self._batch
+            if batch is None or batch.full:
+                batch = _BotBatch(size)
+                self._batch = batch
+            event, leader = batch.join(my_key)
+
+        if leader:
+            deadline = time.monotonic() + wait
+            while not batch.full and time.monotonic() < deadline:
+                time.sleep(0.05)
+            with self._batch_lock:
+                batch.full = True  # seal the window
+                numbers = list(batch.entries)
+            if len(numbers) < 2:
+                # Nobody joined: a normal single check costs the same.
+                try:
+                    data = self.check_preferred(numbers[0], service=service)
+                    batch.results[numbers[0]] = data
+                except Exception as exc:
+                    batch.error = exc
+            else:
+                self._log(f"Batched checker request: {len(numbers)} numbers "
+                          f"in one message to {self._preferred_name}.")
+                if not self.preferred_ready:
+                    batch.error = CheckerUnavailable(
+                        "Dedicated checker bot unavailable: "
+                        f"{self.preferred_unavailable_reason}")
+                else:
+                    try:
+                        data = many(numbers)
+                        verdicts = (data or {}).get("verdicts") or {}
+                        for digits, verdict in verdicts.items():
+                            batch.results[str(digits)] = {
+                                "success": True,
+                                "is_registered": bool(verdict),
+                                "source": "telegram_checker",
+                                "checker_name": self._preferred_name,
+                                "checker_username": self._preferred_username,
+                                "number": str(digits),
+                                "batched": len(numbers),
+                            }
+                        missing = [n for n in numbers if n not in batch.results]
+                        if missing:
+                            batch.error = batch.error or CheckerUnavailable(
+                                "The dedicated checker bot's batch reply was "
+                                f"missing a verdict for {', '.join(missing)}.")
+                    except Exception as exc:
+                        batch.error = exc
+            batch.finish()
+            with self._batch_lock:
+                if self._batch is batch:
+                    self._batch = None
+            return batch.result_for(my_key)
+
+        # Not the leader: wait for the batch leader to publish the verdict.
+        margin = 30.0 + wait
+        try:
+            step_timeout = float(self.conf.get("step_timeout_seconds", 25.0))
+        except (TypeError, ValueError):
+            step_timeout = 25.0
+        ok = event.wait(wait + step_timeout + margin)
+        if not ok:
+            raise CheckerUnavailable(
+                "Batched checker request timed out waiting for the bot's reply.")
+        return batch.result_for(my_key)
+
     def check(self, number, service=None):
+        # Dedicated checker bot first: it has its own conversation and never
+        # touches the PRIMES login flow, so a mid-flight OTP is never at risk.
+        if self.preferred_ready:
+            try:
+                return self.check_preferred_batched(number, service=service)
+            except CheckerError:
+                # Fall through: try PRIMES as the last resort when there is one.
+                self._log(
+                    f"Dedicated checker bot failed to answer; "
+                    f"trying the PRIMES bot as the last resort.")
+            except Exception as exc:
+                self._log(
+                    f"Dedicated checker bot failed ({exc}); "
+                    f"trying the PRIMES bot as the last resort.")
+
         if not self.ready:
             raise CheckerUnavailable(
                 f"PRIMES bot checker unavailable: {self.unavailable_reason}"
             )
+        allowed, reason = self.gate_state()
+        if not allowed:
+            raise CheckerBotBusy(
+                f"PRIMES bot checker is not available for this check: {reason}"
+            )
+        if self._claim is None:
+            return self._run_check(number)
+        try:
+            with self._claim():
+                return self._run_check(number)
+        except BotBusy as exc:
+            raise CheckerBotBusy(str(exc)) from exc
+
+    def _run_check(self, number):
         try:
             data = self.client.check_registration(number)
         except CheckerError:
@@ -219,7 +503,8 @@ class CheckerRouter:
     """
 
     def __init__(self, config=None, bot_getter=None, log_fn=None, stats=None,
-                 api_client=None):
+                 api_client=None, gate=None, claim=None,
+                 checker_bot_getter=None, checker_bot_username=None) :
         config = config or {}
         conf = config.get("checker", {}) or {}
         self.conf = conf
@@ -243,7 +528,24 @@ class CheckerRouter:
                 network_backoff_seconds=conf.get("network_backoff_seconds", 1.5),
                 log_fn=log_fn,
             )
-        self.bot = BotChecker(bot_getter, conf.get("bot") or {}, log_fn=log_fn)
+        tg_config = (conf.get("telegram_bot") or {})
+        username = tg_config.get("username") or tg_config.get("bot_username") or checker_bot_username
+        username = (username or "") if isinstance(username, str) else ""
+
+        # The dedicated checker bot gets its own conf (a union of checker.bot
+        # defaults + checker.telegram_bot overrides), so its screen wording can
+        # differ from the PRIMES login bot without touching the login hints.
+        check_conf = dict(conf.get("bot") or {})
+        overrides = {k: v for k, v in tg_config.items() if k not in ("username", "bot_username", "name")}
+        check_conf.update(overrides)
+
+        self.bot = BotChecker(
+            bot_getter, check_conf, log_fn=log_fn,
+            gate=gate, claim=claim,
+            preferred_getter=checker_bot_getter,
+            preferred_username=username,
+            preferred_name=tg_config.get("name") or "checker bot",
+        )
 
         # "API is broken right now" state. While it is cooling down, checks go
         # straight to the bot instead of waiting for the API to fail again.
@@ -441,6 +743,11 @@ class CheckerRouter:
                 data = self._bot_check(
                     number, f"API error: {reason}", api_error=api_exc
                 )
+            except CheckerBotBusy:
+                # The bot is mid-login: report it as such (the worker cancels
+                # this number with a refund rather than counting it as a
+                # broken checker).
+                raise
             except CheckerError as bot_exc:
                 raise CheckerUnavailable(
                     f"Checker API failed ({api_exc}) and the PRIMES bot checker "

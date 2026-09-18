@@ -25,6 +25,24 @@ helper (`python meesho_bot_client.py <number>`) and the safety rules are in
 
 ## What it does automatically
 
+While workers are still hunting for a number, the bot is parked on an agreed
+offer (**offer pre-warm**): the Add Account → Login with Number → Normal walk
+and the reroll to `target_upi_price` already happened **before** any number
+exists. As soon as a number is found it is typed into that parked prompt
+without waiting for an offer. The parked prompt is re-armed automatically if
+it times out. Controlled by `meesho_bot.prewarm_offer` (default on),
+`meesho_bot.offer_warm_refresh_seconds` (default 90) and
+`meesho_bot.warmup_max_offer_rerolls` (0 = reuse `max_offer_rerolls`).
+
+**Price guard before typing.** A paid number is NEVER typed into an offer
+priced above `target_upi_price`: right before sending, the parked prompt's
+price is verified — a drifted/expensive offer is re-rolled **in place** until
+it fits (a genuine Change Number prompt carries no price line and no reroll
+button; its price was already agreed when the offer was parked, so it is
+accepted as-is). If no in-budget offer can be reached within the reroll
+budget, the login fails loudly with the number UN-typed (so it can be
+cancelled with a refund), instead of silently paying the higher UPI price.
+
 1. `/start` → **Add Account** → **Login with Number**
 2. **Referral step (optional — the bot does not always show it)** — when it does
    (🔗 *Set Refer Link* / 🎁 *Referral link?*), it appears **before** the
@@ -228,6 +246,8 @@ auto mode) instead of being lost.
      "max_referral_events": 4,
      "target_upi_price": 47,
      "max_offer_rerolls": 30,
+  "warmup_max_offer_rerolls": 0,
+  "offer_warm_refresh_seconds": 90,
      "max_change_number": 5,
      "change_number_retries": 2,
      "change_number_timeout_seconds": 0,
