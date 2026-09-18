@@ -34,6 +34,17 @@ it times out. Controlled by `automation.prewarm_offer` (default on),
 `meesho_bot.offer_warm_refresh_seconds` (default 90) and
 `meesho_bot.warmup_max_offer_rerolls` (0 = reuse `max_offer_rerolls`).
 
+`offer_warm_refresh_seconds` = how often the parked prompt is **re-verified**
+read-only. Default 90s: every 90s the bot checks if it is still on the number
+prompt; if the prompt is gone (Telegram bot timeout ~5 min, manual /start,
+checker using PRIMES conversation) it re-arms. If you set `900` (15 min) it
+will NOT re-search after 15 min unless the prompt is gone — it will just sit
+on the already-parked offer and wait for the next number. 900 is safe but
+slow to recover from a timed-out prompt; 60-120s is recommended. Login now
+outranks prewarm: if a number is found while prewarm is rerolling, the login
+**waits up to 120s** for prewarm to finish instead of cancelling the paid
+number with “PRIMES bot is busy (owner: prewarm)” — fixed in this branch.
+
 **Price guard before typing.** A paid number is NEVER typed into an offer
 priced above `target_upi_price`: right before sending, the parked prompt's
 price is verified — a drifted/expensive offer is re-rolled **in place** until

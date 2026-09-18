@@ -1823,8 +1823,13 @@ class ParallelAutomationCoordinator:
         return _BotClaim(self, "check", timeout=timeout, wait=timeout > 0)
 
     def _bot_login_claim(self):
-        """Claim the bot for a whole login/OTP/recovery flow (blocking)."""
-        return _BotClaim(self, "login", timeout=0, wait=True)
+        """Claim the bot for a whole login/OTP/recovery flow (blocking).
+
+        Login outranks prewarm: if the offer pre-warm is rerolling when a
+        number is found, the login waits for it to finish instead of
+        cancelling the paid number. 120s covers worst-case reroll budgets.
+        """
+        return _BotClaim(self, "login", timeout=120, wait=True)
 
     def _bot_warm_loop(self):
         """
@@ -1913,12 +1918,26 @@ class ParallelAutomationCoordinator:
             return False
 
     def _bot_warm_once(self):
-        """Walk the bot to an agreed offer and park it there (best effort)."""
+        """Walk the bot to an agreed offer and park it there (best effort).
+
+        If a target number appears while we are about to warm, abort - the
+        login flow will take the bot (it waits for prewarm to finish, see
+        _bot_login_claim). This avoids the 'PRIMES bot is busy (owner: prewarm)'
+        cancellation.
+        """
         prepare = getattr(self.bot, "prepare_offer", None)
         if not callable(prepare):
             return
+        # Quick check before trying to claim: don't start warming if a target
+        # is already waiting to be processed.
+        if self.target_found_event.is_set() or self.bot_login_active:
+            return
         try:
             with _BotClaim(self, "prewarm", timeout=0, wait=False):
+                # Re-check inside the claim: target may have appeared between
+                # the outer check and acquiring the lock.
+                if self.target_found_event.is_set() or self.bot_login_active:
+                    return
                 res = prepare()
         except BotBusy:
             return
@@ -2229,11 +2248,82 @@ class ParallelAutomationCoordinator:
                             # The login/OTP/recovery flow owns the PRIMES bot
                             # for as long as this number is in play: no number
                             # check may walk the bot away from its OTP screen
-                            # (see _BotClaim).
-                            with self._bot_login_claim():
-                                cont = self._process_target(target, use_bot)
+                            # (see _BotClaim). Login outranks prewarm - it now
+                            # waits up to 120s for prewarm to finish instead of
+                            # raising BotBusy immediately.
+                            # Retry once if prewarm was still holding the lock.
+                            last_exc = None
+                            for attempt in range(3):
+                                try:
+                                    with self._bot_login_claim():
+                                        cont = self._process_target(target, use_bot)
+                                    last_exc = None
+                                    break
+                                except BotBusy as busy_exc:
+                                    # Prewarm busy should NOT cancel a paid
+                                    # number - it should wait and then use the
+                                    # parked offer (or reroll if needed).
+                                    if "prewarm" in str(busy_exc).lower() and attempt < 2:
+                                        log(f"PRIMES bot busy with prewarm while processing "
+                                            f"{target.clean_number} (attempt {attempt+1}/3) - "
+                                            f"waiting for prewarm to finish instead of cancelling...",
+                                            prefix=target.provider_name.upper())
+                                        time.sleep(3 + attempt * 2)
+                                        last_exc = busy_exc
+                                        continue
+                                    raise
+                            if last_exc is not None:
+                                # Still busy after retries - treat as busy, not crash
+                                raise last_exc
                         else:
                             cont = self._process_target(target, use_bot)
+                    except BotBusy as exc:
+                        # Login claim still busy after waiting (prewarm stuck or
+                        # another login - the latter should not happen). For
+                        # prewarm we WAIT and retry the same number instead of
+                        # cancelling it - prewarm exists to SAVE time/numbers.
+                        pname = target.provider_name.upper()
+                        is_prewarm = "prewarm" in str(exc).lower()
+                        if is_prewarm:
+                            log(f"PRIMES bot busy with prewarm for {target.clean_number} "
+                                f"after retries - keeping the number and waiting for "
+                                f"prewarm to release (not cancelling).",
+                                prefix=pname)
+                            # Don't cancel, don't clear target - let it be
+                            # retried after a short wait. The outer loop will
+                            # re-enter processing for the same active_target.
+                            time.sleep(5)
+                            # Keep the target, don't clear, retry processing
+                            # in next iteration of the outer while loop.
+                            continue
+                        # Genuine login busy (should not happen for login vs login
+                        # because only one target is processed at a time) - fall
+                        # through to generic handler which cancels with refund.
+                        log(f"Unexpected BotBusy while processing {target.clean_number}: {exc}",
+                            prefix=pname)
+                        log(traceback.format_exc(), prefix=pname)
+                        self.notify.alert(
+                            f"🛑 [{pname}] Bot busy - target skipped",
+                            f"Number: {target.clean_number}\nError: {exc}\n\n"
+                            "The activation is cancelled and the refund tally checked; "
+                            "the search continues with the next number."
+                        )
+                        if use_bot:
+                            try:
+                                self.bot.cancel_flow()
+                            except Exception:
+                                pass
+                            self.bot_at_number_prompt = False
+                            self.bot_change_attempts = 0
+                        try:
+                            self.handle_cancellation(
+                                target.client, target.activation_id, target.clean_number,
+                                f"Bot busy: {exc}", expect_refund=True,
+                            )
+                        except Exception as exc2:
+                            log(f"Cancellation after bot busy failed: {exc2}", prefix=pname)
+                        self._clear_target()
+                        cont = "continue"
                     except Exception as exc:
                         # Last-resort net: nothing may ever crash the whole
                         # automation run again (a bare TimeoutError from the
