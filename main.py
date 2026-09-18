@@ -103,6 +103,28 @@ class NumberContext:
         self.acquired_at = now()
 
 
+def _bot_lease(coordinator, action, owner):
+    """
+    Mark / clear the PRIMES conversation lease on the bot client.
+
+    Both the offer pre-warm and the number checker drive the SAME Telegram
+    chat unless a dedicated checker bot answers the check. The lease lets the
+    client reject (with a readable message) anything that would navigate the
+    chat while the login / pre-warm owns it - instead of silently tapping in
+    the middle of a reroll (the pre-warm then failed with "Offer screen has
+    no reroll button").
+    """
+    bot = getattr(coordinator, "bot", None)
+    method = getattr(bot, "hold_conversation" if action == "hold"
+                     else "release_conversation", None)
+    if not callable(method):
+        return
+    try:
+        method(owner)
+    except Exception:
+        pass
+
+
 class _BotClaim:
     """
     Exclusive claim on the PRIMES bot conversation (see the coordinator).
@@ -150,6 +172,12 @@ class _BotClaim:
             else:
                 coord._bot_claim_owner = self.owner
             self.held = True
+            # Tell the bot client who is driving the PRIMES chat: the login
+            # flow and the offer pre-warm leave the bot on a screen that must
+            # not be walked away from, and a check that would use the SAME
+            # conversation says so instead of tapping over it.
+            if self.owner in ("login", "prewarm"):
+                _bot_lease(coord, "hold", self.owner)
             return coord
         except Exception:
             lock.release()
@@ -161,6 +189,8 @@ class _BotClaim:
             return False
         self.held = False
         try:
+            if self.owner in ("login", "prewarm"):
+                _bot_lease(coord, "release", self.owner)
             if self.owner == "login":
                 coord._bot_login_depth = max(0, coord._bot_login_depth - 1)
                 if coord._bot_login_depth == 0:
@@ -225,7 +255,8 @@ class ParallelAutomationCoordinator:
                 )
             except Exception as exc:
                 log(f"Checker: could not set up the dedicated checker bot "
-                    f"({exc}); it is not available.")
+                    f"@{checker_bot_username.lstrip('@')} ({exc}); it is not "
+                    f"available - checks will use the PRIMES bot conversation.")
                 self._dedicated_checker_client = None
 
         self.checker = CheckerRouter(
@@ -503,6 +534,7 @@ class ParallelAutomationCoordinator:
             f"  Referral step: {s.get('referral_pasted', 0)} pasted | "
             f"{s.get('referral_skipped', 0)} skipped | {s.get('offer_rerolls', 0)} offer rerolls\n"
             f"  Checks: {s.get('checker_api_checks', 0)} via API | "
+            f"{s.get('checker_dedicated_checks', 0)} via dedicated bot | "
             f"{s.get('checker_bot_checks', 0)} via PRIMES bot | "
             f"{s.get('checker_fallbacks', 0)} API→bot fallbacks\n"
             f"  Numbers consumed (charged): {s['numbers_consumed']}\n"
@@ -623,6 +655,7 @@ class ParallelAutomationCoordinator:
         s = self.stats.snapshot()
         lines.append(
             f"Checks so far: {s.get('checker_api_checks', 0)} via API | "
+            f"{s.get('checker_dedicated_checks', 0)} via dedicated bot | "
             f"{s.get('checker_bot_checks', 0)} via PRIMES bot | "
             f"{s.get('checker_fallbacks', 0)} fallbacks"
         )
@@ -1824,10 +1857,60 @@ class ParallelAutomationCoordinator:
                     continue
                 # The parked prompt is gone (bot timeout, manual /start): warm
                 # again instead of typing the next number into a wrong screen.
-                log("Parked offer prompt is gone; re-arming the PRIMES bot.")
+                # A checker screen means a number check took the conversation
+                # over - say so, it is the one conflict worth warning about.
+                if self._bot_in_checker_screen():
+                    log("Parked offer prompt is gone: a number check is using "
+                        "the PRIMES conversation (no dedicated checker bot, or "
+                        "the check was routed to the login chat). Re-arming "
+                        "the bot after the check.")
+                else:
+                    log("Parked offer prompt is gone; re-arming the PRIMES bot.")
                 self.bot_at_number_prompt = False
             self._bot_warm_once()
             last_verified = time.time()
+
+    def _log_dedicated_checker_state(self):
+        """
+        Say, once at startup, whether the dedicated checker bot is usable.
+
+        "enabled: true" in config.json is not enough - the bot is only real
+        once the userbot session can open ITS conversation. Without this line
+        a check silently fell back to the PRIMES bot chat and the logs never
+        explained why.
+        """
+        bot_checker = getattr(self.checker, "bot", None)
+        if bot_checker is None:
+            return
+        if not getattr(bot_checker, "has_preferred", False):
+            log("Checker: no dedicated checker bot configured "
+                "(checker.telegram_bot.username is empty/disabled) - number "
+                "checks use the PRIMES login conversation (they then wait for "
+                "a login / the offer pre-warm instead of running alongside).")
+            return
+        summary = bot_checker.describe_preferred()
+        if getattr(bot_checker, "preferred_ready", False):
+            log(f"Checker: dedicated checker bot ready - {summary}; number "
+                f"checks run in that conversation and never touch the PRIMES "
+                f"login chat.")
+        else:
+            log(f"Checker: dedicated checker bot NOT usable - {summary}. Set "
+                f"checker.telegram_bot.username to the bot's @handle (not its "
+                f"display name) and press START in that bot once from this "
+                f"Telegram account.")
+
+    def _bot_in_checker_screen(self):
+        """
+        Read-only: is the PRIMES bot showing its number checker right now?
+        Best effort - a false negative only costs a less specific log line.
+        """
+        probe = getattr(self.bot, "in_checker_screen", None)
+        if not callable(probe):
+            return False
+        try:
+            return bool(probe())
+        except Exception:
+            return False
 
     def _bot_warm_once(self):
         """Walk the bot to an agreed offer and park it there (best effort)."""
@@ -1840,7 +1923,18 @@ class ParallelAutomationCoordinator:
         except BotBusy:
             return
         except Exception as exc:
-            log(f"Offer pre-warm failed: {exc}")
+            # A number check that drives the SAME chat (no dedicated checker
+            # bot, or one mis-bound to the PRIMES bot) walks the bot off the
+            # offer screen mid-reroll - that is a conflict, not a bot bug:
+            # say so instead of a bare "pre-warm failed".
+            if self._bot_in_checker_screen():
+                log("Offer pre-warm stopped: the PRIMES bot is on its number "
+                    "checker screen - a number check is using the same "
+                    "conversation. Configure a dedicated checker bot "
+                    "(checker.telegram_bot.username) so checks stop sharing "
+                    "the login chat; the offer is re-armed after the check.")
+            else:
+                log(f"Offer pre-warm failed: {exc}")
             self.bot_at_number_prompt = False
             return
 
@@ -2040,6 +2134,9 @@ class ParallelAutomationCoordinator:
         use_bot = self.bot.ready
         log(f"PRIMES bot flow: {'AUTO' if use_bot else 'MANUAL TRIGGER'}")
         log(f"Checker: {self.checker.describe()}")
+        # Only now does "the dedicated checker bot is ready" mean anything:
+        # it rides on the same userbot connection.
+        self._log_dedicated_checker_state()
 
         # Checker mode sanity. "bot" cannot work without the userbot, and
         # starting the workers anyway would buy numbers only to cancel every

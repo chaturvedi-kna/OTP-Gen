@@ -38,6 +38,7 @@ COUNTERS = {
     "referral_skipped": 0,     # referral step answered with the bot's skip option
     "checker_api_checks": 0,   # numbers checked through the HTTP checker API
     "checker_bot_checks": 0,   # numbers checked through the PRIMES bot checker
+    "checker_dedicated_checks": 0,  # numbers checked through the dedicated checker bot
     "checker_fallbacks": 0,    # checks that fell back from the API to the bot
     "cancel_deferred": 0,      # cancellations the provider refused, postponed to activation expiry
     "cancel_deferred_refunded": 0,  # deferred cancellations refunded after the retry

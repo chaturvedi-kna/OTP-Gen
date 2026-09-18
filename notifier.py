@@ -304,7 +304,7 @@ class TelegramBackend:
 
     @staticmethod
     def _escape_preserving_code(text):
-        """
+        r"""
         Escapes text for Telegram MarkdownV2 while preserving `code` spans.
         Inside `code` spans, only ` and \ need escaping.
         """

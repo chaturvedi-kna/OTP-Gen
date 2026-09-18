@@ -163,6 +163,44 @@ concurrent number checks with a single bot visit:
   behaviour as before. A lone check with batching on simply runs as a single
   visit after the window closes.
 
+### When the dedicated checker bot is NOT used (and why)
+
+`enabled: true` alone is not enough - the userbot has to open that bot's chat,
+which only resolves after THIS Telegram account has pressed START in it once.
+Startup now says which case you are in:
+
+```
+Checker: dedicated checker bot ready - Meesho Xxpress Manish (@manishmeeshobot) ready; number
+         checks run in that conversation and never touch the PRIMES login chat.
+Checker: dedicated checker bot NOT usable - Meesho Xxpress Manish (@manishmeeshobot) NOT ready
+         (...). Set checker.telegram_bot.username to the bot's @handle (not its display name)
+         and press START in that bot once from this Telegram account.
+```
+
+and every fallback names the bot that actually answered:
+
+```
+[...] Checker: using the dedicated checker bot @manishmeeshobot for 9876543210 (API error: network)
+[...] Checker: using the PRIMES bot checker for 9876543210 (API error: network) - the dedicated
+      checker bot @manishmeeshobot cannot answer (the checker bot userbot is not connected)
+```
+
+Two failures that used to be silent:
+
+* **`Could not open the dedicated checker conversation with @x`** - the account
+  cannot resolve that @handle (typo, display name instead of the handle, or the
+  bot was never started). The check is then **not** sent to the PRIMES login
+  bot as a stand-in; it fails, and the number keeps its normal cancel path.
+* **`Refusing to run a number check: the PRIMES bot conversation is being
+  driven by the prewarm flow`** - the checker is pointed at the login bot (or
+  no dedicated bot is configured) while the offer pre-warm owns that chat. A
+  check and the pre-warm tap in the SAME conversation, so the check waits
+  (`Checker: the PRIMES bot chat is busy with the prewarm flow ...`) or is
+  refused - instead of walking the bot off the offer screen mid-reroll, which
+  used to end in `Offer pre-warm failed: Offer screen has no reroll button`
+  while the checker read a half-finished screen. With a dedicated checker bot
+  configured, checks and the pre-warm simply run in two chats at once.
+
 `checker.fallback` (all default `true` except `rate_limit`):
 
 | Key (aliases) | Trigger |
@@ -208,7 +246,9 @@ Every fallback is logged, counted and visible:
 ```
 
 `/status` shows the mode, the cooldown left, and the counters
-(`checker_api_checks`, `checker_bot_checks`, `checker_fallbacks`).
+(`checker_api_checks`, `checker_dedicated_checks` - answered by
+`checker.telegram_bot` -, `checker_bot_checks` - answered by the PRIMES bot -,
+`checker_fallbacks`).
 
 ## 3. `bot`: how the PRIMES bot checker is driven
 
