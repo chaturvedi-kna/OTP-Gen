@@ -53,6 +53,20 @@ helper (`python meesho_bot_client.py <number>`) and the safety rules are in
    during recovery is answered the same way, so a paid number is never typed
    into the referral field or lost behind that screen
 
+### Verified screen coverage
+
+The recognition above is checked offline against the bot's **real** screens (fixtures
+transcribed from live chats), in `test_primes_referral_flow.py` and
+`test_change_number_recovery.py`:
+
+| Screen | Copy (trimmed) | Must behave as |
+| --- | --- | --- |
+| Offer (login flow) | `Not happy with it? Tap 🔄 Try Another Offer to reroll. / 📱 Otherwise send your 10-digit mobile number to continue.` + `🔄 Try Another Offer` / `✖ Cancel` | an offer (`classify() → offer`); number prompt |
+| Change Number prompt | `✏️ Change Number / Send the 10-digit mobile number you'd like to use instead.` + a lone `✖ Cancel` | THE number prompt - warm **and** cold reads, despite having no price line and no reroll button |
+| Checker prompt | `🔍 Check Number / Send the 10-digit mobile number you want to verify. / I'll tell you if it's registered on Meesho.` + `✖️ Cancel` | NEVER a login prompt on a cold read (checker vocabulary); only typed into by the checker flow |
+| Preparing transient | `⏳ Setting things up… / Finding the best offer for you.` | its own `working` state: waited out, never "no reroll button" |
+| Failed-offer variant | `⚠️ Failed to fetch offer … UPI · ₹83 … Offer · Null` + `🔄 Try Again` / `➡️ Continue without offer` / `❌ Cancel` | a reroll screen: tapped, never typed into (decoy price) |
+
 ## Change Number recovery (no needless menu restart)
 
 Getting back to the number prompt is much cheaper than restarting the flow
@@ -219,6 +233,7 @@ auto mode) instead of being lost.
      "change_number_timeout_seconds": 0,
      "change_number_budget_seconds": 0,
      "change_number_variant_taps": 3,
+     "working_screen_waits": 2,
      "number_prompt_hints": [],
      "reuse_number_prompt": true,
      "reset_to_menu_on_change_failure": "auto",
@@ -249,7 +264,12 @@ auto mode) instead of being lost.
    prompt; `change_number_budget_seconds` (`0` = auto: 30–45s, whatever is
    closest to `step_timeout_seconds`) caps the whole recovery;
    `change_number_variant_taps` (default **3**) bounds
-   **🔄 Try Again** variant taps during it. `number_prompt_hints` adds wording
+   **🔄 Try Again** variant taps during it; `working_screen_waits` (default **2**)
+   is how many extra step-timeout-long rounds the bot's transient
+   **"⏳ Setting things up…"** screen (between a reroll tap and the next offer)
+   is waited out before the flow reports *"the bot stayed on its preparing
+   screen … the next offer never appeared"* — it must never fail as
+   "Offer screen has no reroll button". `number_prompt_hints` adds wording
    for the login number prompt when your bot revision's copy is not recognised
    (the recovery error prints the screen text and names this list).
    `reuse_number_prompt` (default **true**) lets a login send its number from a
@@ -284,6 +304,7 @@ auto mode) instead of being lost.
 | Telegram side hangs (no screen/tap progress for `flow_timeout_seconds`) | ⏱️ `MeeshoBotTimeout` — alert (with the stage it hung at), cancel the number (refund verified — the tally flags it if the number had already reached the bot), reset flow, **automation continues** |
 | Change Number used > `max_change_number` in a row | reset to main menu (full flow restart) |
 | Change Number tap ignored by the bot | retried (`change_number_retries` extra taps) inside `change_number_timeout_seconds` / `change_number_budget_seconds` — no menu restart |
+| Reroll lands on **⏳ Setting things up…** | the bot's preparing transient: classified as its own `working` state and waited out (`working_screen_waits` extra rounds) so a throttled bot holding it past one step timeout no longer fails with "Offer screen has no reroll button" (and never cancels a paid number for it). If it *never* resolves the failure says exactly that — give the bot a rest before the next number |
 | Change Number lands on a number prompt with copy `classify()` does not know | recognised as the prompt (built-in wording + `number_prompt_hints`) → the replacement number is sent from it: no "got unknown" failure, no menu restart, no offer reroll |
 | Change Number unrecoverable (dead-end screen) | `reset_to_menu_on_change_failure`: `"auto"` resets to the main menu **only when the bot checker needs it** (`checker.mode: "bot"`, or `"auto"` while the API is down / cooling down / keyless); with the checker API answering the bot is **left in-flow** and the next login reuses its prompt (or walks back to the menu itself if the bot really is lost) |
 | Bot left the login flow by itself (main menu / link choice / login mode) | reported as `needs_full_flow` — no extra reset, the next number runs the full flow |

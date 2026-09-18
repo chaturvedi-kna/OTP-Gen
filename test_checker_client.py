@@ -23,6 +23,38 @@ Verifies:
 
 import sys
 import time
+import types
+
+# `requests` may be absent in a bare sandbox; stub it before checker_client
+# imports it. The client's rate-limit tests replace requests.post themselves -
+# they only need the exception classes to exist.
+if "requests" not in sys.modules:
+    try:
+        import requests  # noqa: F401
+    except ImportError:
+        _requests = types.ModuleType("requests")
+
+        class _RequestException(Exception):
+            pass
+
+        class _ConnectionError(_RequestException):
+            pass
+
+        class _Timeout(_RequestException):
+            pass
+
+        def _no_network(*_args, **_kwargs):
+            raise RuntimeError("network disabled in this offline check")
+
+        _requests.Session = object
+        _requests.RequestException = _RequestException
+        _requests.ConnectionError = _ConnectionError
+        _requests.Timeout = _Timeout
+        _requests.HTTPError = _RequestException
+        _requests.get = _no_network
+        _requests.post = _no_network
+        sys.modules["requests"] = _requests
+
 
 import checker_client
 from checker_client import (

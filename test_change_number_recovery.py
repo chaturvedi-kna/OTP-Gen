@@ -75,6 +75,7 @@ import main as m  # noqa: E402
 from test_primes_referral_flow import (  # noqa: E402
     MAIN_MENU,
     PROMPT_ALT_COPY,
+    CHANGE_NUMBER_SCREENSHOT,
     BROKEN_SCREEN,
     build_client,
 )
@@ -347,6 +348,55 @@ def scenario_prompt_reuse_after_kept_flow():
     check("kept flow: no /start reset", bot.starts == 0, bot.starts)
     check("kept flow: reuse reported by the flow",
           res.get("reused_prompt") is True, res)
+def scenario_reported_bug_screenshot_prompt():
+    """
+    Same replay, but the bot answers Change Number with the EXACT screen from
+    the user's screenshot: "✏️ Change Number - Send the 10-digit mobile number
+    you'd like to use instead." with a lone Cancel button (no price line, no
+    reroll button). classify() calls it unknown; the recovery and the cold read
+    must both accept it as the number prompt, and the replacement number must
+    go in from there with from_prompt=True (no menu walk, no reroll).
+    """
+    coordinator, bot_client, bot, sent = build(
+        change_number_screen=CHANGE_NUMBER_SCREENSHOT)
+    context = FakeNumberContext()
+    res = bot_client.prepare_login(context.clean_number)
+    check("screenshot: first number reached the OTP screen",
+          res["stage"] == "otp_sent", res)
+    walks_after_login = menu_walks(bot)
+
+    coordinator.handle_cancellation = (
+        lambda *a, **kw: {"tally_ok": True, "salvaged": None, "balance": 35.9177}
+    )
+    coordinator._recover_change_number(context, "otp_timeout")
+
+    check("screenshot: recovery reached the prompt",
+          coordinator.bot_at_number_prompt is True, coordinator.bot_at_number_prompt)
+    check("screenshot: the cold read accepts the marker-less prompt",
+          bot_client.at_number_prompt() is True, bot_client.screen_state())
+    check("screenshot: no menu reset",
+          bot.starts == 0 and menu_walks(bot) == walks_after_login,
+          f"starts={bot.starts} walks={menu_walks(bot)}")
+    title, message = sent[-1]
+    check("screenshot: notification says the bot waits for the replacement number",
+          "waiting for the replacement number" in message, message)
+
+    taps_before = list(bot.tapped)
+    next_context = FakeNumberContext(number="9416424574")
+    res2 = coordinator._bot_send_number(next_context,
+                                        from_prompt=coordinator.bot_at_number_prompt)
+    check("screenshot: no second menu walk happened for the replacement",
+          not any("Add Account" in tap for tap in bot.tapped[len(taps_before):]),
+          bot.tapped[len(taps_before):])
+    check("screenshot: replacement number sent",
+          bot.sent_numbers[-1] == "9416424574", bot.sent_numbers)
+    check("screenshot: OTP screen reached",
+          res2 is not None and res2["stage"] == "otp_sent", res2)
+    check("screenshot: no menu walk, no reroll, no /start for the replacement",
+          bot.tapped == taps_before and menu_walks(bot) == walks_after_login
+          and bot.starts == 0,
+          f"taps={bot.tapped} walks={menu_walks(bot)} starts={bot.starts}")
+
 
 def scenario_prompt_lost_to_a_bot_check():
     """
@@ -393,6 +443,7 @@ def main():
     shutil.copy(os.path.join(REPO_DIR, "config.json"),
                 os.path.join(SCRATCH_DIR, "config.json"))
     scenario_reported_bug_alt_prompt_copy()
+    scenario_reported_bug_screenshot_prompt()
     scenario_unrecoverable_keeps_flow_when_api_answers()
     scenario_unrecoverable_resets_when_bot_checker_needed()
     scenario_prompt_reuse_after_kept_flow()

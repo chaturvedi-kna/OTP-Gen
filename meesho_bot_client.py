@@ -139,6 +139,12 @@ S_SENDING_OTP = "otp_sending"
 # code is submitted, before "Account linked!" (or a wrong-code error) appears:
 # transient, keep waiting - never report it as the flow's outcome.
 S_VERIFYING = "verifying"
+# Transient "the bot is preparing the next screen" copy ("⏳ Setting things
+# up…") the bot shows between a tap (Try Another Offer / Try Again / Change
+# Number / Normal) and the offer that follows it. It normally lasts a second or
+# two, but can outlive a whole step timeout when the bot throttles after many
+# rerolls - it must be waited through, never read as a dead end.
+S_WORKING = "working"
 S_LINKED = "linked"
 S_WRONG_OTP = "wrong_otp"
 S_EXPIRED = "otp_expired"
@@ -244,6 +250,21 @@ _OFFER_VARIANT_HINTS = (
     "failed to fetch offer", "couldn't load", "could not load", "unable to load",
     "offer · null", "offer null", "continue without offer", "try again to retry",
 )
+# The bot's "I am fetching the next offer right now" copy, shown as an edit
+# between a reroll tap and the offer screen.
+WORKING_HINTS = (
+    "setting things up", "setting up", "setting-up", "setup in progress",
+    "preparing", "loading", "working on it", "working on your",
+    "hold on", "please wait", "just a moment", "one moment", "wait a moment",
+    "wait a sec", "fetching your offer", "getting your offer",
+    "finding the best offer", "looking for an offer", "checking offers",
+    "grabbing your offer",
+)
+# Wording that belongs to the bot CHECKER, not to the login flow. A cold read
+# (no tap context) must never type a paid number into the checker's "send the
+# number" prompt, and that prompt is worded almost exactly like the login
+# prompt - the check/verify/registration vocabulary is what tells them apart.
+_CHECKER_WORD_HINTS = ("check", "verify", "registered", "registration")
 
 # A short hint (a single short word) is matched on word boundaries so e.g.
 # "no" can never match inside "notification".
@@ -389,24 +410,22 @@ class Screen:
         """
         True when this screen is the LOGIN number prompt - the offer screen the
         bot shows before it sends the OTP - including revisions whose copy or
-        buttons classify() does not recognise as S_OFFER.
+        buttons classify() does not recognise as S_OFFER (the real one e.g. is
+        "✏️ Change Number - Send the 10-digit mobile number you'd like to use
+        instead." with a lone Cancel button).
 
-        Context decides how strict this has to be:
-
-          * right after a Change Number tap the bot can only be inside the
-            login flow, so any screen asking for a mobile number is the prompt
-            (`require_offer_marker=False`);
-          * at the start of a fresh login the very same wording could be the
-            bot CHECKER's "send the number to check" prompt, so an offer marker
-            (a price line, a reroll button, the word "offer", a Continue /
-            Change Number button) is required there
-            (`require_offer_marker=True`) - never type a paid number into the
-            checker.
+        `require_offer_marker` is the COLD-READ mode (no tap context: the
+        coordinator asking "may I send a number here?", or a login deciding to
+        reuse the screen the bot sits on). The one screen it must never accept
+        is the bot CHECKER's "send the number to check" prompt - worded almost
+        exactly like the login prompt - so checker vocabulary
+        (check/verify/registered) rules it out there. Configured
+        `extra_hints` always win, in both modes.
 
         Known screens (menu, login mode, referral, OTP-wait, linked, blocked,
-        the transient "sending/verifying" ones) are never a number prompt, and
-        neither is the "⚠️ Failed to fetch offer / 🔄 Try Again" variant: it
-        carries a decoy price and must be rerolled, not typed into.
+        the transient "sending/verifying/preparing" ones) are never a number
+        prompt, and neither is the "⚠️ Failed to fetch offer / 🔄 Try Again"
+        variant: it carries a decoy price and must be rerolled, not typed into.
         """
         state = self.classify()
         if state == S_OFFER:
@@ -424,6 +443,17 @@ class Screen:
         if self.reroll_button() is not None and any(
                 hint in text for hint in _OFFER_VARIANT_HINTS):
             return False
+        # Explicit per-revision hints win in both modes.
+        if extra_hints and _hint_match(text, tuple(extra_hints)):
+            return True
+        # Cold read: the checker's prompt is worded like the login prompt; its
+        # check/verify/registration vocabulary is what tells them apart.
+        if require_offer_marker and _hint_match(text, _CHECKER_WORD_HINTS):
+            return False
+        if _hint_match(text, NUMBER_PROMPT_HINTS):
+            return True
+        # Unlisted copy: an ask-for-a-number sentence on a screen that carries
+        # an offer marker ("Enter the mobile no. to continue with this offer").
         marker = (
             self.reroll_button() is not None
             or self.upi_price is not None
@@ -432,10 +462,6 @@ class Screen:
         )
         if require_offer_marker and not marker:
             return False
-        if _hint_match(text, tuple(extra_hints or ()) + NUMBER_PROMPT_HINTS):
-            return True
-        # Unlisted copy: an ask-for-a-number sentence on a screen that carries
-        # an offer marker ("Enter the mobile no. to continue with this offer").
         return bool(
             marker
             and any(word in text for word in ("number", "mobile", "phone"))
@@ -752,6 +778,14 @@ class Screen:
             t.startswith("checking your code") or t.startswith("confirming your code")
         ):
             return S_VERIFYING
+        # Transient: the bot is fetching the next screen ("⏳ Setting things
+        # up…") between a tap and the offer it produces. Checked before the
+        # offer heuristics so such an edit is waited through instead of being
+        # read as a dead end; a screen carrying a price or a reroll button is
+        # offer family and keeps its own classification.
+        if (self.upi_price is None and self.reroll_button() is None
+                and _hint_match(t, WORKING_HINTS)):
+            return S_WORKING
         # Menu / login-mode / offer screens claim priority over the referral
         # check: only the dedicated promotion screen may classify as referral.
         if self.has_button("try another offer") or (
@@ -822,6 +856,12 @@ class MeeshoBotClient:
         )
         self.change_number_variant_taps = max(
             0, int(conf.get("change_number_variant_taps", 3)))
+        # Extra wait rounds for the transient "⏳ Setting things up…" screen the
+        # bot shows between a reroll tap and the offer it produces. It is
+        # normally over in a second, but a throttled bot (many rerolls in a row)
+        # can hold it longer than one step timeout - that must not kill a paid
+        # number with "Offer screen has no reroll button".
+        self.working_screen_waits = max(0, int(conf.get("working_screen_waits", 2)))
         # Overall cap for one Change Number recovery (taps + waits together), so
         # the retry loop can never take longer than the single full-step wait it
         # replaces. 0 = auto: 30-45s, whatever is closest to the step timeout.
@@ -1619,6 +1659,18 @@ class MeeshoBotClient:
             state = screen.classify()
             if state in (S_BLOCKED, S_LINKED, S_OTP_WAIT, S_WRONG_OTP, S_EXPIRED):
                 break
+            if state == S_WORKING:
+                # The preparing screen outlived every wait round: the next
+                # offer never appeared (a throttled bot after many rerolls).
+                # Say exactly that instead of "no reroll button".
+                first_line = (screen.text or "").strip().splitlines()
+                raise MeeshoBotUnknownScreen(
+                    f"The bot stayed on its preparing screen "
+                    f"({first_line[0][:60] if first_line else 'working'}) through "
+                    f"{self.working_screen_waits + 1} wait round(s) after reroll "
+                    f"#{rerolls} - the next offer never appeared",
+                    screen.text, screen.button_labels,
+                )
             upi = screen.upi_price
             result["upi"] = upi
             if self._at_number_prompt(screen):
@@ -1714,10 +1766,28 @@ class MeeshoBotClient:
         """
         states = (S_OFFER, S_BLOCKED, S_LINKED, S_OTP_WAIT, S_LOGIN_MODE, S_LINK_CHOICE)
         taps = 0
+        working = 0
         while True:
-            if (screen.classify() not in states
+            state = screen.classify()
+            if state == S_WORKING:
+                # "⏳ Setting things up…": the next offer is being fetched. Wait
+                # it out (bounded) instead of returning a screen the caller can
+                # only misread as a dead end.
+                if working >= self.working_screen_waits:
+                    return screen
+                working += 1
+                first_line = (screen.text or "").strip().splitlines()
+                self._log(f"[MEESHO-BOT] Bot is preparing the next offer "
+                          f"({first_line[0][:60] if first_line else 'working'}); waiting "
+                          f"it out (round {working}/{self.working_screen_waits}).")
+                self._note(f"waiting for the offer behind the preparing screen "
+                           f"(round {working}/{self.working_screen_waits})")
+                screen = await self._settle(screen, states, timeout=timeout,
+                                            accept_prompt=True)
+                continue
+            if (state not in states
                     and not self._at_number_prompt(screen)
-                    and screen.classify() != S_REFERRAL
+                    and state != S_REFERRAL
                     and screen.reroll_button() is not None):
                 # A non-offer screen that offers to reroll is the "Try Again"
                 # variant: tapping it now is faster (and more correct) than

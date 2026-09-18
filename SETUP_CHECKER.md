@@ -184,6 +184,14 @@ buttons.
 
 * The number is only ever typed into a screen the flow recognises as the
   checker's number prompt; an unrecognised screen fails loudly instead.
+* The two near-identical "send the number" prompts are told apart by
+  vocabulary: the login flow accepts its own Change Number prompt
+  ("✏️ Change Number — Send the 10-digit mobile number you'd like to use
+  instead." with a lone Cancel button) even without a price line, but never
+  accepts the checker's prompt ("Send the 10-digit mobile number you want to
+  verify … registered on Meesho") on a context-free read — check/verify/
+  registered wording rules it out, so a paid number can never be typed into
+  the checker.
 * Checks and logins share one conversation with one bot and are serialised by
   a lock, so a worker's check can never interleave with the coordinator's
   login flow (the second caller waits its turn).

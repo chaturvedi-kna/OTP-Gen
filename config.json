@@ -111,6 +111,7 @@
     "change_number_timeout_seconds": 0,
     "change_number_budget_seconds": 0,
     "change_number_variant_taps": 3,
+    "working_screen_waits": 2,
     "number_prompt_hints": [],
     "reuse_number_prompt": true,
     "reset_to_menu_on_change_failure": "auto",
