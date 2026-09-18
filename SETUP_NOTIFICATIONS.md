@@ -201,3 +201,38 @@ should use different userbot sessions or a different command bot):
       "tempora": { "meesho_bot": { "session_file": "userbot.tempora.session.txt" } },
       "vsimpro": { "meesho_bot": { "session_file": "userbot.vsimpro.session.txt" } }
     }
+
+**Two different Telegram accounts (one per tab).** It is ONE `config.json` -
+there is no conflict: only the tab's own `instances.<name>` block is merged
+over the top-level config, so tempora keeps using its session and vsimpro
+its own. Put each account's credentials in its block:
+
+    "instances": {
+      "tempora": {
+        "meesho_bot": {
+          "api_id": 1111111,
+          "api_hash": "aaaa...",
+          "session_file": "userbot.tempora.session.txt"
+        }
+      },
+      "vsimpro": {
+        "meesho_bot": {
+          "api_id": 2222222,
+          "api_hash": "bbbb...",
+          "session_file": "userbot.vsimpro.session.txt"
+        }
+      }
+    }
+
+Then log in each account ONCE (each writes its own session file):
+
+    python login_userbot.py --instance tempora
+    python login_userbot.py --instance vsimpro
+
+(`--instance` applies that instance's overrides first, so the session lands in
+`userbot.<instance>.session.txt`; `--session-file <path>` overrides the output
+path entirely. Skip the flag and the top-level `meesho_bot` defaults are used.)
+
+If both tabs should drive the SAME Telegram account, do nothing: the top-level
+`meesho_bot.session_file` is shared, and even that is safe now - the dedicated
+checker bot runs as its own conversation and never steals a login in flight.

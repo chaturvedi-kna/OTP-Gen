@@ -41,6 +41,19 @@ def ask(prompt, default="", secret=False):
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="One-time login for the PRIMES Meesho userbot.")
+    parser.add_argument("--instance", default=None,
+                        help="config.json instance (e.g. tempora / vsimpro): "
+                             "its instances block is merged in first, so the "
+                             "session is written to THAT instance's "
+                             "meesho_bot.session_file.")
+    parser.add_argument("--session-file", default=None,
+                        help="explicit path for the session file (wins over "
+                             "config and instances).")
+    args = parser.parse_args()
+
     try:
         from telethon.sync import TelegramClient
         from telethon.sessions import StringSession
@@ -50,11 +63,15 @@ def main():
         return 1
 
     config = load_config()
+    if args.instance:
+        from runtime import apply_instance_overrides
+        config = apply_instance_overrides(config, args.instance)
+        print(f"Instance '{args.instance}': its config overrides are applied.")
     bot_conf = config.get("meesho_bot", {})
 
     api_id_default = bot_conf.get("api_id") or ""
     api_hash_default = bot_conf.get("api_hash") or ""
-    session_file = bot_conf.get("session_file", "userbot.session.txt")
+    session_file = args.session_file or bot_conf.get("session_file", "userbot.session.txt")
     bot_username = (bot_conf.get("bot_username") or "").strip()
 
     print("=== PRIMES Meesho userbot login ===")
