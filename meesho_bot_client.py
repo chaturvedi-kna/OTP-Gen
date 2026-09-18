@@ -897,6 +897,110 @@ class Screen:
 # Userbot
 # ---------------------------------------------------------------------------
 
+def normalize_username(username):
+    """'@SomeBot', 'SomeBot', ' somebot ' -> 'somebot' ('' for nothing)."""
+    return str(username or "").strip().lstrip("@").strip().lower()
+
+
+def _make_conversation_proxy_class(base_cls):
+    """
+    Build the "second conversation" class for `base_cls` (see
+    MeeshoBotClient._conversation_proxy).
+    """
+
+    class _ConversationProxy(base_cls):
+
+        _PROXY_FIELDS = ("_proxy_base", "_proxy_entity", "_proxy_username")
+
+        def __init__(self, base, entity, username):
+            object.__setattr__(self, "_proxy_base", base)
+            object.__setattr__(self, "_proxy_entity", entity)
+            object.__setattr__(self, "_proxy_username", username)
+
+        # -- everything shared comes from the base client -------------------
+
+        def __getattr__(self, name):
+            if name in self._PROXY_FIELDS:
+                raise AttributeError(name)
+            return getattr(object.__getattribute__(self, "_proxy_base"), name)
+
+        def __setattr__(self, name, value):
+            if name in self._PROXY_FIELDS:
+                return object.__setattr__(self, name, value)
+            if name == "_bot_entity":
+                # Never steer the shared conversation from a proxy.
+                return
+            setattr(object.__getattribute__(self, "_proxy_base"), name, value)
+
+        # -- the one thing that is NOT shared --------------------------------
+
+        @property
+        def _bot_entity(self):
+            return object.__getattribute__(self, "_proxy_entity")
+
+        # -- binding ---------------------------------------------------------
+
+        @property
+        def bound(self):
+            return object.__getattribute__(self, "_proxy_entity") is not None
+
+        @property
+        def conversation_username(self):
+            return object.__getattribute__(self, "_proxy_username")
+
+        async def _a_bind(self):
+            """
+            Resolve this conversation's entity ON the userbot loop and pin it.
+            Awaiting here is what makes a dedicated checker bot real: before
+            this, `get_entity` was called from a worker thread and (on an
+            already-running loop) threw - and the old code answered that
+            failure with the PRIMES bot's entity, so the "dedicated" check
+            ran in the login conversation (and leaked an un-awaited
+            coroutine: "coroutine '...get_entity' was never awaited").
+            """
+            base = object.__getattribute__(self, "_proxy_base")
+            name = object.__getattribute__(self, "_proxy_username")
+            entity = await base._a_bind_entity(name)
+            object.__setattr__(self, "_proxy_entity", entity)
+            return entity
+
+        @property
+        def shares_login_conversation(self):
+            """
+            True when this proxy would talk to the PRIMES LOGIN bot - i.e.
+            when the configured "dedicated" checker bot is the login bot
+            (misconfiguration) or the entity was never bound.
+            """
+            entity = object.__getattribute__(self, "_proxy_entity")
+            if entity is None:
+                return True  # unbound: the call would land on the login bot
+            base = object.__getattribute__(self, "_proxy_base")
+            name = normalize_username(object.__getattribute__(self, "_proxy_username"))
+            login = normalize_username(getattr(base, "bot_username", ""))
+            if name and name == login:
+                return True
+            return entity is getattr(base, "_bot_entity", None)
+
+        def conversation_conflict_reason(self, owner):
+            """
+            "" or why `owner` must not navigate this conversation: it is the
+            shared PRIMES chat and something else is driving it.
+            """
+            if not self.shares_login_conversation:
+                return ""  # its own chat: it can never collide
+            base = object.__getattribute__(self, "_proxy_base")
+            return base.conversation_conflict_reason(owner)
+
+        def _conversation_label(self):
+            name = normalize_username(object.__getattribute__(self, "_proxy_username"))
+            if not name:
+                return ""
+            if self.shares_login_conversation:
+                return f"@{name} - the PRIMES login bot"
+            return f"@{name} - the dedicated checker bot"
+
+    return _ConversationProxy
+
 class MeeshoBotClient:
 
     def __init__(self, config=None, log_fn=print, bot_username=None):
@@ -1041,6 +1145,23 @@ class MeeshoBotClient:
         self._bot_entity = None
         self._start_error = None
 
+        # Entities of the OTHER conversations opened on this session, keyed by
+        # normalized username (a dedicated checker bot is driven through the
+        # same Telethon account). They can only be resolved by awaiting
+        # get_entity() ON the userbot loop (see _a_bind_entity), so this cache
+        # is what the synchronous code paths read.
+        self._entity_lock = threading.Lock()
+        self._entities = {}
+
+        # Who is driving the shared PRIMES conversation right now
+        # ("login" / "prewarm" / None). The coordinator's _BotClaim sets it;
+        # a check that would navigate the SAME chat refuses to walk away from
+        # a pre-warm / login screen and says so instead (see
+        # conversation_conflict_reason).
+        self._conversation_lock = threading.RLock()
+        self._conversation_holder = None
+        self._conversation_since = 0.0
+
         # Cross-thread bookkeeping for _run's hang watchdog: the loop thread
         # bumps _last_progress whenever a step completes, and records what the
         # in-flight flow was doing in _step_note so a timeout alert can say
@@ -1173,6 +1294,8 @@ class MeeshoBotClient:
             if not await client.is_user_authorized():
                 raise MeeshoBotNotConfigured("userbot session is not authorized; re-run login_userbot.py")
             self._bot_entity = await client.get_entity(self.bot_username)
+            with self._entity_lock:
+                self._entities[normalize_username(self.bot_username)] = self._bot_entity
             self._client = client
             return True
 
@@ -2286,19 +2409,115 @@ class MeeshoBotClient:
     # -- bot number checker --------------------------------------------------
 
     def _resolve_bot_entity(self, username):
-        """Best-effort entity for a conversation on the same session."""
-        base = getattr(self, "_bot_entity", None)
-        current = getattr(self, "bot_username", "")
-        if base is not None and username and username.lstrip("@") == current.lstrip("@"):
-            return base
-        try:
-            import asyncio
-            entity = self._client.get_entity(username)
-            if asyncio.iscoroutine(entity):
-                entity = self._loop.run_until_complete(entity)
+        """
+        Cached entity for a conversation on this session, or None.
+
+        Telethon's get_entity() is a COROUTINE and the userbot loop is already
+        running in its own thread, so it can only be awaited from INSIDE that
+        loop (`_a_bind_entity`). This used to call
+        `self._loop.run_until_complete(...)`, which raises "This event loop is
+        already running" for every caller that is not the loop thread - and the
+        bare `except Exception` then returned the PRIMES bot's entity. A
+        "dedicated" checker bot therefore typed its numbers into the LOGIN
+        conversation (and leaked an un-awaited coroutine: the RuntimeWarning).
+
+        There is no safe synchronous resolution here: return the cached entity
+        when it is known, otherwise None - NEVER another bot's entity.
+        """
+        with self._entity_lock:
+            entity = self._entities.get(normalize_username(username))
+        if entity is not None:
             return entity
-        except Exception:
-            return base
+        if normalize_username(username) == normalize_username(
+                getattr(self, "bot_username", "")):
+            return getattr(self, "_bot_entity", None)
+        return None
+
+    async def _a_bind_entity(self, username):
+        """
+        Resolve `username` to a Telegram entity ON the userbot loop and cache
+        it. This is the only place `get_entity()` may be called for another
+        conversation: it is awaited, so nothing is left pending.
+        """
+        key = normalize_username(username)
+        if not key:
+            raise MeeshoBotError("Cannot open a conversation without a username")
+        with self._entity_lock:
+            cached = self._entities.get(key)
+        if cached is not None:
+            return cached
+        entity = await self._client.get_entity(username)
+        if entity is None:
+            raise MeeshoBotError(
+                f"Telegram has no conversation for '@{key}' on this account")
+        with self._entity_lock:
+            self._entities[key] = entity
+        return entity
+
+    # -- who is driving the shared PRIMES conversation -----------------------
+
+    def hold_conversation(self, owner):
+        """
+        Mark the PRIMES (login) conversation as being driven by `owner`
+        ("login" / "prewarm"). A number check that would navigate the same chat
+        refuses to walk away from that screen - see conversation_conflict_reason.
+        """
+        with self._conversation_lock:
+            self._conversation_holder = owner or None
+            self._conversation_since = time.time() if self._conversation_holder else 0.0
+
+    def release_conversation(self, owner=None):
+        """Drop the PRIMES conversation lease (any owner if `owner` is None)."""
+        with self._conversation_lock:
+            if owner is None or self._conversation_holder == owner:
+                self._conversation_holder = None
+                self._conversation_since = 0.0
+
+    @property
+    def conversation_holder(self):
+        """(owner, since) - who is driving the PRIMES conversation right now."""
+        with self._conversation_lock:
+            return self._conversation_holder, self._conversation_since
+
+    def conversation_conflict_reason(self, owner):
+        """
+        "" or a readable reason why `owner` must NOT navigate the PRIMES
+        conversation right now. Both the offer pre-warm and the number checker
+        drive the SAME Telegram chat when no dedicated checker bot is in play:
+        a check that starts while the pre-warm rerolls the offer walks the bot
+        off that screen (the offer is gone, the pre-warm fails with "no reroll
+        button") and the check itself reads a half-finished screen.
+        """
+        holder, since = self.conversation_holder
+        if not holder or holder == owner:
+            return ""
+        age = max(0.0, time.time() - since) if since else 0.0
+        held = f" (running for {age:.0f}s)" if age >= 1 else ""
+        return (
+            f"Refusing to run a number check: the PRIMES bot conversation is "
+            f"being driven by the {holder} flow{held}. A number check and the "
+            f"{holder} drive the SAME chat, so the check would walk the bot "
+            f"away from that screen - nothing was sent and the number is left "
+            f"untouched. Use a dedicated checker bot "
+            f"(checker.telegram_bot.username) so checks never share the login "
+            f"conversation."
+        )
+
+    def _conversation_label(self):
+        """Where this client's taps/text go - for logs (the PRIMES login chat)."""
+        name = normalize_username(getattr(self, "bot_username", ""))
+        return f"@{name} - the PRIMES login bot" if name else ""
+
+    def in_checker_screen(self):
+        """
+        Read-only: True when the PRIMES bot is currently showing its number
+        checker (prompt / "checking..." / result). Used to tell a pre-warm that
+        lost its offer screen apart from one that was hijacked by a check.
+        """
+        with self._flow_lock:
+            screen = self._run(self._latest_screen())
+        return screen.classify_check((), (), ()) in (
+            S_CHECK_PROMPT, S_CHECKING, S_CHECK_RESULT)
 
     def _checker_settings(self, overrides=None):
         """Resolve checker.bot config (defaults + overrides) into a plain dict."""
@@ -2392,64 +2611,66 @@ class MeeshoBotClient:
             self._progress()
             screen = await self._latest_screen()
 
+    def _conversation_proxy_class(self):
+        """The proxy class for this client's type, built once and cached."""
+        cls = self.__dict__.get("_conversation_proxy_cls")
+        if cls is None:
+            cls = _make_conversation_proxy_class(type(self))
+            self.__dict__["_conversation_proxy_cls"] = cls
+        return cls
+
     def _conversation_proxy(self, username):
         """
-        Return a light proxy of THIS client whose every mutation/look-up is on
-        the base client EXCEPT the conversation pointer `_bot_entity`, which is
-        pinned to `username`. A checker conversation can then run against the
-        second bot without ever touching an in-flight login conversation that
-        reads `_bot_entity` (the previous swap-and-restore was racy).
+        A client that shares EVERYTHING with this one (Telethon session,
+        config, flow locks, watchdog state, referral bookkeeping) except the
+        conversation pointer `_bot_entity`, which is pinned to the second bot.
+        A checker conversation then runs against that bot without ever
+        touching an in-flight login conversation.
+
+        It is a real subclass, not a thin `__getattr__` wrapper: with a
+        wrapper, `proxy._a_check_registration()` resolved to the BASE client's
+        bound method, so the coroutine ran with `self` = the login client and
+        read `self._bot_entity` from there - the check was typed into the
+        PRIMES conversation no matter what the proxy pinned.
+
+        The entity is NOT resolved here: get_entity() is a coroutine and this
+        runs on a coordinator/worker thread, not on the userbot loop. Call
+        `proxy._a_bind()` inside the loop first (CheckerBotClient does) - an
+        unbound proxy refuses to check instead of silently falling back to the
+        PRIMES conversation.
         """
-        base = self
-        entity = base._resolve_bot_entity(username) or None
+        cls = self._conversation_proxy_class()
+        return cls(self, self._resolve_bot_entity(username), username)
 
-        class _ConversationProxy:
-            __slots__ = ("_base", "_entity")
-
-            def __init__(self, base, entity):
-                object.__setattr__(self, "_base", base)
-                object.__setattr__(self, "_entity", entity)
-
-            def __getattr__(self, name):
-                if name == "_bot_entity":
-                    return object.__getattribute__(self, "_entity")
-                return getattr(self._base, name)
-
-            def __setattr__(self, name, value):
-                if name == "_bot_entity":
-                    return  # never steer the shared conversation from a proxy
-                setattr(self._base, name, value)
-
-        return _ConversationProxy(base, entity)
 
     async def _a_check_registration(self, number, overrides=None, _bot_username=None):
         """
-        Ask the PRIMES bot whether `number` is registered on Meesho.
+        Ask the bot whether `number` is registered on Meesho.
+
+        `self` may be a conversation proxy bound to a DEDICATED checker bot
+        (see _conversation_proxy / CheckerBotClient); the check then runs in
+        that second conversation and leaves the PRIMES login chat untouched.
 
         Returns {"success": True, "is_registered": bool, "source": "bot", ...}
         - the same shape the API checker returns, so callers can treat both
         the same way. Raises MeeshoBotError subclasses when no verdict can be
         read; the caller (checker_router) turns those into CheckerUnavailable.
         """
-        if _bot_username:
-            # Dedicated checker bot: a separate conversation on the same
-            # Telethon session - resolve it instead of the PRIMES login bot.
-            previous = self._bot_entity
-            self._bot_entity = self._resolve_bot_entity(_bot_username) or previous
-            if self._bot_entity is None:
-                self._bot_entity = previous
-                raise MeeshoBotError(
-                    f"Could not resolve the dedicated checker bot @{_bot_username.lstrip('@')} on this session"
-                )
+        # A check that drives the SHARED login conversation must not run while
+        # the pre-warm / a login owns it: both would tap in the same chat.
+        conflict = self.conversation_conflict_reason("check")
+        if conflict:
+            raise MeeshoBotError(conflict)
         conf = self._checker_settings(overrides)
         digits = self._ten_digit(number)
         if len(digits) != 10:
             raise MeeshoBotError(f"Not a usable 10-digit number: {number!r}")
 
+        where = self._conversation_label()
         self._note(f"checking {digits} with the bot checker"
-                   + (_bot_username and f" (@{_bot_username.lstrip('@')})" or ""))
+                   + (f" ({where})" if where else ""))
         self._log(f"[MEESHO-BOT] Bot checker: checking {digits} "
-                  f"(entry: {conf['entry']}).")
+                  f"(entry: {conf['entry']}){(' in ' + where) if where else ''}.")
 
         screen = await self._latest_screen()
         button = None
@@ -2585,6 +2806,11 @@ class MeeshoBotClient:
         verdicts are keyed BY NUMBER because the bot's reply is not ordered.
         Raises MeeshoBotError subclasses when no/all verdicts can be read.
         """
+        # Same guard as the single check: never navigate the shared PRIMES
+        # chat while the pre-warm / a login is driving it.
+        conflict = self.conversation_conflict_reason("check")
+        if conflict:
+            raise MeeshoBotError(conflict)
         conf = self._checker_settings(overrides)
         targets = []
         seen = set()
@@ -2596,9 +2822,10 @@ class MeeshoBotClient:
         if not targets:
             raise MeeshoBotError("check many: no usable 10-digit numbers given")
 
+        where = self._conversation_label()
         self._note(f"checking {len(targets)} numbers with the bot checker")
         self._log(f"[MEESHO-BOT] Bot checker: batch of {len(targets)} "
-                  f"(entry: {conf['entry']}).")
+                  f"(entry: {conf['entry']}){(' in ' + where) if where else ''}.")
 
         screen = await self._latest_screen()
         button = None
@@ -2810,6 +3037,10 @@ class CheckerBotClient:
     def __init__(self, base_client, username, conf=None, log_fn=None):
         self._base = base_client
         self._log_fn = log_fn or base_client._log
+        import threading as _threading
+        # Own lock: a checker conversation runs independently of the login
+        # conversation, so it never waits behind a login flow.
+        self._checker_lock = _threading.RLock()
         username = (username or "").strip()
         if not username.startswith("@"):
             username = "@" + username
@@ -2847,6 +3078,41 @@ class CheckerBotClient:
         # access, logging, referral state, ...) is taken from the base client.
         return getattr(self._base, name)
 
+    @property
+    def shares_login_conversation(self):
+        """
+        True when the configured "dedicated" checker bot IS the PRIMES login
+        bot (same @handle). Then there is no second conversation and every
+        check has to respect the login claim like the PRIMES checker does.
+        """
+        return normalize_username(self.bot_username) == normalize_username(
+            getattr(self._base, "bot_username", ""))
+
+    def _bound_proxy(self):
+        """
+        A proxy pinned to the DEDICATED checker bot's conversation.
+
+        The entity is bound ON the userbot loop (get_entity is a coroutine and
+        the loop already runs in its own thread - resolving it from here used
+        to raise and silently fall back to the PRIMES bot entity, so the
+        "dedicated" check was typed into the login conversation and collided
+        with a running login / offer pre-warm). A binding failure is an error,
+        never a reason to use the login conversation.
+        """
+        username = self.bot_username
+        proxy = self._base._conversation_proxy(username)
+        try:
+            proxy._run(proxy._a_bind())
+        except Exception as exc:
+            raise MeeshoBotError(
+                f"Could not open the dedicated checker conversation with "
+                f"@{normalize_username(username)} on this session ({exc}). "
+                f"Nothing was sent - the PRIMES login bot was NOT used as a "
+                f"stand-in. Check checker.telegram_bot.username (the bot's "
+                f"@handle) and that the account has started that bot."
+            ) from exc
+        return proxy
+
     # -- checks against the DEDICATED bot -----------------------------------
 
     def check_registration(self, number, overrides=None):
@@ -2857,18 +3123,8 @@ class CheckerBotClient:
             )
         merged = dict(self.conf)
         merged.update(overrides or {})
-        # Own flow lock: a checker conversation runs independently of the
-        # login conversation, so it never waits behind a login flow.
-        checker_lock = self.__dict__.get("_checker_lock")
-        if checker_lock is None:
-            import threading
-            checker_lock = threading.RLock()
-            self.__dict__["_checker_lock"] = checker_lock
-
-        client = self._base
-        username = self.bot_username
-        with checker_lock:
-            proxy = client._conversation_proxy(username)
+        with self._checker_lock:
+            proxy = self._bound_proxy()
             return proxy._run(
                 proxy._a_check_registration(number, overrides=merged)
             )
@@ -2892,15 +3148,8 @@ class CheckerBotClient:
             )
         merged = dict(self.conf)
         merged.update(overrides or {})
-        checker_lock = self.__dict__.get("_checker_lock")
-        if checker_lock is None:
-            import threading
-            checker_lock = threading.RLock()
-            self.__dict__["_checker_lock"] = checker_lock
-        client = self._base
-        username = self.bot_username
-        with checker_lock:
-            proxy = client._conversation_proxy(username)
+        with self._checker_lock:
+            proxy = self._bound_proxy()
             return proxy._run(
                 proxy._a_check_registration_many(numbers, overrides=merged)
             )

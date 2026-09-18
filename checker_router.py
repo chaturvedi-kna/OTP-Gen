@@ -98,6 +98,11 @@ _FALLBACK_BOOLS = ("is_down", "timeout", "network", "http_5xx", "auth",
                    "rate_limit", "unknown")
 
 
+def _norm_username(value):
+    """'@SomeBot', 'SomeBot', ' somebot ' -> 'somebot' ('' for nothing)."""
+    return str(value or "").strip().lstrip("@").strip().lower()
+
+
 def normalize_mode(value, default=MODE_API):
     """Map a config/CLI value onto one of api / bot / auto."""
     if value is None:
@@ -301,7 +306,8 @@ class BotChecker:
     def describe_preferred(self):
         """One-line summary for logs/status."""
         if not self.has_preferred:
-            return "no dedicated checker bot"
+            return ("no dedicated checker bot configured "
+                    "(checker.telegram_bot.username)")
         if self.preferred_ready:
             return f"{self._preferred_name} (@{self._preferred_username}) ready"
         return (f"{self._preferred_name} (@{self._preferred_username or '?'}) "
@@ -448,10 +454,47 @@ class BotChecker:
                 "Batched checker request timed out waiting for the bot's reply.")
         return batch.result_for(my_key)
 
+    def preferred_shares_login(self, client):
+        """
+        True when the "dedicated" checker bot is really the PRIMES LOGIN bot
+        (same @handle configured). Then there is no second conversation, so
+        the check must take the login claim like the PRIMES checker does -
+        otherwise it taps in the same chat as a running login / offer pre-warm.
+        """
+        if client is None:
+            return False
+        try:
+            return bool(client.shares_login_conversation)
+        except Exception:
+            return _norm_username(self._preferred_username) == _norm_username(
+                getattr(self.client, "bot_username", ""))
+
+    def _log_conversation_conflict(self):
+        """
+        Say it out loud when a check and the offer pre-warm/login are about to
+        fight over the same PRIMES chat: both drive ONE conversation, so the
+        check waits for it (or is skipped) instead of walking the bot away.
+        """
+        client = self.client
+        if client is None:
+            return
+        holder, since = getattr(client, "conversation_holder", (None, 0.0)) or (None, 0.0)
+        if not holder or holder == "check":
+            return
+        age = max(0.0, time.time() - since) if since else 0.0
+        held = f" ({age:.0f}s so far)" if age >= 1 else ""
+        self._log(
+            f"Checker: the PRIMES bot chat is busy with the {holder} flow{held}. "
+            f"A number check and the {holder} drive the SAME conversation, so "
+            f"this check waits for it instead of tapping over it (a dedicated "
+            f"checker bot - checker.telegram_bot - would avoid the wait).")
+
     def check(self, number, service=None):
         # Dedicated checker bot first: it has its own conversation and never
-        # touches the PRIMES login flow, so a mid-flight OTP is never at risk.
-        if self.preferred_ready:
+        # touches the PRIMES login flow, so a mid-flight OTP is never at risk
+        # (unless it is configured to BE the login bot - then there is no
+        # second conversation and the claim below has to guard it).
+        if self.preferred_ready and not self.preferred_shares_login(self.preferred_client):
             try:
                 return self.check_preferred_batched(number, service=service)
             except CheckerError:
@@ -473,6 +516,7 @@ class BotChecker:
             raise CheckerBotBusy(
                 f"PRIMES bot checker is not available for this check: {reason}"
             )
+        self._log_conversation_conflict()
         if self._claim is None:
             return self._run_check(number)
         try:
@@ -672,7 +716,9 @@ class CheckerRouter:
             return f"PRIMES bot only ({state})"
         bot_state = "ready" if self.bot_ready else f"NOT ready ({self.bot.unavailable_reason})"
         api_state = f"{self.key_count} key(s)" if self.api_ready else "no API keys"
-        return f"AUTO - API first ({api_state}), PRIMES bot fallback ({bot_state})"
+        return (f"AUTO - API first ({api_state}), dedicated checker bot "
+                f"({self.bot.describe_preferred()}), PRIMES bot fallback "
+                f"({bot_state})")
 
     # -- checking ------------------------------------------------------------
 
@@ -682,12 +728,43 @@ class CheckerRouter:
         return data
 
     def _bot_check(self, number, reason, api_error=None):
-        self._log(f"Checker: using the PRIMES bot checker for {number} ({reason})")
+        self._log(self._bot_check_message(number, reason))
         data = self.bot.check(number)
         data["source"] = "bot"
+        if data.get("checker_username"):
+            # The dedicated checker bot answered in its own conversation.
+            self._count("checker_dedicated_checks")
         if api_error is not None:
             data["api_error"] = str(api_error)
         return data
+
+    @property
+    def bot_checker_name(self):
+        """
+        Which bot answers a bot check right now: "the dedicated checker bot
+        @x" (checker.telegram_bot) or "the PRIMES bot checker".
+        """
+        if self.bot.preferred_ready and not self.bot.preferred_shares_login(
+                self.bot.preferred_client):
+            return f"the dedicated checker bot @{self.bot._preferred_username or '?'}"
+        return "the PRIMES bot checker"
+
+    def _bot_check_message(self, number, reason):
+        """
+        "who is answering this check and why" - a bare "using the PRIMES bot
+        checker" hid that the DEDICATED checker bot was the one answering
+        (and, before the entity fix, that it was answering in the PRIMES
+        conversation). Say which bot, and - when the dedicated one is
+        configured but unusable - why.
+        """
+        why = ""
+        if (self.bot.has_preferred
+                and self.bot_checker_name == "the PRIMES bot checker"):
+            why = (f" - the dedicated checker bot "
+                   f"@{self.bot._preferred_username or '?'} cannot answer "
+                   f"({self.bot.preferred_unavailable_reason})")
+        return (f"Checker: using {self.bot_checker_name} for {number} "
+                f"({reason}){why}")
 
     def check(self, service, number):
         """
@@ -728,15 +805,17 @@ class CheckerRouter:
                 raise
             if not self.bot_ready:
                 self._log(
-                    f"Checker API failed ({reason}: {api_exc}) and the PRIMES bot "
-                    f"checker is not available ({self.bot.unavailable_reason}); "
-                    f"cancelling the number as before."
+                    f"Checker API failed ({reason}: {api_exc}) and the bot "
+                    f"checker is not available "
+                    f"({self.bot.unavailable_reason}); cancelling the number "
+                    f"as before."
                 )
                 raise
             cooldown = self._enter_cooldown()
             self._log(
-                f"Checker API failed ({reason}: {api_exc}); falling back to the "
-                f"PRIMES bot checker for this and the next {cooldown:.0f}s."
+                f"Checker API failed ({reason}: {api_exc}); falling back to "
+                f"{self.bot_checker_name} for this and the next "
+                f"{cooldown:.0f}s."
             )
             self._count("checker_fallbacks")
             try:
