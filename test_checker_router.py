@@ -338,6 +338,44 @@ def test_auto_cooldown():
     check("cooldown 0: api retried on the next check", len(api.calls) == 2, api.calls)
 
 
+def test_bot_check_needed():
+    """
+    bot_check_needed tells the coordinator whether the PRIMES bot has to be able
+    to reach its main menu for the next number check - which is what decides
+    whether a failed Change Number resets the flow there or keeps it in place
+    (no menu restart, no offer reroll).
+    """
+    router, _api, _bot, _stats = make_router(MODE_API)
+    check("bot_check_needed: api mode -> False", router.bot_check_needed is False)
+    check("bot_check_needed: api mode says the API answers",
+          "checker API" in router.bot_check_reason, router.bot_check_reason)
+
+    router, _api, _bot, _stats = make_router(MODE_BOT)
+    check("bot_check_needed: bot mode -> True", router.bot_check_needed is True)
+    check("bot_check_needed: bot mode says every check uses the bot",
+          "PRIMES bot" in router.bot_check_reason, router.bot_check_reason)
+
+    router, _api, _bot, _stats = make_router(MODE_AUTO)
+    check("bot_check_needed: auto with a healthy API -> False",
+          router.bot_check_needed is False)
+
+    router, _api, _bot, _stats = make_router(MODE_AUTO, keys=0)
+    check("bot_check_needed: auto without API keys -> True",
+          router.bot_check_needed is True)
+    check("bot_check_needed: no-keys reason mentions the keys",
+          "keys" in router.bot_check_reason, router.bot_check_reason)
+
+    router, _api, _bot, _stats = make_router(MODE_AUTO)
+    router._enter_cooldown()
+    check("bot_check_needed: auto while the API cools down -> True",
+          router.bot_check_needed is True)
+    check("bot_check_needed: cooldown reason mentions the cooldown",
+          "cooling down" in router.bot_check_reason, router.bot_check_reason)
+    router._clear_cooldown()
+    check("bot_check_needed: auto again once the API answers -> False",
+          router.bot_check_needed is False)
+
+
 def test_describe():
     router, _, _, _ = make_router(MODE_API, keys=2)
     check("describe: api", "API only" in router.describe() and "2 key(s)" in router.describe(),
@@ -388,6 +426,7 @@ def main():
     test_auto_bot_unavailable()
     test_auto_no_keys()
     test_auto_cooldown()
+    test_bot_check_needed()
     test_describe()
     test_bot_checker_adapter()
 

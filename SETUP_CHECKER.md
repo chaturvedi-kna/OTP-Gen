@@ -189,6 +189,13 @@ buttons.
   login flow (the second caller waits its turn).
 * A check that starts while the bot sits on a leftover login/OTP screen
   resets to the main menu first.
+* Because a check ends at the main menu, the bot checker is the only reason the
+  login flow must be able to fall back to it: with `mode: "api"` (or `"auto"`
+  while the API answers) an unrecovered **Change Number** leaves the bot
+  in-flow instead of restarting from the menu
+  (`meesho_bot.reset_to_menu_on_change_failure`, see SETUP_MEESHO_BOT.md).
+  `/checker` reports which of the two applies right now, and a check that runs
+  after a login flow simply resets to the menu itself.
 * Failure modes are `CheckerUnavailable` at the router level: the existing
   "cancel + refund tally" safety net is unchanged.
 
@@ -267,4 +274,5 @@ python test_checker_client.py               # API client: 429s, retries, error t
 python test_checker_router.py               # modes, fallback triggers, cooldown
 python test_bot_checker_flow.py             # bot checker screens + safety
 python test_checker_mode_integration.py     # worker/run/Telegram wiring
+python test_change_number_recovery.py       # which mode may keep the bot in-flow
 ```

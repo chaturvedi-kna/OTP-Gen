@@ -53,6 +53,57 @@ helper (`python meesho_bot_client.py <number>`) and the safety rules are in
    during recovery is answered the same way, so a paid number is never typed
    into the referral field or lost behind that screen
 
+## Change Number recovery (no needless menu restart)
+
+Getting back to the number prompt is much cheaper than restarting the flow
+(**Add Account → Login with Number → Normal → offer rerolls**), so the recovery
+works hard — but bounded — before it gives up:
+
+1. **The prompt is recognised, not guessed.** `classify()`'s offer heuristics
+   (`Try Another Offer` button, "10-digit mobile … continue") are only one way
+   in: a screen that asks for the mobile number to link is accepted as the
+   prompt as well, so a bot revision with different copy no longer ends the
+   recovery with *"Expected number prompt after Change Number, got unknown"*.
+   Unknown copy can be taught with `meesho_bot.number_prompt_hints`. The
+   **⚠️ Failed to fetch offer / 🔄 Try Again** variant is never a prompt (its
+   price lines are a decoy — it is rerolled), and the bot **checker's** "send
+   the number" prompt is never mistaken for the login prompt on a cold read.
+2. **An ignored tap is retried** (`change_number_retries`, default 2 extra
+   taps), each wait bounded by `change_number_timeout_seconds` and the whole
+   recovery by `change_number_budget_seconds` — never the full
+   `step_timeout_seconds` on a screen that will not move.
+3. **Already at the prompt?** Nothing is tapped: the coordinator asks read-only
+   (`at_number_prompt()`) first, and a recovery that reported failure is
+   re-read once before it is acted on.
+4. **Only a real dead end resets the flow — and only when the menu is needed.**
+   `reset_to_menu_on_change_failure` decides:
+
+   | Value | Behaviour |
+   |---|---|
+   | `"auto"` (default) | Reset to the main menu **only when the bot checker is needed** for the next number check (`checker.mode: "bot"`, or `"auto"` while the checker API is down / cooling down / has no keys — the bot checker works from the menu, so the reset costs nothing extra). **With the checker API answering, the bot is left in-flow**: the next login reuses the number prompt it is sitting on instead of paying for a menu restart and a fresh offer reroll. |
+   | `"always"` | Always reset (the old behaviour). |
+   | `"never"` | Never reset from the recovery. |
+
+   Leaving the bot in-flow is safe: when the next login cannot reuse what is on
+   screen it walks back to the main menu itself, exactly as before.
+5. **A prompt the bot is already on is reused** by the next login
+   (`reuse_number_prompt`, default `true`): no menu walk, and an over-target
+   price is rerolled **in place** instead of from a fresh flow. An unpriced
+   prompt is only reused when its wording is an explicit number prompt or it can
+   be rerolled, so `target_upi_price` keeps being enforced.
+
+`/status` counts both outcomes (`Change-number: N (menu resets: X | kept
+in-flow: Y)`), and every **🔄 Changing number** notification says which one
+happened and why.
+
+Verified offline (no Telegram, no network — a fake bot speaks the screens):
+
+```bash
+python test_primes_referral_flow.py     # flow + Change Number recovery screens
+python test_change_number_recovery.py   # the reported bug, end to end
+python test_primes_coordinator_integration.py
+```
+
 ## Referral link
 
 Paste your Meesho referral link once and it is given to the bot whenever the
@@ -164,6 +215,13 @@ auto mode) instead of being lost.
      "target_upi_price": 47,
      "max_offer_rerolls": 30,
      "max_change_number": 5,
+     "change_number_retries": 2,
+     "change_number_timeout_seconds": 0,
+     "change_number_budget_seconds": 0,
+     "change_number_variant_taps": 3,
+     "number_prompt_hints": [],
+     "reuse_number_prompt": true,
+     "reset_to_menu_on_change_failure": "auto",
      "step_timeout_seconds": 60,
      "flow_timeout_seconds": 0,
      "human_delay_seconds": [1.0, 2.5]
@@ -184,8 +242,25 @@ auto mode) instead of being lost.
    default). Set it from Telegram with `/referral <link>` while the tool runs —
    no config edit or restart needed.
 
+   **Change Number recovery knobs** (see *Change Number recovery* above):
+   `change_number_retries` (default **2**) is how many extra taps are tried when
+   the bot ignores **Change Number**; `change_number_timeout_seconds`
+   (`0` = auto: `min(step_timeout, 20)`) is the per-wait budget for the number
+   prompt; `change_number_budget_seconds` (`0` = auto: 30–45s, whatever is
+   closest to `step_timeout_seconds`) caps the whole recovery;
+   `change_number_variant_taps` (default **3**) bounds
+   **🔄 Try Again** variant taps during it. `number_prompt_hints` adds wording
+   for the login number prompt when your bot revision's copy is not recognised
+   (the recovery error prints the screen text and names this list).
+   `reuse_number_prompt` (default **true**) lets a login send its number from a
+   prompt the bot is already on instead of restarting from the main menu, and
+   `reset_to_menu_on_change_failure` (`"auto"` / `"always"` / `"never"`) decides
+   whether an unrecovered Change Number drops the bot back to the menu — by
+   default only when the **bot checker** needs the menu.
+
 6. Counters (`accounts_linked`, `otp_wrong`, `otp_expired`, `user_blocked`,
-   `otp_timeout`, `change_number`, `offer_rerolls`, `referral_pasted/skipped`,
+   `otp_timeout`, `change_number`, `bot_menu_resets` / `bot_flow_kept`,
+   `offer_rerolls`, `referral_pasted/skipped`,
    `checker_api_checks` / `checker_bot_checks` / `checker_fallbacks`,
    `refunds_verified/missing`, `late_otp_salvaged`) persist in `stats.json` and
    are shown via `/status` and
@@ -208,5 +283,10 @@ auto mode) instead of being lost.
 | Unknown/unexpected screen | alert with the screen text **and the buttons**, cancel the number (refund verified — nothing was submitted), reset flow |
 | Telegram side hangs (no screen/tap progress for `flow_timeout_seconds`) | ⏱️ `MeeshoBotTimeout` — alert (with the stage it hung at), cancel the number (refund verified — the tally flags it if the number had already reached the bot), reset flow, **automation continues** |
 | Change Number used > `max_change_number` in a row | reset to main menu (full flow restart) |
+| Change Number tap ignored by the bot | retried (`change_number_retries` extra taps) inside `change_number_timeout_seconds` / `change_number_budget_seconds` — no menu restart |
+| Change Number lands on a number prompt with copy `classify()` does not know | recognised as the prompt (built-in wording + `number_prompt_hints`) → the replacement number is sent from it: no "got unknown" failure, no menu restart, no offer reroll |
+| Change Number unrecoverable (dead-end screen) | `reset_to_menu_on_change_failure`: `"auto"` resets to the main menu **only when the bot checker needs it** (`checker.mode: "bot"`, or `"auto"` while the API is down / cooling down / keyless); with the checker API answering the bot is **left in-flow** and the next login reuses its prompt (or walks back to the menu itself if the bot really is lost) |
+| Bot left the login flow by itself (main menu / link choice / login mode) | reported as `needs_full_flow` — no extra reset, the next number runs the full flow |
+| Bot no longer on the remembered prompt when a number is ready (e.g. a bot check reset it to the menu) | read-only re-check → the full flow runs instead of typing into the wrong screen; the number is **not** cancelled for it |
 | Change Number recovery | never shows the referral screen; the replacement number is sent only at the number prompt |
 | Refund not credited | 🛑 stop everything + critical alert; the bot is **left on its OTP screen** so the OTP can still be entered manually if it shows up |

@@ -20,6 +20,8 @@ COUNTERS = {
     "user_blocked": 0,         # Meesho blocked / banned the number during signup
     "otp_timeout": 0,          # no OTP arrived within the wait window
     "change_number": 0,        # bot "Change Number" recoveries used
+    "bot_menu_resets": 0,      # unrecovered Change Numbers that reset the bot to the menu
+    "bot_flow_kept": 0,        # unrecovered Change Numbers where the bot stayed in-flow
     "numbers_cancelled": 0,    # provider activations cancelled
     "numbers_consumed": 0,     # numbers kept/charged (SMS delivered, no refund possible)
     "refunds_verified": 0,     # cancellations where the balance tally matched

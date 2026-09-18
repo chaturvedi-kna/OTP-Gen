@@ -134,6 +134,35 @@ BLOCKED = Screen(
     "🚫 This number is blocked on Meesho. Please use another number.",
 )
 
+# A number prompt whose copy/buttons classify() does NOT recognise as an offer
+# (no "Try Another Offer" button, no "10-digit mobile ... continue"): this is
+# the screen that used to end the Change Number recovery with
+# "Expected number prompt after Change Number, got unknown" and a full restart
+# from the main menu.
+PROMPT_ALT_COPY = Screen(
+    "📱 Enter the mobile number you want to link\n\n"
+    "UPI · ₹45\n\n"
+    "Make sure the number is active - the OTP is sent right away.",
+    [["❌ Cancel"]],
+)
+
+# A prompt only recognizable through meesho_bot.number_prompt_hints.
+PROMPT_LOCAL_COPY = Screen("📱 Apna number daalein", [["❌ Cancel"]])
+
+# A dead end that is neither a prompt nor a known screen: the recovery must
+# give up (bounded) instead of sitting on it forever or silently resetting.
+BROKEN_SCREEN = Screen(
+    "⚠️ Something went wrong on our side.\n\nPlease try again later.",
+    [["🏠 Main Menu"]],
+)
+
+# The bot CHECKER's number prompt: same "send the number" wording, no offer
+# marker - it must never be mistaken for the login prompt by a cold read.
+CHECK_PROMPT_ONLY = Screen(
+    "📱 Send the number you want to check",
+    [["🏠 Main Menu"]],
+)
+
 
 # ---------------------------------------------------------------------------
 # Fake Telethon
@@ -174,7 +203,8 @@ class FakeBot:
                  offer_prices=(60, 45), referral_reask=False,
                  retry_after=None, variant_first=False,
                  otp_transition="instant", setup_interstitial=False,
-                 code_transition="instant"):
+                 code_transition="instant", change_number_screen=None,
+                 ignore_change_taps=0):
         self.tapped = []
         self.taps = self.tapped  # alias used by FakeMessage
         self.messages = []
@@ -205,6 +235,15 @@ class FakeBot:
         self._pending_linked = 0  # polls that still show the verifying transient
         self._pending_offer = None  # "setup" = show the offer on the next poll
         self.setup_interstitial = setup_interstitial
+        # Change Number scripting: the screen it answers with (default: the
+        # regular offer) and how many taps it ignores first.
+        self.change_number_screen = change_number_screen
+        self.ignore_change_taps = ignore_change_taps
+        self.change_taps = 0
+        self.ignored_change_taps = 0
+        # How many times the flow was hard-reset with /start, and how many full
+        # menu walks (Add Account) it paid for.
+        self.starts = 0
         self._push(MAIN_MENU)
 
     # -- helpers ----------------------------------------------------------
@@ -260,8 +299,16 @@ class FakeBot:
             else:
                 self._edit_last(self._offer_screen())
         elif "Change Number" in label:
+            self.change_taps += 1
+            if self.ignore_change_taps > 0:
+                # The bot ignores the tap and re-posts its OTP screen: the
+                # recovery must retry instead of giving up on the flow.
+                self.ignore_change_taps -= 1
+                self.ignored_change_taps += 1
+                self._edit_last(OTP_WAIT)
+                return
             self.state = "offer"
-            self._edit_last(self._offer_screen())
+            self._edit_last(self.change_number_screen or self._offer_screen())
         elif "Try Another Offer" in label:
             self.reroll_count += 1
             if self.offer_prices:
@@ -309,6 +356,7 @@ class FakeBot:
                 self._push(REFERRAL_ACCEPTED)
             return
         if stripped.startswith("/start"):
+            self.starts += 1
             self.state = "menu"
             self._push(MAIN_MENU)
             return
@@ -388,7 +436,8 @@ class FakeTelegramClient:
 def build_client(referral_link="", referral_script="save",
                  referral_failure_action="stop", retry_after=None,
                  variant_first=False, otp_transition="instant",
-                 setup_interstitial=False, code_transition="instant", **kwargs):
+                 setup_interstitial=False, code_transition="instant",
+                 change_number_screen=None, ignore_change_taps=0, **kwargs):
     config = {
         "meesho_bot": {
             "enabled": True,
@@ -410,7 +459,9 @@ def build_client(referral_link="", referral_script="save",
                   retry_after=retry_after, variant_first=variant_first,
                   otp_transition=otp_transition,
                   setup_interstitial=setup_interstitial,
-                  code_transition=code_transition)
+                  code_transition=code_transition,
+                  change_number_screen=change_number_screen,
+                  ignore_change_taps=ignore_change_taps)
     client = MeeshoBotClient(config, log_fn=lambda *_: None)
     client._client = FakeTelegramClient(bot)
     client._bot_entity = "@primesbot"
@@ -990,6 +1041,287 @@ def scenario_screen_parsing():
           Screen("Choose login mode", [["Normal"], ["Auto"]]).referral_skip_button() is None)
 
 
+# ---------------------------------------------------------------------------
+# Change Number recovery: getting back to the number prompt without paying for
+# a main-menu restart (Add Account -> Login with Number -> Normal -> rerolls)
+# ---------------------------------------------------------------------------
+
+def menu_pushes(bot):
+    """How many times the main menu was posted (a /start reset adds one)."""
+    return sum(1 for m in bot.messages if m.text == MAIN_MENU.text)
+
+
+def scenario_number_prompt_recognition():
+    """
+    The recognition behind the recovery: a regular offer, a revision copy
+    classify() reports as "unknown", and the screens that must never be typed
+    into.
+    """
+    check("prompt: a regular offer is the number prompt",
+          OFFER_45.classify() == "offer" and OFFER_45.looks_like_number_prompt(),
+          OFFER_45.classify())
+    check("prompt: revision copy classify() does not know is still the prompt",
+          PROMPT_ALT_COPY.classify() == "unknown"
+          and PROMPT_ALT_COPY.looks_like_number_prompt(),
+          PROMPT_ALT_COPY.classify())
+    check("prompt: revision copy also passes the strict (offer-marker) read",
+          PROMPT_ALT_COPY.looks_like_number_prompt(require_offer_marker=True))
+    check("prompt: a configured hint recognizes an otherwise unknown copy",
+          not PROMPT_LOCAL_COPY.looks_like_number_prompt()
+          and PROMPT_LOCAL_COPY.looks_like_number_prompt(extra_hints=("daalein",)),
+          PROMPT_LOCAL_COPY.classify())
+    check("prompt: the 'Failed to fetch offer' variant is NOT a prompt",
+          not OFFER_RETRY.looks_like_number_prompt()
+          and not OFFER_RETRY.looks_like_number_prompt(require_offer_marker=True),
+          OFFER_RETRY.classify())
+    check("prompt: the bot checker's prompt is NOT a prompt on a cold read",
+          not CHECK_PROMPT_ONLY.looks_like_number_prompt(require_offer_marker=True))
+    check("prompt: OTP / linked / menu / blocked / transient screens are not prompts",
+          not any(screen.looks_like_number_prompt() for screen in
+                  (OTP_WAIT, LINKED, MAIN_MENU, BLOCKED, SENDING_OTP,
+                   VERIFYING, SETTING_UP, LINK_CHOICE, LOGIN_MODE)))
+    check("prompt: the referral screens are not number prompts",
+          not REFERRAL_ASK.looks_like_number_prompt()
+          and not REFERRAL_SET.looks_like_number_prompt())
+
+
+def scenario_change_number_unrecognised_prompt_copy():
+    """
+    The reported failure: the bot answers Change Number with a number prompt
+    whose copy classify() does not know ("got unknown"). It must be accepted as
+    the prompt - no main-menu restart, no offer reroll - and the replacement
+    number must go out from there.
+    """
+    client, bot = build_client(referral_link=None, referral_script="absent",
+                               change_number_screen=PROMPT_ALT_COPY)
+    client.prepare_login("9876543210")
+    menus_before = menu_pushes(bot)
+    taps_before = list(bot.tapped)
+
+    res = client.change_number(None)
+    check("alt copy: Change Number reaches the prompt",
+          res["stage"] == "prompt", res)
+    check("alt copy: one tap was enough", bot.change_taps == 1, bot.change_taps)
+    check("alt copy: bot NOT reset to the main menu",
+          menu_pushes(bot) == menus_before, [m.text[:24] for m in bot.messages])
+    check("alt copy: only the Change Number tap was added",
+          bot.tapped == taps_before + ["\U0001f504 Change Number"], bot.tapped)
+
+    rerolls_before = bot.reroll_count
+    res2 = client.continue_with_number("9876543231")
+    check("alt copy: replacement number sent from the prompt",
+          bot.sent_numbers[-1] == "9876543231", bot.sent_numbers)
+    check("alt copy: OTP screen reached", res2["stage"] == "otp_sent", res2)
+    check("alt copy: no offer reroll for the replacement",
+          res2.get("rerolls", 0) == 0 and bot.reroll_count == rerolls_before,
+          f"res={res2} rerolls={bot.reroll_count} (was {rerolls_before})")
+    check("alt copy: prompt reuse flagged on the change-number path",
+          res2.get("upi") == 45.0, res2)
+
+
+def scenario_change_number_tap_ignored_then_retried():
+    """A Change Number tap the bot ignores is retried, not abandoned."""
+    client, bot = build_client(referral_link=None, referral_script="absent",
+                               ignore_change_taps=1, change_number_retries=2)
+    client.prepare_login("9876543210")
+    menus_before = menu_pushes(bot)
+
+    res = client.change_number(None)
+    check("ignored tap: retried and reached the prompt",
+          res["stage"] == "prompt", res)
+    check("ignored tap: the bot ignored the first tap",
+          bot.ignored_change_taps == 1, bot.ignored_change_taps)
+    check("ignored tap: exactly two Change Number taps",
+          bot.change_taps == 2, bot.change_taps)
+    check("ignored tap: no main-menu reset",
+          menu_pushes(bot) == menus_before, menu_pushes(bot))
+
+    res2 = client.continue_with_number("9876543232")
+    check("ignored tap: replacement number sent",
+          bot.sent_numbers[-1] == "9876543232", bot.sent_numbers)
+    check("ignored tap: OTP screen reached", res2["stage"] == "otp_sent", res2)
+
+
+def scenario_change_number_bot_left_the_flow():
+    """
+    The bot dropped out of the login flow by itself (its OTP prompt expired, a
+    manual /start): report needs_full_flow instead of raising - it is already
+    where a full flow starts, so nothing has to be reset.
+    """
+    client, bot = build_client(referral_link=None, referral_script="absent")
+    client.prepare_login("9876543210")
+    sent_before = list(bot.sent_numbers)
+    menus_before = menu_pushes(bot)
+
+    bot.state = "menu"
+    bot._push(MAIN_MENU)
+    res = client.change_number(None)
+    check("left flow: reports needs_full_flow",
+          res["stage"] == "needs_full_flow", res)
+    check("left flow: nothing typed into the menu",
+          bot.sent_numbers == sent_before, bot.sent_numbers)
+    check("left flow: no /start reset on top of it",
+          menu_pushes(bot) == menus_before + 1, menu_pushes(bot))
+    check("left flow: no Change Number tap on the menu",
+          bot.change_taps == 0, bot.change_taps)
+
+
+def scenario_change_number_gives_up_bounded():
+    """
+    A dead-end screen: the recovery gives up within its own short budget and
+    raises (so the coordinator decides what to do next) instead of burning the
+    full step timeout or silently resetting the bot to the menu.
+    """
+    client, bot = build_client(referral_link=None, referral_script="absent",
+                               change_number_screen=BROKEN_SCREEN,
+                               change_number_retries=1,
+                               change_number_timeout_seconds=1,
+                               change_number_budget_seconds=6,
+                               step_timeout_seconds=30)
+    client.prepare_login("9876543210")
+    menus_before = menu_pushes(bot)
+
+    started = time.time()
+    try:
+        client.change_number(None)
+        check("dead end: raises MeeshoBotUnknownScreen", False, "no exception")
+    except MeeshoBotUnknownScreen as exc:
+        check("dead end: raises MeeshoBotUnknownScreen", True)
+        check("dead end: error says how to teach the prompt copy",
+              "number_prompt_hints" in str(exc), str(exc))
+        check("dead end: error carries the screen text",
+              "Something went wrong" in (exc.screen_text or ""), exc.screen_text)
+    took = time.time() - started
+    check("dead end: bot NOT reset to the main menu inside change_number",
+          menu_pushes(bot) == menus_before, menu_pushes(bot))
+    check("dead end: gave up quickly, not after the 30s step timeout",
+          took < 10, f"{took:.1f}s")
+
+
+def scenario_change_number_config_hint():
+    """meesho_bot.number_prompt_hints teaches an otherwise unknown copy."""
+    client, bot = build_client(referral_link=None, referral_script="absent",
+                               change_number_screen=PROMPT_LOCAL_COPY,
+                               number_prompt_hints=["daalein"])
+    client.prepare_login("9876543210")
+    res = client.change_number(None)
+    check("config hint: prompt recognized", res["stage"] == "prompt", res)
+    res2 = client.continue_with_number("9876543250")
+    check("config hint: replacement number sent",
+          bot.sent_numbers[-1] == "9876543250", bot.sent_numbers)
+    check("config hint: OTP screen reached", res2["stage"] == "otp_sent", res2)
+
+    # Without the hint the same copy is not recognizable: the recovery gives up
+    # (and the coordinator decides), it does not guess.
+    client2, bot2 = build_client(referral_link=None, referral_script="absent",
+                                 change_number_screen=PROMPT_LOCAL_COPY,
+                                 change_number_retries=0,
+                                 change_number_timeout_seconds=1,
+                                 change_number_budget_seconds=4)
+    client2.prepare_login("9876543210")
+    try:
+        client2.change_number(None)
+        check("config hint: without it the copy stays unknown", False, "no exception")
+    except MeeshoBotUnknownScreen:
+        check("config hint: without it the copy stays unknown", True)
+    check("config hint: nothing typed without the hint",
+          bot2.sent_numbers == ["9876543210"], bot2.sent_numbers)
+
+
+def scenario_at_number_prompt_probe():
+    """at_number_prompt() is a read-only probe the coordinator can trust."""
+    client, bot = build_client(referral_link=None, referral_script="absent")
+    client.prepare_login("9876543210")
+    check("probe: the OTP screen is not the number prompt",
+          client.at_number_prompt() is False, client.screen_state())
+    client.change_number(None)
+    check("probe: the offer screen is the number prompt",
+          client.at_number_prompt() is True, client.screen_state())
+    bot._push(CHECK_PROMPT_ONLY)
+    check("probe: the bot checker's prompt is not the login prompt",
+          client.at_number_prompt() is False)
+    check("probe: the probe typed nothing",
+          bot.sent_numbers == ["9876543210"] and bot.sent_codes == [],
+          f"numbers={bot.sent_numbers} codes={bot.sent_codes}")
+
+
+def scenario_prepare_login_reuses_prompt():
+    """
+    The bot is already sitting on a good offer/number prompt (a Change Number
+    that reported "unknown" but worked, or a flow the coordinator deliberately
+    kept in place because the checker API answers the number checks): a fresh
+    login sends its number from there - no main-menu walk, no offer reroll.
+    """
+    client, bot = build_client(referral_link=None, referral_script="absent")
+    bot.state = "offer"
+    bot.offer_prices = [45]
+    bot._push(bot._offer_screen())
+    menus_before = menu_pushes(bot)
+
+    res = client.prepare_login("9876543240")
+    check("reuse: number sent", bot.sent_numbers == ["9876543240"], bot.sent_numbers)
+    check("reuse: OTP screen reached", res["stage"] == "otp_sent", res)
+    check("reuse: flagged as a reused prompt", res.get("reused_prompt") is True, res)
+    check("reuse: no menu walk (not a single tap)", bot.tapped == [], bot.tapped)
+    check("reuse: no offer reroll",
+          res["rerolls"] == 0 and bot.reroll_count == 0, res)
+    check("reuse: no /start reset", menu_pushes(bot) == menus_before, menu_pushes(bot))
+    check("reuse: UPI price kept", res["upi"] == 45.0, res)
+
+
+def scenario_prepare_login_rerolls_over_target_prompt_in_place():
+    """An over-target prompt is rerolled where the bot already sits."""
+    client, bot = build_client(referral_link=None, referral_script="absent")
+    bot.state = "offer"
+    bot.offer_prices = [60, 45]
+    bot._push(bot._offer_screen())  # ₹60 on screen, above the ₹47 target
+
+    res = client.prepare_login("9876543241")
+    check("reroll in place: number sent",
+          bot.sent_numbers == ["9876543241"], bot.sent_numbers)
+    check("reroll in place: prompt reused", res.get("reused_prompt") is True, res)
+    check("reroll in place: only the reroll was tapped",
+          bot.tapped == ["\U0001f504 Try Another Offer"], bot.tapped)
+    check("reroll in place: price brought down to the target",
+          res["rerolls"] == 1 and res["upi"] == 45.0, res)
+
+
+def scenario_prepare_login_does_not_reuse_checker_prompt():
+    """
+    A cold read must not mistake the bot CHECKER's "send the number" prompt for
+    the login prompt - the paid number would vanish into the checker.
+    """
+    client, bot = build_client(referral_link=None, referral_script="absent")
+    bot.state = "check_prompt"
+    bot._push(CHECK_PROMPT_ONLY)
+
+    res = client.prepare_login("9876543242")
+    check("checker prompt: NOT reused as a login prompt",
+          res.get("reused_prompt") is not True, res)
+    check("checker prompt: flow walked back to the menu first",
+          bool(bot.tapped) and "Main Menu" in bot.tapped[0], bot.tapped)
+    check("checker prompt: number only sent after the full walk",
+          res["stage"] == "otp_sent" and bot.sent_numbers == ["9876543242"],
+          f"res={res} sent={bot.sent_numbers}")
+
+
+def scenario_reuse_disabled_by_config():
+    """reuse_number_prompt=false restores the always-restart behaviour."""
+    client, bot = build_client(referral_link=None, referral_script="absent",
+                               reuse_number_prompt=False)
+    bot.state = "offer"
+    bot.offer_prices = [45, 45]
+    bot._push(bot._offer_screen())
+
+    res = client.prepare_login("9876543243")
+    check("reuse disabled: prompt not reused", res.get("reused_prompt") is not True, res)
+    check("reuse disabled: full menu walk happened",
+          any("Add Account" in tap for tap in bot.tapped), bot.tapped)
+    check("reuse disabled: number still sent",
+          bot.sent_numbers == ["9876543243"] and res["stage"] == "otp_sent",
+          f"res={res} sent={bot.sent_numbers}")
+
+
 def main():
     print("=== PRIMES referral-flow replay ===\n")
     scenario_reroll_button_parsing()
@@ -1018,6 +1350,17 @@ def main():
     scenario_menu_refer_earn_not_mistaken()
     scenario_referral_mid_otp_wait()
     scenario_change_number_with_referral()
+    scenario_number_prompt_recognition()
+    scenario_change_number_unrecognised_prompt_copy()
+    scenario_change_number_tap_ignored_then_retried()
+    scenario_change_number_bot_left_the_flow()
+    scenario_change_number_gives_up_bounded()
+    scenario_change_number_config_hint()
+    scenario_at_number_prompt_probe()
+    scenario_prepare_login_reuses_prompt()
+    scenario_prepare_login_rerolls_over_target_prompt_in_place()
+    scenario_prepare_login_does_not_reuse_checker_prompt()
+    scenario_reuse_disabled_by_config()
 
     print()
     if FAILURES:

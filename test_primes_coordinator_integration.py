@@ -14,7 +14,13 @@ Verifies:
   * an unexpected screen alerts with the screen text AND its buttons, cancels
     the number with the refund expected (nothing was submitted), and resets,
   * a referral prompt interrupting the OTP submission surfaces as "unknown"
-    instead of losing the code.
+    instead of losing the code,
+  * the OTP-recovery order (cancel + refund tally first, move the bot second),
+    the late-OTP salvage paths and the refund-mismatch stop,
+  * the Change Number recovery decision: an unrecovered Change Number only
+    resets the bot to the main menu when the bot checker needs it - with the
+    checker API answering the bot is kept in-flow (no menu restart, no offer
+    reroll), and a number is never typed into a screen that is not the prompt.
 """
 
 import json
@@ -105,7 +111,9 @@ class FakeUserbot:
 
     def __init__(self, result=None, error=None, code_result=None,
                  referral_link="", referral_failure_action="stop",
-                 screen="otp_wait"):
+                 screen="otp_wait", change_error=None, change_result=None,
+                 at_prompt=False, at_prompt_after_change=False,
+                 menu_reset_policy="auto"):
         self.bot_username = "@primesbot"
         self.max_change_number = 5
         self.enabled = True
@@ -120,11 +128,26 @@ class FakeUserbot:
         self._error = error
         self._code_result = code_result or {"status": "linked", "user_id": "1", "account_number": "42"}
         self._screen = screen
+        # Change Number behaviour: raise change_error, or answer change_result
+        # (default: the number prompt was reached).
+        self._change_error = change_error
+        self._change_result = change_result or {"stage": "prompt"}
+        self._at_prompt = at_prompt
+        self._at_prompt_after_change = at_prompt_after_change
+        self._change_called = False
+        self.menu_reset_policy = menu_reset_policy
+        self.change_number_retries = 2
         self.calls = []
 
     def screen_state(self):
         self.calls.append(("screen_state",))
         return self._screen
+
+    def at_number_prompt(self):
+        """Read-only probe: is the bot sitting on the login number prompt?"""
+        self.calls.append(("at_number_prompt",))
+        return bool(self._at_prompt
+                    or (self._change_called and self._at_prompt_after_change))
 
     def prepare_login(self, number):
         self.calls.append(("prepare_login", number))
@@ -150,7 +173,10 @@ class FakeUserbot:
 
     def change_number(self, new_number=None):
         self.calls.append(("change_number", new_number))
-        return {"stage": "prompt"}
+        self._change_called = True
+        if self._change_error:
+            raise self._change_error
+        return dict(self._change_result)
 
     def return_to_menu(self):
         self.calls.append(("return_to_menu",))
@@ -166,10 +192,14 @@ class FakeUserbot:
         return previous
 
 
-def build_coordinator():
+def build_coordinator(checker_mode=None, checker_conf=None):
     config = json.load(open(os.path.join(REPO_DIR, "config.json"), encoding="utf-8"))
     config["meesho_bot"]["enabled"] = True
     config["active_otp_provider"] = "tempora"
+    if checker_mode is not None:
+        config["checker"]["mode"] = checker_mode
+    if checker_conf:
+        config["checker"].update(checker_conf)
     # Run in a scratch directory so the check never touches the live
     # stats.json / state.json / .signals of the automation.
     os.chdir(SCRATCH_DIR)
@@ -481,6 +511,263 @@ def test_refund_mismatch_leaves_bot_on_otp_screen():
           any("REFUND DID NOT TALLY" in t for t, _m in sent), [t for t, _m in sent])
 
 
+CHANGE_NUMBER_ERROR = MeeshoBotUnknownScreen(
+    "Expected number prompt after Change Number, got unknown (no Change Number "
+    "button and the screen never settled)",
+    "📱 Some screen the bot showed",
+    ["❌ Cancel"],
+)
+
+
+def clean_cancel(*_a, **_kw):
+    """A cancellation that tallied, with no salvaged OTP."""
+    return {"tally_ok": True, "salvaged": None, "balance": 99.0}
+
+
+def test_change_number_failure_keeps_flow_when_api_checker_answers():
+    """
+    The reported bug: a Change Number the bot did not answer dropped the bot
+    back to the main menu, so the next number paid for a full flow (Add Account
+    -> Login with Number -> Normal -> offer rerolls) - minutes of delay for
+    nothing. With the checker API answering, the bot is not needed on its main
+    menu, so the flow must be left in place.
+    """
+    coordinator, sent, _ = build_coordinator(checker_mode="auto")
+    coordinator.bot = FakeUserbot(change_error=CHANGE_NUMBER_ERROR)
+    coordinator.handle_cancellation = clean_cancel
+    before = coordinator.stats.snapshot()
+    coordinator._recover_change_number(FakeNumberContext(), "otp_timeout")
+
+    check("api checker healthy: Change Number was attempted",
+          ("change_number", None) in coordinator.bot.calls, coordinator.bot.calls)
+    check("api checker healthy: bot NOT reset to the main menu",
+          ("cancel_flow",) not in coordinator.bot.calls, coordinator.bot.calls)
+    check("api checker healthy: prompt flag cleared",
+          coordinator.bot_at_number_prompt is False)
+    check("api checker healthy: counted as kept in-flow",
+          coordinator.stats.snapshot().get("bot_flow_kept", 0) - before.get("bot_flow_kept", 0) == 1,
+          coordinator.stats.snapshot())
+    check("api checker healthy: automation still running",
+          not coordinator.stop_requested.is_set())
+    title, message = sent[-1]
+    check("api checker healthy: notification says the bot stays in-flow",
+          title == "🔄 Changing number" and "stays in-flow" in message, message)
+    check("api checker healthy: notification does not promise a menu restart",
+          "restart from the menu" not in message, message)
+    check("api checker healthy: notification names the checker as the reason",
+          "checker API is answering" in message, message)
+
+
+def test_change_number_failure_resets_when_bot_checker_needed():
+    """
+    checker.mode "bot": the bot checker works from the main menu, so a Change
+    Number that cannot be recovered still resets the flow there (the old
+    behaviour, and the correct one in this mode).
+    """
+    coordinator, sent, _ = build_coordinator(checker_mode="bot")
+    coordinator.bot = FakeUserbot(change_error=CHANGE_NUMBER_ERROR)
+    coordinator.handle_cancellation = clean_cancel
+    before = coordinator.stats.snapshot()
+    coordinator._recover_change_number(FakeNumberContext(), "otp_timeout")
+
+    check("bot checker: bot reset to the main menu",
+          ("cancel_flow",) in coordinator.bot.calls, coordinator.bot.calls)
+    after = coordinator.stats.snapshot()
+    check("bot checker: counted as a menu reset",
+          after.get("bot_menu_resets", 0) - before.get("bot_menu_resets", 0) == 1, after)
+    check("bot checker: flow NOT counted as kept",
+          after.get("bot_flow_kept", 0) - before.get("bot_flow_kept", 0) == 0, after)
+    title, message = sent[-1]
+    check("bot checker: notification says the flow restarts from the menu",
+          title == "🔄 Changing number" and "restart from the menu" in message, message)
+    check("bot checker: automation still running",
+          not coordinator.stop_requested.is_set())
+
+
+def test_change_number_failure_resets_while_api_cools_down():
+    """
+    checker.mode "auto" while the API is in its fallback cooldown: the next
+    checks go through the bot, so the bot has to be back at its main menu.
+    """
+    coordinator, sent, _ = build_coordinator(checker_mode="auto")
+    coordinator.bot = FakeUserbot(change_error=CHANGE_NUMBER_ERROR)
+    coordinator.handle_cancellation = clean_cancel
+    coordinator.checker._enter_cooldown()
+    coordinator._recover_change_number(FakeNumberContext(), "otp_timeout")
+
+    check("api cooling down: bot reset to the main menu",
+          ("cancel_flow",) in coordinator.bot.calls, coordinator.bot.calls)
+    title, message = sent[-1]
+    check("api cooling down: notification says the flow restarts from the menu",
+          "restart from the menu" in message, message)
+    check("api cooling down: notification mentions the cooldown",
+          "cooling down" in message, message)
+
+
+def test_change_number_needs_full_flow_without_reset():
+    """
+    The bot left the login flow by itself (its OTP prompt expired, a manual
+    /start): change_number reports needs_full_flow. It is already where a full
+    flow starts, so no extra reset is paid for.
+    """
+    coordinator, sent, _ = build_coordinator(checker_mode="bot")
+    coordinator.bot = FakeUserbot(change_result={"stage": "needs_full_flow"})
+    coordinator.handle_cancellation = clean_cancel
+    coordinator._recover_change_number(FakeNumberContext(), "otp_timeout")
+
+    check("needs full flow: no menu reset on top of it",
+          ("cancel_flow",) not in coordinator.bot.calls, coordinator.bot.calls)
+    check("needs full flow: prompt flag cleared",
+          coordinator.bot_at_number_prompt is False)
+    title, message = sent[-1]
+    check("needs full flow: notification says the full flow is needed",
+          "full flow" in message, message)
+
+
+def test_change_number_prompt_found_on_second_look():
+    """
+    A Change Number can report failure while the bot did reach the number
+    prompt (a slow edit, a copy classify() does not know). The read-only probe
+    catches it, so the number is not paid for with a menu restart.
+    """
+    coordinator, sent, _ = build_coordinator(checker_mode="bot")
+    coordinator.bot = FakeUserbot(change_error=CHANGE_NUMBER_ERROR,
+                                  at_prompt_after_change=True)
+    coordinator.handle_cancellation = clean_cancel
+    coordinator._recover_change_number(FakeNumberContext(), "otp_timeout")
+
+    check("second look: no menu reset",
+          ("cancel_flow",) not in coordinator.bot.calls, coordinator.bot.calls)
+    check("second look: prompt flag set",
+          coordinator.bot_at_number_prompt is True)
+    title, message = sent[-1]
+    check("second look: notification says the bot waits for the number",
+          "waiting for the replacement number" in message, message)
+
+
+def test_change_number_skips_tap_when_already_at_prompt():
+    """Already at the number prompt: no tap, no reset - the search resumes."""
+    coordinator, sent, _ = build_coordinator()
+    coordinator.bot = FakeUserbot(at_prompt=True)
+    coordinator.handle_cancellation = clean_cancel
+    coordinator._recover_change_number(FakeNumberContext(), "otp_timeout")
+
+    check("already at prompt: no Change Number tap",
+          ("change_number", None) not in coordinator.bot.calls, coordinator.bot.calls)
+    check("already at prompt: no menu reset",
+          ("cancel_flow",) not in coordinator.bot.calls, coordinator.bot.calls)
+    check("already at prompt: prompt flag set",
+          coordinator.bot_at_number_prompt is True)
+    title, message = sent[-1]
+    check("already at prompt: notification says the bot waits for the number",
+          "waiting for the replacement number" in message, message)
+
+
+def test_change_number_cap_resets_regardless_of_checker():
+    """
+    max_change_number in a row: a deliberate full restart, even with a healthy
+    checker API (something is wrong with the flow at that point).
+    """
+    coordinator, sent, _ = build_coordinator(checker_mode="auto")
+    coordinator.bot = FakeUserbot()
+    coordinator.handle_cancellation = clean_cancel
+    coordinator.bot_change_attempts = coordinator.bot.max_change_number
+    coordinator._recover_change_number(FakeNumberContext(), "otp_timeout")
+
+    check("cap: bot reset to the main menu",
+          ("cancel_flow",) in coordinator.bot.calls, coordinator.bot.calls)
+    check("cap: Change Number not tapped again",
+          ("change_number", None) not in coordinator.bot.calls, coordinator.bot.calls)
+    check("cap: attempt counter reset", coordinator.bot_change_attempts == 0,
+          coordinator.bot_change_attempts)
+    title, message = sent[-1]
+    check("cap: notification says the flow restarts from the menu",
+          "restart from the menu" in message, message)
+
+
+def test_change_number_reset_policy_override():
+    """
+    meesho_bot.reset_to_menu_on_change_failure overrides the checker-based
+    decision in both directions.
+    """
+    coordinator, sent, _ = build_coordinator(checker_mode="auto")
+    coordinator.bot = FakeUserbot(change_error=CHANGE_NUMBER_ERROR,
+                                  menu_reset_policy="always")
+    coordinator.handle_cancellation = clean_cancel
+    coordinator._recover_change_number(FakeNumberContext(), "otp_timeout")
+    check("policy 'always': resets even with a healthy checker API",
+          ("cancel_flow",) in coordinator.bot.calls, coordinator.bot.calls)
+
+    coordinator, sent, _ = build_coordinator(checker_mode="bot")
+    coordinator.bot = FakeUserbot(change_error=CHANGE_NUMBER_ERROR,
+                                  menu_reset_policy="never")
+    coordinator.handle_cancellation = clean_cancel
+    coordinator._recover_change_number(FakeNumberContext(), "otp_timeout")
+    check("policy 'never': keeps the flow even when the bot checker is needed",
+          ("cancel_flow",) not in coordinator.bot.calls, coordinator.bot.calls)
+
+
+def test_checker_status_reports_menu_need():
+    """/checker says whether a failed Change Number will reset the bot."""
+    coordinator, _, _ = build_coordinator(checker_mode="auto")
+    text = coordinator.checker_status_text()
+    check("checker status: API-healthy run keeps the bot in-flow",
+          "Checks need the bot at its main menu: NO" in text
+          and "keeps the bot in-flow" in text, text)
+
+    coordinator, _, _ = build_coordinator(checker_mode="bot")
+    text = coordinator.checker_status_text()
+    check("checker status: bot mode resets to the menu",
+          "Checks need the bot at its main menu: YES" in text
+          and "resets the bot to the menu" in text, text)
+
+
+def test_send_number_falls_back_when_the_prompt_is_gone():
+    """
+    A bot number check resets the bot to its main menu (checker.mode "bot", or
+    an "auto" fallback), so the prompt the coordinator remembers can be gone by
+    the time the next number is ready. The paid number must not be typed into
+    whatever is on screen now, and must not be cancelled for it either: the
+    screen is re-read and the full flow is used.
+    """
+    coordinator, sent, cancellations = build_coordinator()
+    coordinator.bot = FakeUserbot(at_prompt=False, result={
+        "stage": "otp_sent", "upi": 45.0, "rerolls": 1,
+    })
+    coordinator.bot_at_number_prompt = True
+    res = coordinator._bot_send_number(FakeNumberContext(), from_prompt=True)
+
+    check("prompt gone: full flow used instead of continuing from the prompt",
+          ("prepare_login", "9876543210") in coordinator.bot.calls
+          and ("continue_with_number", "9876543210") not in coordinator.bot.calls,
+          coordinator.bot.calls)
+    check("prompt gone: number still sent", res is not None and res["stage"] == "otp_sent", res)
+    check("prompt gone: number NOT cancelled", cancellations == [], cancellations)
+    check("prompt gone: prompt flag corrected",
+          coordinator.bot_at_number_prompt is False)
+    check("prompt gone: automation still running",
+          not coordinator.stop_requested.is_set())
+
+
+def test_send_number_continues_from_prompt_when_the_bot_is_on_it():
+    """With the bot really on the prompt, the cheap path is kept."""
+    coordinator, sent, cancellations = build_coordinator()
+    coordinator.bot = FakeUserbot(at_prompt=True, result={
+        "stage": "otp_sent", "upi": 45.0, "rerolls": 0,
+    })
+    coordinator.bot_at_number_prompt = True
+    res = coordinator._bot_send_number(FakeNumberContext(), from_prompt=True)
+
+    check("at prompt: continue_with_number used",
+          ("continue_with_number", "9876543210") in coordinator.bot.calls,
+          coordinator.bot.calls)
+    check("at prompt: no full menu flow",
+          ("prepare_login", "9876543210") not in coordinator.bot.calls,
+          coordinator.bot.calls)
+    check("at prompt: number sent", res is not None and res["stage"] == "otp_sent", res)
+    check("at prompt: prompt flag kept", coordinator.bot_at_number_prompt is True)
+
+
 def test_cancel_race_salvage_charge_stands_no_critical_stop():
     """
     Inside handle_cancellation itself: when the salvage probes find a late
@@ -641,6 +928,17 @@ def main():
     test_salvaged_late_otp_wrong_code_still_recovers()
     test_salvaged_otp_not_on_otp_screen()
     test_refund_mismatch_leaves_bot_on_otp_screen()
+    test_change_number_failure_keeps_flow_when_api_checker_answers()
+    test_change_number_failure_resets_when_bot_checker_needed()
+    test_change_number_failure_resets_while_api_cools_down()
+    test_change_number_needs_full_flow_without_reset()
+    test_change_number_prompt_found_on_second_look()
+    test_change_number_skips_tap_when_already_at_prompt()
+    test_change_number_cap_resets_regardless_of_checker()
+    test_change_number_reset_policy_override()
+    test_checker_status_reports_menu_need()
+    test_send_number_falls_back_when_the_prompt_is_gone()
+    test_send_number_continues_from_prompt_when_the_bot_is_on_it()
     test_cancel_race_salvage_charge_stands_no_critical_stop()
     test_code_not_submitted_after_referral_interrupt()
     test_startup_logs_referral_config()
