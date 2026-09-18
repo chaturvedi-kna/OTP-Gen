@@ -1533,6 +1533,12 @@ class MeeshoBotClient:
         self._log(f"[MEESHO-BOT] Telegram FloodWait: {seconds}s - pausing all bot checks "
                   f"until {time.strftime('%H:%M:%S', time.localtime(self._floodwait_until))}")
 
+    def floodwait_remaining(self):
+        """Seconds left in FloodWait cooldown, or 0."""
+        with self._floodwait_lock:
+            until = self._floodwait_until
+        return max(0.0, until - time.time())
+
     @staticmethod
     def _extract_floodwait_seconds(exc):
         """Extract seconds from FloodWaitError or its message."""

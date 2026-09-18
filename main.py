@@ -1098,6 +1098,39 @@ class ParallelAutomationCoordinator:
                 time.sleep(1)
                 continue
 
+            # Self-heal: if bot checker is in FloodWait cooldown, pause fetching
+            # instead of buying numbers that will be cancelled.
+            try:
+                bot_fw = float(self.checker.bot_floodwait_remaining() or 0)
+            except Exception:
+                bot_fw = 0.0
+            if bot_fw > 1.0:
+                try:
+                    self_heal_on = bool(getattr(self.checker, "self_heal_enabled", True))
+                except Exception:
+                    self_heal_on = True
+                if self_heal_on:
+                    try:
+                        max_wait = float(getattr(self.checker, "self_heal_max_wait", 3600.0) or 3600.0)
+                    except Exception:
+                        max_wait = 3600.0
+                    wait_for = bot_fw if max_wait <= 0 else min(bot_fw, max_wait)
+                    log(f"Checker bot in FloodWait cooldown ({bot_fw:.0f}s left) - "
+                        f"self-heal pausing {pname} for {wait_for:.0f}s before next number.",
+                        prefix=pname)
+                    self.worker_statuses[client.name] = f"Self-heal pause {wait_for:.0f}s (FloodWait {bot_fw:.0f}s)"
+                    slept = 0
+                    while slept < wait_for and not self.stop_requested.is_set():
+                        if self.target_found_event.is_set():
+                            break
+                        chunk = min(5.0, wait_for - slept)
+                        time.sleep(chunk)
+                        slept += chunk
+                    if self.stop_requested.is_set():
+                        break
+                    # Re-check after pause
+                    continue
+
             with self.attempts_lock:
                 if self.worker_attempts[client.name] >= client_max_attempts:
                     log(f"Reached configured max attempts ({client_max_attempts}). Worker completed.", prefix=pname)
@@ -1269,11 +1302,103 @@ class ParallelAutomationCoordinator:
             except (CheckerUnavailable, CheckerError) as exc:
                 msg = str(exc)
                 is_flood = ("wait of" in msg.lower() and "seconds is required" in msg.lower()) or "floodwait" in msg.lower()
+                # Extract FloodWait seconds for self-heal
+                flood_seconds = 0
+                if is_flood:
+                    import re as _re
+                    m = _re.search(r"wait of (\d+)", msg, _re.IGNORECASE)
+                    if m:
+                        try:
+                            flood_seconds = int(m.group(1))
+                        except Exception:
+                            flood_seconds = 0
+                    # Also check bot's own tracking (more accurate)
+                    try:
+                        remaining = float(self.checker.bot_floodwait_remaining() or 0)
+                        if remaining > flood_seconds:
+                            flood_seconds = int(remaining)
+                    except Exception:
+                        pass
+                    # Fallback: try bot client directly
+                    try:
+                        br = float(self.checker.bot.floodwait_remaining or 0)
+                        if br > flood_seconds:
+                            flood_seconds = int(br)
+                    except Exception:
+                        pass
+
                 if is_flood:
                     log(f"Checker error (mode {self.checker.mode}): Telegram FloodWait - {exc}. "
                         f"Both dedicated checker and PRIMES share the same Telegram account, "
-                        f"so they share the rate limit. Cancelling {clean_number} with refund - "
-                        f"wait for the cooldown to expire.", prefix=pname)
+                        f"so they share the rate limit. Cancelling {clean_number} with refund.",
+                        prefix=pname)
+
+                    # Self-heal mode: pause and auto-resume instead of hammering
+                    try:
+                        self_heal_on = bool(getattr(self.checker, "self_heal_enabled", True))
+                    except Exception:
+                        self_heal_on = True
+                    try:
+                        max_wait = float(getattr(self.checker, "self_heal_max_wait", 3600.0) or 3600.0)
+                    except Exception:
+                        max_wait = 3600.0
+
+                    if self_heal_on and flood_seconds > 0:
+                        # Enter bot FloodWait cooldown so other workers also pause
+                        try:
+                            self.checker._enter_bot_floodwait(flood_seconds)
+                        except Exception:
+                            pass
+
+                        wait_for = flood_seconds
+                        if max_wait > 0:
+                            wait_for = min(flood_seconds, max_wait)
+
+                        log(f"🤖 Self-heal mode ON: pausing {pname} for {wait_for:.0f}s "
+                            f"(FloodWait was {flood_seconds}s, max_wait {max_wait:.0f}s) - "
+                            f"will auto-resume after cooldown. No more numbers will be bought "
+                            f"during this pause.", prefix=pname)
+                        self.worker_statuses[client.name] = f"Self-heal pause {wait_for:.0f}s (FloodWait {flood_seconds}s)"
+
+                        # Sleep in small chunks so stop_requested is responsive
+                        slept = 0
+                        while slept < wait_for and not self.stop_requested.is_set():
+                            chunk = min(5.0, wait_for - slept)
+                            time.sleep(chunk)
+                            slept += chunk
+                            # Update status with remaining
+                            remaining = wait_for - slept
+                            if remaining > 0 and int(remaining) % 30 == 0:
+                                log(f"Self-heal: {pname} still paused, {remaining:.0f}s left...",
+                                    prefix=pname)
+
+                        if self.stop_requested.is_set():
+                            return
+
+                        log(f"Self-heal: {pname} resuming after {wait_for:.0f}s pause - "
+                            f"clearing FloodWait cooldown and retrying.",
+                            prefix=pname)
+                        try:
+                            # Clear if we waited the full FloodWait, otherwise keep remaining
+                            if flood_seconds <= max_wait:
+                                self.checker._clear_bot_floodwait()
+                                # Also clear client-side tracking if possible
+                                try:
+                                    bot_client = self.bot
+                                    if bot_client:
+                                        with getattr(bot_client, "_floodwait_lock", threading.RLock()):
+                                            bot_client._floodwait_until = 0.0
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                        # Don't count FloodWait as a checker failure when self-heal is on
+                        self._reset_checker_failures()
+                    else:
+                        if not self_heal_on:
+                            log(f"Self-heal mode OFF: not auto-pausing, will continue and may hit "
+                                f"FloodWait again. Enable with checker.telegram_bot.self_heal_enabled=true",
+                                prefix=pname)
                 else:
                     log(f"Checker error (mode {self.checker.mode}): {exc}. "
                         f"Cancelling number...", prefix=pname)
@@ -1283,7 +1408,16 @@ class ParallelAutomationCoordinator:
                 # With the bot (or the bot fallback) in the checking path, a run
                 # of failures means the checker itself is broken: stop instead
                 # of buying numbers only to cancel them.
+                # For FloodWait with self-heal ON, we already reset the streak above,
+                # so we skip counting it as a failure.
                 if isinstance(exc, CheckerUnavailable) and self.checker.mode_wants_bot:
+                    if is_flood:
+                        try:
+                            if bool(getattr(self.checker, "self_heal_enabled", True)):
+                                # Self-heal handled the pause, don't count towards critical stop
+                                continue
+                        except Exception:
+                            pass
                     streak = self._note_checker_failure()
                     limit = self.checker.stop_after_failures
                     if limit and streak >= limit:

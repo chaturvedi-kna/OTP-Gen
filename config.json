@@ -75,7 +75,9 @@
       "max_attempts": 2,
       "reset_after_check": true,
       "stop_after_failures": 3,
-      "claim_timeout_seconds": 60
+      "claim_timeout_seconds": 60,
+      "fallback_to_primes": false,
+      "self_heal_enabled": true
     },
     "telegram_bot": {
       "enabled": false,
@@ -85,7 +87,7 @@
       "command": "",
       "button_hints": [
         "Check Number",
-        "🔍 Check Number"
+        "\ud83d\udd0d Check Number"
       ],
       "number_prompt_hints": [
         "Meesho Number Check",
@@ -95,13 +97,13 @@
         "Cancel likho to exit"
       ],
       "registered_hints": [
-        "— REGISTERED",
+        "\u2014 REGISTERED",
         "REGISTERED (EXISTING",
         "Ye number Meesho pe registered hai"
       ],
       "not_registered_hints": [
         "NOT REGISTERED (NEW USER)",
-        "— NEW USER",
+        "\u2014 NEW USER",
         "Meesho pe ye number NAYA hai"
       ],
       "step_timeout_seconds": 30,
@@ -111,7 +113,10 @@
       "reuse_checker": true,
       "batch_enabled": false,
       "batch_size": 3,
-      "batch_wait_seconds": 6.0
+      "batch_wait_seconds": 6.0,
+      "fallback_to_primes": false,
+      "self_heal_enabled": true,
+      "self_heal_max_wait_seconds": 3600
     }
   },
   "balance_guard": {

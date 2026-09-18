@@ -494,11 +494,52 @@ class BotChecker:
         msg = str(exc).lower()
         return ("wait of" in msg and "seconds is required" in msg) or "floodwait" in msg or ("flood" in msg and "wait" in msg)
 
+    @property
+    def fallback_to_primes(self):
+        """
+        Whether a dedicated checker failure may fall back to PRIMES.
+        Config: checker.telegram_bot.fallback_to_primes (bool, default False).
+        When False, PRIMES is never used as a fallback if a dedicated bot is
+        configured - this prevents the 2622s FloodWait cascade (same account).
+        """
+        # conf is merged bot + telegram_bot overrides, so check both keys.
+        val = self.conf.get("fallback_to_primes")
+        if val is None:
+            val = self.conf.get("fallback_to_primes_bot", False)
+        # Explicit False by default: no PRIMES fallback.
+        return bool(val)
+
+    @property
+    def floodwait_remaining(self):
+        """Seconds left in FloodWait cooldown from either client, or 0."""
+        remaining = 0.0
+        for getter in (self.preferred_client, self.client):
+            try:
+                if getter is None:
+                    continue
+                # MeeshoBotClient exposes floodwait_remaining() / _floodwait_until
+                fn = getattr(getter, "floodwait_remaining", None)
+                if callable(fn):
+                    r = fn()
+                    remaining = max(remaining, float(r or 0))
+                else:
+                    until = getattr(getter, "_floodwait_until", 0)
+                    if until:
+                        import time as _time
+                        r = max(0.0, until - _time.time())
+                        remaining = max(remaining, r)
+            except Exception:
+                continue
+        return remaining
+
     def check(self, number, service=None):
         # Dedicated checker bot first: it has its own conversation and never
         # touches the PRIMES login flow, so a mid-flight OTP is never at risk
         # (unless it is configured to BE the login bot - then there is no
         # second conversation and the claim below has to guard it).
+        has_dedicated = self.has_preferred
+        use_primes_fallback = self.fallback_to_primes
+
         if self.preferred_ready and not self.preferred_shares_login(self.preferred_client):
             try:
                 return self.check_preferred_batched(number, service=service)
@@ -509,7 +550,13 @@ class BotChecker:
                         f"PRIMES bot as fallback (same Telegram account shares the limit) - "
                         f"cancelling with refund.")
                     raise
-                # Fall through: try PRIMES as the last resort when there is one.
+                if not use_primes_fallback and has_dedicated:
+                    self._log(
+                        f"Dedicated checker bot failed ({exc}); PRIMES fallback is DISABLED "
+                        f"(checker.telegram_bot.fallback_to_primes=false) - cancelling with refund, "
+                        f"no PRIMES attempt.")
+                    raise
+                # Fall through: try PRIMES as the last resort when allowed.
                 self._log(
                     f"Dedicated checker bot failed to answer ({exc}); "
                     f"trying the PRIMES bot as the last resort.")
@@ -520,9 +567,35 @@ class BotChecker:
                         f"PRIMES bot as fallback (same account) - cancelling with refund.")
                     raise CheckerUnavailable(
                         f"Dedicated checker bot FloodWait: {exc}") from exc
+                if not use_primes_fallback and has_dedicated:
+                    self._log(
+                        f"Dedicated checker bot failed ({exc}); PRIMES fallback is DISABLED "
+                        f"(checker.telegram_bot.fallback_to_primes=false) - cancelling with refund.")
+                    raise CheckerUnavailable(
+                        f"Dedicated checker bot failed: {exc}") from exc
                 self._log(
                     f"Dedicated checker bot failed ({exc}); "
                     f"trying the PRIMES bot as the last resort.")
+
+        # If a dedicated bot is configured as a SEPARATE conversation and
+        # PRIMES fallback is disabled, never use PRIMES - even when dedicated
+        # is not ready. If the dedicated bot IS the login bot (misconfig, same
+        # handle), it shares the login conversation and must still go through
+        # the gate/claim path so a busy login is reported as CheckerBotBusy.
+        if has_dedicated and not use_primes_fallback:
+            pref = self.preferred_client
+            shares = False
+            try:
+                shares = self.preferred_shares_login(pref) if pref is not None else False
+            except Exception:
+                shares = False
+            if not shares:
+                reason = self.preferred_unavailable_reason or self.unavailable_reason
+                raise CheckerUnavailable(
+                    f"Dedicated checker bot unavailable and PRIMES fallback is disabled "
+                    f"(checker.telegram_bot.fallback_to_primes=false): {reason}. "
+                    f"Enable fallback_to_primes or fix the dedicated bot."
+                )
 
         if not self.ready:
             raise CheckerUnavailable(
@@ -613,6 +686,11 @@ class CheckerRouter:
         self._state_lock = threading.Lock()
         self._cooldown = 0.0
         self._down_until = 0.0
+
+        # Bot checker FloodWait cooldown (self-heal mode). Same account drives
+        # both PRIMES and dedicated checker, so FloodWait applies to both.
+        self._bot_cooldown = 0.0
+        self._bot_down_until = 0.0
 
     # -- state helpers -------------------------------------------------------
 
@@ -724,18 +802,90 @@ class CheckerRouter:
         if had:
             self._log("Checker API answered again - back to API-first checking.")
 
+    # -- bot checker FloodWait cooldown (self-heal) --------------------------
+
+    def bot_floodwait_remaining(self):
+        """Seconds left in bot FloodWait cooldown (from BotChecker or local)."""
+        # Local bot cooldown (set via _enter_bot_floodwait)
+        with self._state_lock:
+            local = max(0.0, self._bot_down_until - time.monotonic())
+        # Plus MeeshoBotClient's own _floodwait_until tracking
+        try:
+            client_remaining = float(self.bot.floodwait_remaining or 0)
+        except Exception:
+            client_remaining = 0.0
+        return max(local, client_remaining)
+
+    def _enter_bot_floodwait(self, seconds):
+        """Enter bot FloodWait cooldown for `seconds` (self-heal pause)."""
+        seconds = max(0.0, float(seconds or 0))
+        if seconds <= 0:
+            return 0.0
+        with self._state_lock:
+            # Use the larger of existing and new, so we don't shorten a 2622s wait.
+            self._bot_cooldown = max(self._bot_cooldown, seconds)
+            self._bot_down_until = max(self._bot_down_until, time.monotonic() + seconds)
+            return self._bot_cooldown
+
+    def _clear_bot_floodwait(self):
+        with self._state_lock:
+            had = self._bot_down_until > 0
+            self._bot_cooldown = 0.0
+            self._bot_down_until = 0.0
+        if had:
+            self._log("Bot checker FloodWait cooldown cleared - resuming checks.")
+
+    @property
+    def self_heal_enabled(self):
+        """Whether self-heal mode is on (auto-pause on FloodWait and resume)."""
+        # Check telegram_bot config first, then bot config, then top-level checker.
+        tg = self.conf.get("telegram_bot") or {}
+        for src in (tg, self.conf.get("bot") or {}, self.conf):
+            if "self_heal_enabled" in src:
+                return bool(src["self_heal_enabled"])
+            if "self_heal" in src:
+                return bool(src["self_heal"])
+        return True  # default on
+
+    @property
+    def self_heal_max_wait(self):
+        """Max seconds to pause for self-heal (0 = wait full FloodWait)."""
+        tg = self.conf.get("telegram_bot") or {}
+        for src in (tg, self.conf.get("bot") or {}, self.conf):
+            for key in ("self_heal_max_wait_seconds", "self_heal_max_wait", "max_self_heal_wait"):
+                if key in src:
+                    try:
+                        return max(0.0, float(src[key]))
+                    except (TypeError, ValueError):
+                        continue
+        return 3600.0  # default 1h cap, so a 2622s wait is honored but not infinite
+
+    @property
+    def fallback_to_primes(self):
+        """Whether PRIMES fallback is allowed when dedicated fails (default False)."""
+        tg = self.conf.get("telegram_bot") or {}
+        # Check telegram_bot first, then bot, then top-level.
+        for src in (tg, self.conf.get("bot") or {}, self.conf):
+            if "fallback_to_primes" in src:
+                return bool(src["fallback_to_primes"])
+        return False  # default: NO PRIMES fallback
+
     def describe(self):
         """One-line summary for startup logs and /status."""
         if self.mode == MODE_API:
             return f"Checker API only ({self.key_count} key(s))"
         if self.mode == MODE_BOT:
             state = "ready" if self.bot_ready else f"NOT ready ({self.bot.unavailable_reason})"
-            return f"PRIMES bot only ({state})"
+            fb = "with PRIMES fallback" if self.fallback_to_primes else "NO PRIMES fallback"
+            heal = "self-heal ON" if self.self_heal_enabled else "self-heal OFF"
+            return f"PRIMES bot only ({state}, {fb}, {heal})"
         bot_state = "ready" if self.bot_ready else f"NOT ready ({self.bot.unavailable_reason})"
         api_state = f"{self.key_count} key(s)" if self.api_ready else "no API keys"
+        dedicated = self.bot.describe_preferred()
+        fb = "PRIMES fallback ON" if self.fallback_to_primes else "PRIMES fallback OFF"
+        heal = "self-heal ON" if self.self_heal_enabled else "self-heal OFF"
         return (f"AUTO - API first ({api_state}), dedicated checker bot "
-                f"({self.bot.describe_preferred()}), PRIMES bot fallback "
-                f"({bot_state})")
+                f"({dedicated}), {fb}, {heal}, PRIMES bot ({bot_state})")
 
     # -- checking ------------------------------------------------------------
 

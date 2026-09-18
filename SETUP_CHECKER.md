@@ -421,7 +421,48 @@ Failure types (`checker_client.py`) are what `auto` mode classifies:
 | `network_backoff_seconds` | `1.5` | Backoff between retries after network errors / 5xx. |
 | `timeout` | `15` | Per-request HTTP timeout — the read timeout that `auto` treats as "too slow" and hands to the bot. |
 
-## 6. Verify
+## 6. PRIMES fallback disabled + self-heal mode (new)
+
+**Problem solved:** dedicated checker `@manishmeeshobot` and PRIMES bot share the SAME Telegram account → same FloodWait limit (2622s in prod). Old flow: dedicated fails → fallback to PRIMES → PRIMES hits FloodWait → cancellation. Wasted.
+
+**Fix:**
+
+1. **PRIMES fallback disabled by default** when a dedicated checker bot is configured:
+```json
+"telegram_bot": {
+  "enabled": true,
+  "username": "@manishmeeshobot",
+  "fallback_to_primes": false,   // default false - no PRIMES fallback
+  "self_heal_enabled": true,     // default true - auto pause on FloodWait
+  "self_heal_max_wait_seconds": 3600  // cap pause at 1h (2622s will be honored)
+}
+```
+- `fallback_to_primes: false` (default): if dedicated checker fails for ANY reason, it does NOT try PRIMES. It cancels with refund directly. Set to `true` to restore old behaviour (try PRIMES as last resort).
+- When no dedicated bot is configured, PRIMES is still used as before (flag only matters when dedicated is present).
+
+2. **Self-heal mode** for FloodWait:
+- When `A wait of X seconds is required` is seen, `meesho_bot_client` records `_floodwait_until` (shared between both bots via proxy).
+- `checker_router` tracks bot FloodWait cooldown (`bot_floodwait_remaining()`).
+- Worker loop (`main.py`) detects FloodWait, enters self-heal pause:
+  - Logs `🤖 Self-heal mode ON: pausing WORKER for Xs (FloodWait was Ys)`
+  - Sleeps in 5s chunks (responsive to stop), up to `self_heal_max_wait_seconds` (default 3600).
+  - During pause, no new numbers are bought - prevents buying numbers that will be cancelled.
+  - After pause, clears cooldown and resumes. Failure streak is NOT counted, so it doesn't trigger critical stop.
+  - If `self_heal_enabled: false`, old behaviour: immediate cancel and continue (may hit FloodWait repeatedly).
+
+**Config changes required?** None - defaults are safe:
+- Existing installs without these keys get `fallback_to_primes=false` (no PRIMES fallback) and `self_heal_enabled=true` (auto pause). This is what you want to prevent the 2622s cascade.
+- To re-enable old PRIMES fallback: set `checker.telegram_bot.fallback_to_primes: true` in config.json.
+- To disable self-heal pause: set `checker.telegram_bot.self_heal_enabled: false`.
+
+**Logs you will see:**
+```
+Dedicated checker bot hit FloodWait (A wait of 2622 seconds...); NOT trying PRIMES bot as fallback (same Telegram account shares the limit) - cancelling with refund.
+Checker error (mode auto): Telegram FloodWait - ... Both dedicated checker and PRIMES share the same Telegram account, so they share the rate limit. Cancelling 9954276790 with refund.
+🤖 Self-heal mode ON: pausing VSIMPRO for 2622s (FloodWait was 2622s, max_wait 3600s) - will auto-resume after cooldown.
+```
+
+## 7. Verify
 
 Offline checks (no network, scripted responses and a fake Telethon bot):
 
