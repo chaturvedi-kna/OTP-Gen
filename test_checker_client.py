@@ -18,7 +18,11 @@ Verifies:
   * transient network errors / HTTP 5xx are retried,
   * the legacy single "api_key" argument still works,
   * definitive failures (success=false, is_down, 4xx, non-JSON) are not
-    retried, same as before.
+    retried, same as before,
+  * v2 payloads without "success" (but with a verdict) are accepted,
+  * a Free-plan 403 mentioning the proxy raises CheckerProxyError (an
+    CheckerAuthError, so auto mode falls back to the bot),
+  * the account helpers (get_me / list_services / health) work.
 """
 
 import sys
@@ -62,6 +66,8 @@ from checker_client import (
     CheckerError,
     CheckerUnavailable,
     CheckerRateLimited,
+    CheckerAuthError,
+    CheckerProxyError,
 )
 
 
@@ -105,7 +111,11 @@ class ScriptedPoster:
         self.calls = []          # (headers x-api-key, json payload)
 
     def __call__(self, url, headers=None, json=None, timeout=None):
-        self.calls.append((headers.get("x-api-key"), json))
+        key = None
+        for header, value in (headers or {}).items():
+            if header.lower() == "x-api-key":
+                key = value
+        self.calls.append((key, json))
         if not self.responses:
             raise AssertionError("ScriptedPoster ran out of responses")
         item = self.responses.pop(0)
@@ -342,6 +352,142 @@ def test_error_taxonomy():
               type(exc).__name__)
 
 
+def test_v2_response_without_success_flag():
+    # v2 only requires service/number/is_registered/in_database; "success"
+    # defaults to true server-side and may be absent - that is still a verdict.
+    poster = ScriptedPoster([FakeResponse(
+        200,
+        '{"service": "meesho", "number": "9876543210", '
+        '"is_registered": true, "in_database": true, '
+        '"operator": "JIO", "api_version": "2.0.0"}',
+    )])
+    checker_client.requests.post = poster
+    data = make_client("k").check("meesho", "9876543210")
+    check("v2: verdict without 'success' accepted", data.get("is_registered") is True)
+    check("v2: new fields pass through",
+          data.get("in_database") is True and data.get("operator") == "JIO", data)
+    check("v2: not retried", len(poster.calls) == 1, str(len(poster.calls)))
+
+
+def test_free_plan_proxy_403():
+    body = '{"detail": "Free plan requires a verified Indian proxy in your Profile"}'
+    # Single key: raises the proxy error with the fix in the message.
+    poster = ScriptedPoster([FakeResponse(403, body)])
+    checker_client.requests.post = poster
+    try:
+        make_client("proxy-less").check("meesho", "9876543210")
+        check("proxy: raises CheckerProxyError", False, "no exception raised")
+    except CheckerProxyError as exc:
+        check("proxy: raises CheckerProxyError", True)
+        check("proxy: message names the fix",
+              "proxy" in str(exc).lower() and "Profile" in str(exc), str(exc)[:120])
+        check("proxy: is a CheckerAuthError (auto mode falls back to the bot)",
+              isinstance(exc, CheckerAuthError), type(exc).__name__)
+    except Exception as exc:  # noqa: BLE001
+        check("proxy: raises CheckerProxyError", False, repr(exc))
+
+    # Two keys: the proxy-less key is retired, the good key answers.
+    poster = ScriptedPoster([FakeResponse(403, body), ok(is_registered=False)])
+    checker_client.requests.post = poster
+    data = make_client(["proxy-less", "good-key"]).check("meesho", "9876543210")
+    check("proxy: rotates to a key with a proxy", data.get("is_registered") is False)
+    check("proxy: bad key retired (not reused)",
+          [c[0] for c in poster.calls] == ["proxy-less", "good-key"],
+          str([c[0] for c in poster.calls]))
+
+    # A plain 403 (banned key, no proxy wording) keeps the old behaviour.
+    poster = ScriptedPoster([FakeResponse(403, '{"detail": "banned"}')] * 2)
+    checker_client.requests.post = poster
+    try:
+        make_client(["k1", "k2"]).check("meesho", "9876543210")
+        check("proxy: plain 403 still raises CheckerAuthError", False)
+    except CheckerProxyError as exc:
+        check("proxy: plain 403 still raises CheckerAuthError", False, repr(exc))
+    except CheckerAuthError as exc:
+        check("proxy: plain 403 still raises CheckerAuthError",
+              "all 2 API keys" in str(exc), str(exc))
+
+
+def test_account_helpers():
+    calls = []
+
+    def fake_get(url, headers=None, timeout=None):
+        key = None
+        for header, value in (headers or {}).items():
+            if header.lower() == "x-api-key":
+                key = value
+        calls.append((url, key))
+        if url.endswith("/api/v1/me"):
+            return FakeResponse(200, '{"user_id": 7, "plan_name": "Free Plan", '
+                                    '"rate_limit_seconds": 5, "proxy_required": true, '
+                                    '"usage": {"daily": 3, "monthly": 40, "services": {}}}')
+        if url.endswith("/api/v1/services"):
+            return FakeResponse(200, '{"services": ["meesho", "operator"]}')
+        if url.endswith("/health"):
+            return FakeResponse(200, '{"status": "ok"}')
+        raise AssertionError(f"unexpected GET {url}")
+
+    checker_client.requests.get = fake_get
+    client = make_client("key-single")
+
+    me = client.get_me()
+    check("helpers: get_me returns the plan",
+          me.get("plan_name") == "Free Plan" and me.get("proxy_required") is True, me)
+    check("helpers: get_me sends the key",
+          calls and calls[0] == (client.base_url + "/api/v1/me", "key-single"), calls)
+
+    services = client.list_services()
+    check("helpers: list_services returns slugs", services == ["meesho", "operator"], services)
+
+    health = client.health()
+    check("helpers: health needs no key",
+          health.get("status") == "ok" and calls[-1][1] is None, (health, calls[-1]))
+
+    # A proxy 403 on /me surfaces as CheckerProxyError too.
+    def fake_get_proxy(url, headers=None, timeout=None):
+        return FakeResponse(403, '{"detail": "add a verified Indian proxy"}')
+
+    checker_client.requests.get = fake_get_proxy
+    try:
+        client.get_me()
+        check("helpers: proxy 403 on /me raises CheckerProxyError", False)
+    except CheckerProxyError:
+        check("helpers: proxy 403 on /me raises CheckerProxyError", True)
+
+
+def test_health_status():
+    seen = {}
+
+    def fake_get(url, headers=None, timeout=None):
+        seen["url"] = url
+        seen["headers"] = dict(headers or {})
+        return seen.pop("response")
+
+    checker_client.requests.get = fake_get
+    client = make_client("key-single")
+
+    seen["response"] = FakeResponse(200, '{"status": "ok"}')
+    up, detail = client.health_status()
+    check("health: HTTP 200 means up", up is True, detail)
+    check("health: probe sends no API key",
+          not any(h.lower() == "x-api-key" for h in seen["headers"]), seen["headers"])
+
+    seen["response"] = FakeResponse(200, "OK")
+    up, _ = client.health_status()
+    check("health: plain-text 200 counts as up", up is True)
+
+    seen["response"] = FakeResponse(503, '{"detail": "down for maintenance"}')
+    up, detail = client.health_status()
+    check("health: 503 means down", up is False, detail)
+
+    def boom(url, headers=None, timeout=None):
+        raise checker_client.requests.ConnectionError("refused")
+
+    checker_client.requests.get = boom
+    up, detail = client.health_status()
+    check("health: network failure means down (never raises)", up is False, detail)
+
+
 def test_format_number_regression():
     cases = {
         "919876543210": "9876543210",
@@ -368,6 +514,10 @@ def main():
     test_legacy_single_api_key_argument()
     test_definitive_failures_not_retried()
     test_error_taxonomy()
+    test_v2_response_without_success_flag()
+    test_free_plan_proxy_403()
+    test_account_helpers()
+    test_health_status()
     test_format_number_regression()
     print()
     if FAILURES:

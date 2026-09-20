@@ -49,6 +49,7 @@ from checker_client import (
     CheckerServerError,
     CheckerServiceDown,
     CheckerAuthError,
+    CheckerProxyError,
 )
 from checker_router import (
     CheckerRouter,
@@ -104,6 +105,21 @@ class FakeAPI(object):
         if isinstance(outcome, Exception):
             raise outcome
         return dict(outcome)
+
+
+class HealthFakeAPI(FakeAPI):
+    """FakeAPI with a scripted liveness probe."""
+
+    def __init__(self, results=None, keys=1, health=None):
+        super().__init__(results=results, keys=keys)
+        self.health_results = list(health or [])
+        self.health_calls = 0
+
+    def health_status(self):
+        self.health_calls += 1
+        if not self.health_results:
+            raise AssertionError("HealthFakeAPI: unexpected extra probe")
+        return self.health_results.pop(0)
 
 
 class FakeBotClient(object):
@@ -174,6 +190,8 @@ def test_classify():
     check("classify: 5xx", classify_api_error(CheckerServerError("x")) == "http_5xx")
     check("classify: 429", classify_api_error(CheckerRateLimited("x")) == "rate_limit")
     check("classify: auth", classify_api_error(CheckerAuthError("x")) == "auth")
+    check("classify: proxy 403 counts as auth (bot fallback)",
+          classify_api_error(CheckerProxyError("no verified proxy")) == "auth")
     check("classify: other", classify_api_error(CheckerError("success=false")) == "unknown")
 
 
@@ -445,6 +463,93 @@ def test_bot_checker_adapter():
         check("BotChecker: checker errors pass through", "bot is down" in str(exc), str(exc))
 
 
+def test_liveness_gate():
+    # auto, API down per /health: the API is not asked, the bot answers,
+    # and the cooldown starts immediately.
+    api = HealthFakeAPI(results=[], health=[(False, "503 down for maintenance")])
+    bot = FakeBotClient(results=[{"is_registered": False}])
+    router, _, _, stats = make_router(MODE_AUTO, api=api, bot=bot)
+    data = router.check("meesho", "9876543210")
+    check("gate: down API is not asked", api.calls == [], api.calls)
+    check("gate: bot answers instead",
+          data.get("source") == "bot" and data.get("is_registered") is False, data)
+    check("gate: cooldown entered", router.cooldown_remaining() > 0)
+    check("gate: fallback counted", stats.counters.get("checker_fallbacks") == 1,
+          stats.counters)
+
+    # auto, ambiguous API answer + fresh probe says down: falls back instead
+    # of acting on the garbage answer.
+    api = HealthFakeAPI(
+        results=[CheckerError("Checker error: bad service")],
+        health=[(True, "ok"), (False, "connection refused")],
+    )
+    bot = FakeBotClient(results=[{"is_registered": True}])
+    router, _, _, _ = make_router(MODE_AUTO, api=api, bot=bot)
+    data = router.check("meesho", "9876543210")
+    check("gate: bad answer + down service falls back to the bot",
+          data.get("source") == "bot" and data.get("is_registered") is True, data)
+    check("gate: pre-check probe cached, failure re-probed fresh",
+          api.health_calls == 2, api.health_calls)
+
+    # auto, ambiguous API answer but the service is up: the answer stands.
+    api = HealthFakeAPI(
+        results=[CheckerError("Checker error: bad service")],
+        health=[(True, "ok"), (True, "still ok")],
+    )
+    bot = FakeBotClient(results=[{"is_registered": True}])
+    router, _, _, _ = make_router(MODE_AUTO, api=api, bot=bot)
+    try:
+        router.check("meesho", "9876543210")
+        check("gate: bad answer while up raises", False, "no exception")
+    except CheckerError as exc:
+        check("gate: bad answer while up raises",
+              type(exc) is CheckerError and "bad service" in str(exc), str(exc)[:100])
+    check("gate: bot never asked for a definitive answer", bot.calls == [], bot.calls)
+
+    # api mode: a down API cancels with the liveness reason, without asking.
+    api = HealthFakeAPI(results=[], health=[(False, "timeout")])
+    router, _, _, _ = make_router(MODE_API, api=api)
+    try:
+        router.check("meesho", "9876543210")
+        check("gate: api mode raises CheckerServiceDown", False, "no exception")
+    except CheckerServiceDown as exc:
+        check("gate: api mode raises CheckerServiceDown", "liveness" in str(exc),
+              str(exc)[:100])
+    check("gate: api mode never asked the down API", api.calls == [], api.calls)
+
+    # caching: one probe serves every check inside the TTL.
+    api = HealthFakeAPI(
+        results=[{"success": True, "is_registered": False},
+                 {"success": True, "is_registered": True}],
+        health=[(True, "ok")],
+    )
+    router, _, _, _ = make_router(MODE_AUTO, api=api, conf={"health_cache_seconds": 60})
+    router.check("meesho", "9876543210")
+    router.check("meesho", "9876543211")
+    check("gate: healthy verdict cached across checks", api.health_calls == 1,
+          api.health_calls)
+
+    # disabled gate / legacy client without a probe: behaviour unchanged.
+    api = HealthFakeAPI(results=[{"success": True, "is_registered": False}], health=[])
+    router, _, _, _ = make_router(MODE_AUTO, api=api, conf={"health_check_enabled": False})
+    data = router.check("meesho", "9876543210")
+    check("gate: disabled gate asks the API directly",
+          data.get("is_registered") is False and api.calls != [] and api.health_calls == 0,
+          (data, api.health_calls))
+
+    legacy = FakeAPI(results=[{"success": True, "is_registered": True}])
+    router, _, _, _ = make_router(MODE_AUTO, api=legacy)
+    data = router.check("meesho", "9876543210")
+    check("gate: client without a probe still works", data.get("is_registered") is True,
+          data)
+
+    # mark_api_down (used by the startup preflight) starts the cooldown.
+    router, _, _, _ = make_router(MODE_AUTO)
+    check("gate: no cooldown initially", router.cooldown_remaining() == 0)
+    router.mark_api_down("preflight")
+    check("gate: mark_api_down starts the cooldown", router.cooldown_remaining() > 0)
+
+
 def main():
     test_mode_aliases()
     test_classify()
@@ -460,6 +565,7 @@ def main():
     test_bot_check_needed()
     test_describe()
     test_bot_checker_adapter()
+    test_liveness_gate()
 
     print()
     if FAILURES:

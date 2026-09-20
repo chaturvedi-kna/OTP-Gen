@@ -3,7 +3,7 @@ Mode-aware number checker: HTTP checker API and/or the PRIMES bot checker.
 
 config.json -> "checker" -> "mode" picks the strategy:
 
-  * "api"  - the superassets.in checker API only (the original behaviour).
+  * "api"  - the tubesave.in checker API only (the original behaviour).
   * "bot"  - the PRIMES Meesho bot's own number checker only, driven through
              the Telethon userbot (see meesho_bot_client.py). Requires
              meesho_bot to be enabled + configured.
@@ -14,7 +14,12 @@ config.json -> "checker" -> "mode" picks the strategy:
              number. Which API failures trigger the fallback is configurable
              (`checker.fallback`), and after a failure the API is skipped for
              a cooldown (doubling up to `max_cooldown_seconds`) so a dead API
-             is not re-tried on every single number.
+             is not re-tried on every single number. A no-auth GET /health
+             liveness gate (cached, see `health_check_enabled`) backs this:
+             a down API is not asked at all, and an ambiguous API answer
+             (success=false / 4xx / malformed) is re-verified against /health
+             - when the service itself is down it falls back instead of
+             acting on a garbage "verdict" by cancelling the number.
 
 Both paths return the same dict shape {"success": True, "is_registered": bool,
 ..., "source": "api"|"bot"}, so the coordinator does not care which one
@@ -36,6 +41,7 @@ from checker_client import (
     CheckerServerError,
     CheckerServiceDown,
     CheckerAuthError,
+    CheckerProxyError,
 )
 
 
@@ -63,6 +69,7 @@ MODE_AUTO = "auto"
 MODE_ALIASES = {
     "api": MODE_API, "api_checker": MODE_API, "api-only": MODE_API, "http": MODE_API,
     "superassets": MODE_API, "server": MODE_API,
+    "tubesave": MODE_API, "speedz": MODE_API, "speedz_checker": MODE_API,
     "bot": MODE_BOT, "primes": MODE_BOT, "primes_bot": MODE_BOT, "primesbot": MODE_BOT,
     "bot_checker": MODE_BOT, "telegram": MODE_BOT, "userbot": MODE_BOT,
     "auto": MODE_AUTO, "automatic": MODE_AUTO, "fallback": MODE_AUTO,
@@ -76,7 +83,8 @@ DEFAULT_FALLBACK = {
     "timeout": True,        # read/connect timeout - "takes too long to respond"
     "network": True,        # connection errors
     "http_5xx": True,       # server-side errors
-    "auth": True,           # every API key rejected (401/403)
+    "auth": True,           # every API key rejected (401/403), incl. the
+                            # Free-plan "no verified Indian proxy" 403
     "rate_limit": False,    # 429 retry budget spent (opt-in: the API is alive)
     "unknown": False,       # success=false / unexpected payload: not a fallback
     "cooldown_seconds": 60,      # skip the API this long after a fallback
@@ -119,6 +127,8 @@ def classify_api_error(exc):
         return "timeout"
     if isinstance(exc, CheckerRateLimited):
         return "rate_limit"
+    # CheckerProxyError subclasses CheckerAuthError, so the Free-plan
+    # "add an Indian proxy" 403 also lands here and falls back to the bot.
     if isinstance(exc, CheckerAuthError):
         return "auth"
     if isinstance(exc, CheckerServerError):
@@ -651,13 +661,13 @@ class CheckerRouter:
             self.api = api_client
         else:
             self.api = CheckerClient(
-                base_url=conf.get("base_url", "https://superassets.in"),
+                base_url=conf.get("base_url", "https://tubesave.in"),
                 api_key=conf.get("api_key", ""),
                 api_keys=conf.get("api_keys"),
                 timeout=conf.get("timeout", 15),
                 max_retries=conf.get("max_retries", 10),
                 max_retry_wait_seconds=conf.get("max_retry_wait_seconds", 45.0),
-                min_interval_seconds=conf.get("min_interval_seconds", 1.0),
+                min_interval_seconds=conf.get("min_interval_seconds", 5.0),
                 rate_limit_buffer_seconds=conf.get("rate_limit_buffer_seconds", 0.5),
                 network_backoff_seconds=conf.get("network_backoff_seconds", 1.5),
                 log_fn=log_fn,
@@ -686,6 +696,8 @@ class CheckerRouter:
         self._state_lock = threading.Lock()
         self._cooldown = 0.0
         self._down_until = 0.0
+        # Liveness gate cache (GET /health, no auth): "is the API itself up".
+        self._health = {"up": True, "detail": "not probed yet", "at": 0.0}
 
         # Bot checker FloodWait cooldown (self-heal mode). Same account drives
         # both PRIMES and dedicated checker, so FloodWait applies to both.
@@ -801,6 +813,81 @@ class CheckerRouter:
             self._down_until = 0.0
         if had:
             self._log("Checker API answered again - back to API-first checking.")
+
+    # -- liveness gate (GET /health, no auth) --------------------------------
+
+    @property
+    def health_check_enabled(self):
+        """checker.health_check_enabled (default True)."""
+        try:
+            return bool(self.conf.get("health_check_enabled", True))
+        except Exception:
+            return True
+
+    @property
+    def health_cache_seconds(self):
+        """checker.health_cache_seconds (default 60): 0 = probe every check."""
+        try:
+            return max(0.0, float(self.conf.get("health_cache_seconds", 60)))
+        except (TypeError, ValueError):
+            return 60.0
+
+    def _health_probe_fn(self):
+        fn = getattr(self.api, "health_status", None)
+        return fn if callable(fn) else None
+
+    def probe_health(self, fresh=False):
+        """
+        (up, detail) for the API itself, cached for health_cache_seconds.
+
+        Returns (True, reason) without probing when the gate is disabled or
+        the API client has no probe, so callers simply proceed. Fresh probes
+        are counted (checker_health_probes / checker_health_down).
+        """
+        fn = self._health_probe_fn()
+        if fn is None:
+            return True, "health gate unavailable (API client has no probe)"
+        if not self.health_check_enabled:
+            return True, "health gate disabled (checker.health_check_enabled=false)"
+        with self._state_lock:
+            cached = dict(self._health)
+        if (
+            not fresh
+            and cached["at"]
+            and time.monotonic() - cached["at"] < self.health_cache_seconds
+        ):
+            return cached["up"], cached["detail"]
+        try:
+            up, detail = fn()
+            up = bool(up)
+            detail = str(detail or "")
+        except Exception as exc:  # a probe must never break a check
+            up, detail = False, f"health probe failed: {exc}"
+        with self._state_lock:
+            self._health = {"up": up, "detail": detail, "at": time.monotonic()}
+        self._count("checker_health_probes")
+        if not up:
+            self._count("checker_health_down")
+        return up, detail
+
+    def _require_healthy_api(self):
+        """Raise CheckerServiceDown when the liveness gate says the API is down."""
+        up, detail = self.probe_health()
+        if not up:
+            raise CheckerServiceDown(
+                f"Checker liveness probe says the API is down ({detail}); "
+                f"not asking it - and not trusting any answer it might give."
+            )
+
+    def mark_api_down(self, reason=""):
+        """Enter API cooldown now (e.g. the startup preflight found it down)."""
+        cooldown = self._enter_cooldown()
+        suffix = f" ({reason})" if reason else ""
+        self._log(
+            f"Checker API marked down{suffix}; skipping it for the next "
+            f"{cooldown:.0f}s."
+        )
+        return cooldown
 
     # -- bot checker FloodWait cooldown (self-heal) --------------------------
 
@@ -939,6 +1026,7 @@ class CheckerRouter:
         raises a CheckerError subclass - exactly like CheckerClient.check.
         """
         if self.mode == MODE_API:
+            self._require_healthy_api()
             data = self.api.check(service, number)
             self._count("checker_api_checks")
             return self._tag(data, "api")
@@ -965,9 +1053,27 @@ class CheckerRouter:
             return data
 
         try:
+            self._require_healthy_api()
             data = self.api.check(service, number)
         except (CheckerUnavailable, CheckerError) as api_exc:
             reason = classify_api_error(api_exc)
+            if reason == "unknown" and not self.fallback.get("unknown", False):
+                # success=false / 4xx / malformed: normally definitive ("the
+                # answer is no"), so no fallback. But when the SERVICE itself
+                # is down the "answer" is garbage - re-verify liveness with a
+                # fresh probe and fall back instead of acting on it.
+                up, detail = self.probe_health(fresh=True)
+                if not up:
+                    self._log(
+                        f"Checker API gave an unusable answer ({api_exc}); the "
+                        f"liveness probe says the service itself is down "
+                        f"({detail}) - treating it as down, not as a verdict."
+                    )
+                    api_exc = CheckerServiceDown(
+                        f"Checker API is down (liveness: {detail}); "
+                        f"its answer is not trusted: {api_exc}"
+                    )
+                    reason = "is_down"
             if not self.fallback.get(reason, False):
                 raise
             if not self.bot_ready:

@@ -359,6 +359,22 @@ def test_status_summary_mentions_checker():
     check("status: bot checks counter shown", "via PRIMES bot" in summary, summary)
 
 
+def test_checker_extra_info():
+    info = m.checker_extra_info({"success": True, "is_registered": False,
+                                 "in_database": True, "source": "api"})
+    check("extra info: verdict-only answer shows nothing", info == "", info)
+
+    info = m.checker_extra_info({"success": True, "is_registered": True,
+                                 "operator": "JIO", "validity": "28 days",
+                                 "plan": "239", "source": "api"})
+    check("extra info: operator first, then the rest",
+          info == "operator=JIO plan=239 validity=28 days", info)
+
+    info = m.checker_extra_info({"success": True, "is_registered": False,
+                                 "operator": None, "circle": "", "source": "bot"})
+    check("extra info: empty values skipped", info == "", info)
+
+
 def main():
     test_worker_falls_back_to_bot()
     test_worker_api_mode_unchanged()
@@ -368,6 +384,7 @@ def main():
     test_auto_mode_warns_but_runs()
     test_checker_command_and_config_round_trip()
     test_status_summary_mentions_checker()
+    test_checker_extra_info()
 
     print()
     if FAILURES:

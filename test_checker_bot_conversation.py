@@ -522,7 +522,7 @@ def scenario_auto_mode_end_to_end():
         def check(self, service, number):
             self.calls += 1
             raise CheckerUnavailable(
-                "network: HTTPSConnectionPool(host='superassets.in'): "
+                "network: HTTPSConnectionPool(host='tubesave.in'): "
                 "Max retries exceeded")
 
     class _Coord(object):

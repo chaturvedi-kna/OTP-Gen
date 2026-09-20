@@ -44,16 +44,18 @@
   },
   "checker": {
     "mode": "auto",
-    "base_url": "https://superassets.in",
+    "base_url": "https://tubesave.in",
     "api_keys": [
       "AK__3b9HMjWPCtV8_kNsN4npV64lwPVqdAa"
     ],
     "service": "meesho",
     "max_retries": 10,
     "max_retry_wait_seconds": 45.0,
-    "min_interval_seconds": 1.0,
+    "min_interval_seconds": 5.0,
     "rate_limit_buffer_seconds": 0.5,
     "network_backoff_seconds": 1.5,
+    "health_check_enabled": true,
+    "health_cache_seconds": 60,
     "fallback": {
       "is_down": true,
       "read_timeout": true,
