@@ -38,7 +38,9 @@ from otp_client import (
 )
 from checker_client import (
     CheckerClient,
+    CheckerAuthError,
     CheckerError,
+    CheckerProxyError,
     CheckerUnavailable
 )
 from checker_router import (
@@ -90,6 +92,35 @@ def log(message, prefix=""):
         print(msg, flush=True)
     except UnicodeEncodeError:
         print(msg.encode("ascii", "replace").decode("ascii"), flush=True)
+
+
+def checker_extra_info(check):
+    """
+    Compact "k=v ..." string for v2 info fields beyond the verdict.
+
+    The API enriches responses with the number's operator (Jio / Airtel / Vi /
+    BSNL) and may include plan / validity / expiry / True-5G details. Field
+    names beyond "operator" are not in the published schema, so everything
+    past the known verdict bookkeeping is surfaced generically (operator first
+    for readability).
+    """
+    skip = {
+        "success", "api_version", "service", "number", "is_registered",
+        "in_database", "is_down", "source", "checker_name",
+        "checker_username", "batched", "api_error",
+    }
+    check = check or {}
+    bits = []
+    if check.get("operator") not in (None, ""):
+        bits.append(f"operator={check['operator']}")
+    for key in sorted(check):
+        if key in skip or key == "operator":
+            continue
+        value = check[key]
+        if value in (None, "", {}, []):
+            continue
+        bits.append(f"{key}={value}")
+    return " ".join(bits)
 
 
 class NumberContext:
@@ -618,6 +649,12 @@ class ParallelAutomationCoordinator:
             f"{self.checker.describe()}",
             f"Service: {self.checker_service}",
         ]
+        try:
+            api_url = getattr(getattr(self.checker, "api", None), "endpoint_url", "")
+        except Exception:
+            api_url = ""
+        if api_url:
+            lines.append(f"API endpoint: {api_url}")
         if self.checker.mode == MODE_AUTO:
             triggers = [name for name in
                         ("is_down", "timeout", "network", "http_5xx", "auth",
@@ -1439,8 +1476,10 @@ class ParallelAutomationCoordinator:
                 # A bot check navigates the bot (menu -> checker -> menu), so a
                 # parked offer is gone: re-arm it before the next number.
                 self._release_bot_warm()
+            extra_info = checker_extra_info(check)
             log(f"Checker result via {checker_source}: is_registered={is_registered} "
-                f"(Target: {self.target_registered})", prefix=pname)
+                f"(Target: {self.target_registered})"
+                + (f" [{extra_info}]" if extra_info else ""), prefix=pname)
 
             if is_registered != self.target_registered:
                 reason = "Already registered on Meesho" if is_registered else "Not registered on Meesho"
@@ -2046,6 +2085,83 @@ class ParallelAutomationCoordinator:
                 f"display name) and press START in that bot once from this "
                 f"Telegram account.")
 
+    def _checker_api_preflight(self):
+        """
+        Best-effort v2 startup probe: liveness (GET /health, no auth), then
+        the account check (GET /api/v1/me).
+
+        Warns early when the API itself is down, the key is dead, or the Free
+        plan's verified Indian proxy is missing - all otherwise surface as a
+        cancelled first number. Never stops the run: the normal check path
+        (and the bot fallback in auto mode) still applies per number.
+        """
+        if getattr(self.checker, "mode", None) == MODE_BOT:
+            return
+        api = getattr(self.checker, "api", None)
+        # Liveness first (no auth): when the service itself is down, API
+        # answers are not trusted - auto mode starts on the bot immediately
+        # instead of learning it from a cancelled first number.
+        health_probe = getattr(api, "health_status", None)
+        if callable(health_probe):
+            try:
+                up, detail = health_probe()
+            except Exception as exc:  # noqa: BLE001 - never block startup
+                up, detail = False, f"health probe failed: {exc}"
+            if not up:
+                log(f"Checker API preflight: liveness probe says the API is DOWN "
+                    f"({detail}) - API answers will not be trusted until it recovers.")
+                self.notify.alert(
+                    "⚠️ Checker API is down",
+                    f"Liveness probe (GET /health, no auth): {detail}\n\n"
+                    f"In auto mode checks go through the bot until the API "
+                    f"recovers; in api mode numbers are cancelled with this "
+                    f"reason instead of acting on bad API answers."
+                )
+                try:
+                    self.checker.mark_api_down(f"liveness probe: {detail}")
+                except Exception:
+                    pass
+                return
+        probe = getattr(api, "get_me", None)
+        if not callable(probe):
+            return
+        try:
+            me = probe()
+        except CheckerProxyError as exc:
+            log(f"Checker API preflight: {exc}")
+            self.notify.alert(
+                "⚠️ Checker API needs an Indian proxy",
+                f"{exc}\n\nEvery API check will fail until this is fixed. "
+                f"In auto mode the bot checker covers for the API; in api mode "
+                f"numbers are bought and cancelled until the proxy is added."
+            )
+            return
+        except CheckerAuthError as exc:
+            log(f"Checker API preflight: API key rejected ({exc}).")
+            self.notify.alert(
+                "❌ Checker API key rejected",
+                f"{exc}\n\nCheck checker.api_keys in config.json (a revoked key "
+                f"gives a new token in the Speedz Checker bot)."
+            )
+            return
+        except Exception as exc:
+            log(f"Checker API preflight: could not verify the key ({exc}); "
+                f"continuing anyway - the first check will say more.")
+            return
+        plan = me.get("plan_name", "?") or "?"
+        proxy_required = me.get("proxy_required")
+        rate = me.get("rate_limit_seconds")
+        rpm = me.get("requests_per_minute")
+        window = f"{rate:.0f}s" if isinstance(rate, (int, float)) else "?"
+        if rpm:
+            window += f" (~{rpm:g}/min)"
+        if proxy_required is True:
+            log(f"Checker API preflight: key OK, plan '{plan}', but the account "
+                f"still requires a verified Indian proxy - add one in the "
+                f"Speedz Checker bot's Profile or checks will fail with 403.")
+        else:
+            log(f"Checker API preflight: key OK (plan '{plan}', rate window {window}).")
+
     def _bot_in_checker_screen(self):
         """
         Read-only: is the PRIMES bot showing its number checker right now?
@@ -2298,6 +2414,9 @@ class ParallelAutomationCoordinator:
         # Only now does "the dedicated checker bot is ready" mean anything:
         # it rides on the same userbot connection.
         self._log_dedicated_checker_state()
+        # v2 account probe: a dead key or a missing Free-plan proxy is found
+        # here, before the first number is bought - not on number #1's cancel.
+        self._checker_api_preflight()
 
         # Checker mode sanity. "bot" cannot work without the userbot, and
         # starting the workers anyway would buy numbers only to cancel every

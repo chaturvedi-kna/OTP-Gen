@@ -2,7 +2,18 @@
 
 Three ways to validate a number before it is spent, in preference order:
 
-1. the **checker API** (superassets.in) — fast, parallel, rate limited per key;
+1. the **checker API** (Speedz Checker API v2, `https://tubesave.in`) — fast,
+   parallel, rate limited per key;
+
+> ⚠️ **API v2 migration (Sep 2026).** The old base URL (`superassets.in`) is
+> dead — `checker.base_url` must be `https://tubesave.in` (docs:
+> `https://tubesave.in/docs`). Free plan: **no monthly limit**, 1 request /
+> 5s — and the proxy requirement was dropped again (**No Proxy Needed For
+> API**, so nothing to add in Profile). Responses now also carry the number's
+> operator (Jio / Airtel / Vi / BSNL) plus plan / validity / expiry / True-5G
+> details where available — the worker log shows them in brackets. At startup
+> the tool probes liveness + `GET /api/v1/me` and warns you if the API is
+> down or the key is dead — before the first number is bought.
 2. a **dedicated Telegram checker bot** (`"checker" -> "telegram_bot"`) —
    driven through the SAME logged-in Telegram account but a SECOND bot
    conversation, so it never walks the PRIMES login bot out of a waiting OTP
@@ -25,9 +36,10 @@ Three ways to validate a number before it is spent, in preference order:
 ```json
 "checker": {
   "mode": "auto",
-  "base_url": "https://superassets.in",
+  "base_url": "https://tubesave.in",
   "api_keys": ["AK__...", "AK__second_key_if_you_have_one"],
   "service": "meesho",
+  "min_interval_seconds": 5.0,
 
   "fallback": {
     "is_down": true,
@@ -221,7 +233,7 @@ Two failures that used to be silent:
 | `read_timeout` (`timeout`, `timed_out`) | connect/read timeout — "takes more time to respond" |
 | `network` (`network_error`, `connection`) | connection refused / DNS / TLS failures |
 | `http_5xx` (`5xx`, `server_error`) | the API returned a 5xx |
-| `auth` (`auth_error`, `bad_keys`) | every configured API key was rejected (401/403) |
+| `auth` (`auth_error`, `bad_keys`) | every configured API key was rejected (401/403), incl. Free-plan "no verified proxy" |
 | `rate_limit` (`429`) | the 429 retry budget was spent — **off** by default: a rate limit means the API is alive, it is only waiting for its turn |
 | `unknown` (`other`) | `success=false` / unexpected payload — **off**: that is a definitive answer, not an outage |
 
@@ -373,13 +385,29 @@ Check the userbot setup in `SETUP_MEESHO_BOT.md` (`enabled`, `api_id`,
 
 ## 5. The API side: rate limits, retries & multiple keys
 
-The checker service rate limits **per API key per service**. With several
-provider workers validating numbers in parallel through a single key, the
-server answers:
+The checker service rate limits **per API key per service** (v2: Free = 1
+request / 5s / service / key; Starter / Plus / Pro = 30 / 45 / 60 per minute
+per key plus a monthly quota). With several provider workers validating
+numbers in parallel through a single key, the server answers:
 
 ```
 HTTP 429: {"detail":"Rate limit exceeded. Please wait 4.6s for service 'meesho'"}
 ```
+
+**Free plan + Indian proxy (no longer needed).** The Sep 2026 update dropped
+the proxy requirement ("No Proxy Needed For API"): Free keys work with no
+proxy and no monthly limit. The detection stays as a safety net — if a key is
+ever refused with HTTP 403 mentioning the proxy, the client raises
+`CheckerProxyError` (a `CheckerAuthError`, so `auto` mode falls back to the
+bot checker) with the fix in the message, and only that key is retired.
+
+**Operator info in responses.** The API enriches each verdict with the
+number's operator (`Jio` / `Airtel` / `Vi` / `BSNL`) and, where available,
+plan / validity / expiry / True-5G details. The client passes every extra
+field through untouched, and the worker log prints them:
+`Checker result via api: is_registered=False (Target: False) [operator=JIO
+validity=...]`. Field names beyond `operator` are not in the published
+schema, so unknown fields are shown generically (`key=value`).
 
 `checker_client.py` absorbs that instead of failing activations:
 
@@ -416,10 +444,35 @@ Failure types (`checker_client.py`) are what `auto` mode classifies:
 | `service` | `meesho` | Service name sent to the API. |
 | `max_retries` | `10` | Maximum attempts per check (429s, 5xx, network, timeouts). |
 | `max_retry_wait_seconds` | `45` | Hard ceiling on total time spent retrying one API check. |
-| `min_interval_seconds` | `1.0` | Conservative minimum spacing per key before a 429 teaches the real spacing. |
+| `min_interval_seconds` | `5.0` | Minimum spacing per key: matches the Free plan (1 req / 5s). Paid plans can lower it to `2.0`–`1.0`. A 429 still teaches longer spacing automatically. |
 | `rate_limit_buffer_seconds` | `0.5` | Safety margin on top of the server-asked wait. |
 | `network_backoff_seconds` | `1.5` | Backoff between retries after network errors / 5xx. |
 | `timeout` | `15` | Per-request HTTP timeout — the read timeout that `auto` treats as "too slow" and hands to the bot. |
+
+**Account helpers (v2).** `CheckerClient.get_me()` (`GET /api/v1/me`: plan,
+rate window, usage, `proxy_required`), `.list_services()` and `.health()` are
+single-shot probes. The coordinator calls `get_me()` once at startup and logs
+`key OK (plan '…', rate window …s)` — or alerts when the key is dead / the
+Free-plan proxy is missing.
+
+**Liveness gate (no auth).** Before trusting the API, the router asks
+`GET /health` (cached `health_cache_seconds`, default 60s; disable with
+`health_check_enabled: false`):
+
+* a down API is **not asked at all** — `auto` goes straight to the bot (plus
+  cooldown), `api` cancels with a clear "liveness probe says down" reason;
+* an **ambiguous answer** (`success=false` / 4xx / malformed — normally
+  definitive, no fallback) is re-verified with a **fresh** probe: if the
+  service itself is down, it is treated as `is_down` (bot fallback) instead
+  of acting on garbage by cancelling the number. If the service is up, the
+  answer stands and the number is cancelled as before.
+* the startup preflight probes liveness first and alerts
+  (`⚠️ Checker API is down`), entering the API cooldown immediately in
+  `auto` mode so check #1 already uses the bot.
+
+Fresh probes are counted (`checker_health_probes` / `checker_health_down`).
+Like `is_down: true` before it, a down service never produces a verdict —
+only a fallback (or a clearly-labelled cancel in `api` mode).
 
 ## 6. PRIMES fallback disabled + self-heal mode (new)
 
