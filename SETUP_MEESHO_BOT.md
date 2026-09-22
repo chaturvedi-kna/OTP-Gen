@@ -220,6 +220,13 @@ auto mode) instead of being lost.
 
 ## One-time setup
 
+> Running it in a container instead of on the host Python (identical behaviour
+> on Termux / Windows / Linux, `config.json` still a host file): see
+> [SETUP_DOCKER.md](SETUP_DOCKER.md). The container is optional — the pinned
+> interpreter just removes a whole class of version-specific bugs (e.g. the
+> pre-3.11 `concurrent.futures.TimeoutError` trap fixed in
+> `meesho_bot_client.py`).
+
 1. Create `api_id` / `api_hash` at <https://my.telegram.org> → API development
    tools. Use a **dedicated/burner Telegram account** (user automation carries
    account-ban risk; do not use your personal account).

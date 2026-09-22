@@ -1,0 +1,54 @@
+# ---------------------------------------------------------------------------
+# OTP-Gen in a container, with config.json editable on the host.
+#
+#   docker compose build                       # after a `git pull` only when
+#                                              # requirements.txt changed
+#   docker compose run --rm otp python login_userbot.py       # one-time session
+#   docker compose run --rm otp python main.py --balance      # one-shot checks
+#   docker compose run --rm otp python main.py --provider tempora
+#   docker compose up -d && docker compose logs -f otp         # a real run
+#
+# The project directory is bind-mounted over /app (see the Dockerfile comment):
+# config.json, userbot.session.txt, stats/state files and .signals-*/ are read
+# and written straight on the host - no rebuild, no `docker cp`.
+#
+# tty + stdin_open keep the interactive parts working: login_userbot.py asks
+# for the Telegram login code (and the 2FA password) on stdin, and the manual
+# trigger flow reads its `.signals-*/go` files from the host.
+#
+# One service per parallel run (see runtime.py: one instance per provider):
+# uncomment the second service and use `docker compose up temporary vsimpro`,
+# or simply run the first one with --provider all.
+# ---------------------------------------------------------------------------
+services:
+  otp:
+    build:
+      context: .
+    image: otp-gen:latest
+    container_name: otp-gen
+    init: true                 # reap children + forward SIGTERM properly
+    stdin_open: true
+    tty: true
+    working_dir: /app
+    volumes:
+      # Code + config + session + stats/state/signals, all host-side.
+      - .:/app
+    environment:
+      # Not Termux: no Android notifications (telegram notifications are
+      # unaffected, they come from config.json).
+      TERMUX_NOTIFICATIONS: "0"
+    command: ["python", "main.py"]
+
+  # --- second parallel instance (own config.json "instances" block) --------
+  # otp-vsimpro:
+  #   build:
+  #     context: .
+  #   image: otp-gen:latest
+  #   container_name: otp-gen-vsimpro
+  #   init: true
+  #   stdin_open: true
+  #   tty: true
+  #   working_dir: /app
+  #   volumes:
+  #     - .:/app
+  #   command: ["python", "main.py", "--provider", "vsimpro"]
