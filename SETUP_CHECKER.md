@@ -355,6 +355,16 @@ buttons.
 * Checks and logins share one conversation with one bot and are serialised by
   a lock, so a worker's check can never interleave with the coordinator's
   login flow (the second caller waits its turn).
+* The read-only "is the PRIMES chat showing its checker screen?" probe (used
+  to tell a pre-warm that lost its offer apart from one hijacked by a check)
+  is stricter than the checker flow's own classification: the login flow's
+  Change Number prompt and its "⏳ Fetching your offer… / setting things up"
+  copy both match the loose checker heuristics, so they are ruled out
+  explicitly. The "a number check is using the same conversation" warning is
+  only printed when a check can actually drive that chat - no dedicated
+  checker bot, one configured with the login bot's own @handle, or
+  `fallback_to_primes: true`. With a separate dedicated bot and fallback off,
+  a checker-looking screen there is the login flow itself, never a check.
 * A check that starts while the bot sits on a leftover login/OTP screen
   resets to the main menu first.
 * Because a check ends at the main menu, the bot checker is the only reason the
