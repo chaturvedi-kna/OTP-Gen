@@ -589,9 +589,9 @@ def scenario_cancel_wait_window():
           record is not None and not record.get("expiry_assumed")
           and 0.5 <= horizon <= 10,
           ((record or {}).get("expiry_at"), horizon))
-    check("wait: the user is told the answer and the retry window",
-          any("ACCESS_CANCEL_WAIT" in body and "wait window" in body
-              for _, body in coordinator.messages),
+    check("wait: OTPIndia's expected cancel window does not send a notification",
+          not any("Cancel refused - deferred" in title
+                  for title, _ in coordinator.messages),
           coordinator.messages)
 
     resolved = wait_until(
@@ -614,8 +614,37 @@ def scenario_cancel_wait_window():
     coordinator.stop_requested.set()
 
 
+def scenario_otpindia_no_balance_waits_for_pending_refund():
+    coordinator = build_coordinator(otpindia_balance_wait_poll_seconds=0.05)
+    coordinator.settings["otpindia_balance_wait_poll_seconds"] = 0.05
+    client = FakeProvider(name="otpindia", balance_before=20.0)
+    client.refunded = True
+    coordinator.pending_cancels.has_pending = lambda provider: True
+    coordinator.pending_cancels.pending = lambda: [{
+        "provider": "otpindia", "expiry_at": time.time() + 0.2,
+    }]
+
+    def clear_pending():
+        time.sleep(0.25)
+        coordinator.pending_cancels.has_pending = lambda provider: False
+        coordinator.pending_cancels.pending = lambda: []
+
+    threading.Thread(target=clear_pending, daemon=True).start()
+    started = time.time()
+    resumed = coordinator._wait_for_pending_otpindia_refunds(client)
+    elapsed = time.time() - started
+    check("no balance: OTPIndia waits for its pending cancel instead of stopping",
+          resumed and elapsed >= 0.2 and not coordinator.stopped,
+          (resumed, elapsed, coordinator.stopped))
+    check("no balance: balance is refreshed after the refund wait",
+          coordinator._ledger("otpindia").get("expected_balance") == 20.0,
+          coordinator._ledger("otpindia"))
+    coordinator.stop_requested.set()
+
+
 def main():
     scenario_defer_instead_of_stop()
+    scenario_otpindia_no_balance_waits_for_pending_refund()
     scenario_retry_at_expiry()
     scenario_late_otp_during_wait()
     scenario_deferred_otp_record()

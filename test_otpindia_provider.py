@@ -428,6 +428,25 @@ def test_telegram_start_help_mentions_run_provider():
     joined = "\n".join(p.get("text") or "" for p in sent)
     check("telegram: /start documents /run <provider>", "/run <provider" in joined, joined)
 
+    backend = FakeUpdates("/start", token="t", chat_id="1")
+    notifier = m.Notifier({"telegram": {"enabled": True},
+                            "termux": {"enabled": False}})
+    notifier.telegram = backend
+    notifier.set_command_callbacks(
+        status_cb=lambda: "status", balance_cb=lambda: "balance",
+        run_cb=lambda arg: "run", stop_cb=lambda: None,
+        referral_cb=lambda arg: "referral", checker_cb=lambda arg: "checker",
+    )
+    registrations = [payload for method, payload in backend.sent
+                     if method == "setMyCommands"]
+    registered = {item["command"]: item["description"]
+                  for item in registrations[-1]["commands"]} if registrations else {}
+    check("telegram: native command menu lists supported bot commands",
+          {"start", "run", "status", "balance", "referral", "checker", "stop"}
+          <= set(registered), registered)
+    check("telegram: command menu explains provider-specific /run",
+          "provider" in registered.get("run", "").lower(), registered)
+
 
 # --- coordinator request_run ---------------------------------------------------
 
