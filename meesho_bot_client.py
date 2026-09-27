@@ -49,6 +49,7 @@ back to the existing manual Telegram trigger flow.
 """
 
 import asyncio
+import concurrent.futures
 import random
 import re
 import threading
@@ -94,6 +95,36 @@ class MeeshoBotTimeout(MeeshoBotError):
     into an alert + number cancellation instead of an unhandled crash, and the
     aborted coroutine is cancelled on its loop so no task is left pending.
     """
+
+
+def _is_timeout_error(exc):
+    """
+    True for every "this call ran out of time" exception Python can raise here.
+
+    `concurrent.futures.Future.result(timeout=...)` raises
+    `concurrent.futures.TimeoutError`, and `asyncio` used to raise the same
+    class - but NEITHER is the builtin `TimeoutError` before Python 3.11: the
+    three were only unified in 3.11 ("Changed in version 3.11: This class was
+    made an alias of TimeoutError", concurrent.futures / asyncio docs). So on
+    the Python 3.8-3.10 anaconda ships, a bare `except TimeoutError:` does NOT
+    catch what `future.result(timeout=...)` raises.
+
+    That is not a cosmetic detail: _run() polls the future in short slices and
+    treats the slice timeout as "keep waiting, the flow is still working". With
+    a bare `except TimeoutError` the very first slice escapes _run() as a
+    message-less TimeoutError - so every PRIMES flow was reported as failed
+    after ~2s, the still-running coroutine kept tapping the same Telegram chat
+    while the next flow started, and the coordinator logged a bare
+    "Offer pre-warm failed: " / "Unexpected error ... Error: " with no reason.
+
+    The classes are read at call time (not frozen into a module constant) so
+    the pre-3.11 split stays testable on a 3.11+ interpreter.
+    """
+    for cls in (TimeoutError, concurrent.futures.TimeoutError,
+                getattr(asyncio, "TimeoutError", None)):
+        if cls is not None and isinstance(exc, cls):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1405,6 +1436,13 @@ class MeeshoBotClient:
         On abort the coroutine is cancelled on its loop (so it cannot leak as
         a pending task) and a MeeshoBotTimeout is raised - a MeeshoBotError,
         which the coordinator handles like any other bot failure.
+
+        Every timeout below is recognised through _is_timeout_error(), never
+        with a bare `except TimeoutError`: on Python < 3.11 future.result()
+        raises a DIFFERENT class, so the first slice used to escape this
+        method as a bare, message-less TimeoutError - "every flow failed
+        after ~2s" while its coroutine kept driving the chat (see that
+        helper's docstring).
         """
         if self._loop is None:
             raise MeeshoBotError("userbot event loop not started")
@@ -1412,58 +1450,81 @@ class MeeshoBotClient:
         self._progress()
         deadline = (time.time() + timeout) if timeout else None
         stall = self.stall_timeout
+        op = (getattr(coro, "__name__", "") or "bot step").replace("_a_", "", 1)
         # Poll in short slices so the watchdog is checked between them.
         slice_wait = max(0.1, min(2.0, stall / 4.0))
 
-        while True:
-            wait = slice_wait
-            if deadline is not None:
-                wait = min(wait, max(0.05, deadline - time.time()))
-            try:
-                return future.result(timeout=wait)
-            except TimeoutError:
-                if future.done():
-                    # The future finished in the race window right at the
-                    # slice boundary: return its value, or - if the coroutine
-                    # itself failed with a timeout (e.g. a Telethon request
-                    # timeout) - surface that as a bot failure, never as a
-                    # bare TimeoutError that crashes the coordinator.
-                    try:
-                        return future.result()
-                    except TimeoutError:
-                        raise MeeshoBotTimeout(
-                            f"PRIMES bot flow "
-                            f"'{(getattr(coro, '__name__', '') or 'bot step').replace('_a_', '', 1)}' "
-                            f"failed with a Telegram timeout"
-                            f"{' (stage: ' + self._step_note + ')' if self._step_note else ''}."
-                        )
-                # else: just the slice elapsing - check the deadlines below.
+        try:
+            while True:
+                wait = slice_wait
+                if deadline is not None:
+                    wait = min(wait, max(0.05, deadline - time.time()))
+                try:
+                    return future.result(timeout=wait)
+                except Exception as exc:
+                    if not _is_timeout_error(exc):
+                        # The flow itself failed (unknown screen, referral
+                        # problem, ...): its own error is the informative one.
+                        raise
+                    if future.done():
+                        # The future finished in the race window right at the
+                        # slice boundary: return its value, or - if the
+                        # coroutine itself failed with a timeout (e.g. a
+                        # Telethon request timeout) - surface that as a bot
+                        # failure, never as a bare TimeoutError that crashes
+                        # the coordinator.
+                        try:
+                            return future.result()
+                        except Exception as inner:
+                            if not _is_timeout_error(inner):
+                                raise
+                            raise MeeshoBotTimeout(
+                                f"PRIMES bot flow '{op}' failed with a "
+                                f"Telegram timeout"
+                                f"{' (stage: ' + self._step_note + ')' if self._step_note else ''}."
+                            ) from inner
+                    # else: just the slice elapsing - check the deadlines below.
 
-            now = time.time()
-            hard = deadline is not None and now >= deadline
-            stalled = now - self._last_progress >= stall
-            if not (hard or stalled):
-                continue
+                now = time.time()
+                hard = deadline is not None and now >= deadline
+                stalled = now - self._last_progress >= stall
+                if not (hard or stalled):
+                    continue
 
-            op = (getattr(coro, "__name__", "") or "bot step").replace("_a_", "", 1)
-            note = f" (stage: {self._step_note})" if self._step_note else ""
-            reason = (
-                f"hard {timeout:.0f}s limit reached" if hard
-                else f"no screen/tap progress for {now - self._last_progress:.0f}s "
-                     f"(watchdog {stall:.0f}s)"
-            )
-            message = (f"PRIMES bot flow '{op}' aborted: {reason}{note}. The "
-                       f"Telegram side stopped responding mid-flow, so the "
-                       f"number/code state is unknown - check the bot manually.")
-            if future.cancel():
-                # run_coroutine_threadsafe chains this cancel onto the asyncio
-                # task, so the coroutine unwinds on its loop instead of
-                # lingering as a pending task until the loop is torn down.
-                raise MeeshoBotTimeout(message)
-            # It finished inside the race window right at the deadline: its
-            # real result (or error, e.g. an unknown screen with its text and
-            # buttons) is more informative than the timeout.
-            return future.result(timeout=1.0)
+                note = f" (stage: {self._step_note})" if self._step_note else ""
+                reason = (
+                    f"hard {timeout:.0f}s limit reached" if hard
+                    else f"no screen/tap progress for {now - self._last_progress:.0f}s "
+                         f"(watchdog {stall:.0f}s)"
+                )
+                message = (f"PRIMES bot flow '{op}' aborted: {reason}{note}. The "
+                           f"Telegram side stopped responding mid-flow, so the "
+                           f"number/code state is unknown - check the bot manually.")
+                if future.cancel():
+                    # run_coroutine_threadsafe chains this cancel onto the asyncio
+                    # task, so the coroutine unwinds on its loop instead of
+                    # lingering as a pending task until the loop is torn down.
+                    raise MeeshoBotTimeout(message)
+                # It finished inside the race window right at the deadline: its
+                # real result (or error, e.g. an unknown screen with its text and
+                # buttons) is more informative than the timeout.
+                try:
+                    return future.result(timeout=1.0)
+                except Exception as exc:
+                    if not _is_timeout_error(exc):
+                        raise
+                    raise MeeshoBotTimeout(message) from exc
+        finally:
+            # Leak guard: however this call exits, the coroutine must not be
+            # left running on the userbot loop. It drives the SAME Telegram
+            # chat, so an abandoned flow keeps tapping it while the next flow
+            # starts (two flows in one conversation: the offer never sticks
+            # and a paid number's OTP screen gets walked away from). Calling
+            # cancel() on this not-yet-finished concurrent future cancels the
+            # asyncio task it was chained to.
+            if not future.done() and future.cancel():
+                self._log(f"[MEESHO-BOT] Cancelled an abandoned '{op}' flow "
+                          f"that was still running on the userbot loop.")
 
     # -- low-level Telethon helpers ----------------------------------------
 
@@ -2620,6 +2681,36 @@ class MeeshoBotClient:
         """
         with self._flow_lock:
             screen = self._run(self._latest_screen())
+        return self._looks_like_checker_screen(screen)
+
+    def _looks_like_checker_screen(self, screen):
+        """
+        True only for a screen that really belongs to the bot CHECKER.
+
+        classify_check() is deliberately loose - it has to accept whatever the
+        configured checker bot shows - so it also accepts two LOGIN screens:
+
+          * the login number prompt ("✏️ Change Number - Send the 10-digit
+            mobile number you'd like to use instead.", lone Cancel button),
+            matched by its "10-digit ... + navigation button" rule;
+          * the bot's own "⏳ Fetching your offer… / setting things up" copy,
+            matched by the generic "please wait / fetching / processing"
+            checking hints.
+
+        Reporting either as "a number check is using this conversation" while
+        the offer pre-warm walks the login flow produced the bogus "the PRIMES
+        bot is on its number checker screen - configure a dedicated checker
+        bot" warning (with a dedicated checker bot configured and the API
+        answering the check). Neither is a checker screen: the login prompt is
+        excluded through the cold-read test, and "the bot is working on the
+        next offer" copy carries no check/verify/registration wording at all.
+        """
+        if self._at_number_prompt(screen, require_marker=True):
+            return False
+        text = normalize_label(screen.text)
+        if (_hint_match(text, WORKING_HINTS)
+                and not _hint_match(text, _CHECKER_WORD_HINTS)):
+            return False
         return screen.classify_check((), (), ()) in (
             S_CHECK_PROMPT, S_CHECKING, S_CHECK_RESULT)
 

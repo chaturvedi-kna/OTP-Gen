@@ -220,6 +220,13 @@ auto mode) instead of being lost.
 
 ## One-time setup
 
+> Running it in a container instead of on the host Python (identical behaviour
+> on Termux / Windows / Linux, `config.json` still a host file): see
+> [SETUP_DOCKER.md](SETUP_DOCKER.md). The container is optional — the pinned
+> interpreter just removes a whole class of version-specific bugs (e.g. the
+> pre-3.11 `concurrent.futures.TimeoutError` trap fixed in
+> `meesho_bot_client.py`).
+
 1. Create `api_id` / `api_hash` at <https://my.telegram.org> → API development
    tools. Use a **dedicated/burner Telegram account** (user automation carries
    account-ban risk; do not use your personal account).
@@ -333,6 +340,7 @@ auto mode) instead of being lost.
 | Number blocked / banned / already registered | count `user_blocked`, cancel/reset, continue |
 | Unknown/unexpected screen | alert with the screen text **and the buttons**, cancel the number (refund verified — nothing was submitted), reset flow |
 | Telegram side hangs (no screen/tap progress for `flow_timeout_seconds`) | ⏱️ `MeeshoBotTimeout` — alert (with the stage it hung at), cancel the number (refund verified — the tally flags it if the number had already reached the bot), reset flow, **automation continues** |
+| `concurrent.futures._base.TimeoutError` with an **empty** message (`Offer pre-warm failed: ` / `Unexpected error while processing <number>: `), every flow "failing" after ~2 s while the bot keeps jumping between screens | pre-3.11 Python: `future.result(timeout=…)` raises a class the builtin `TimeoutError` does not catch, so `_run()`'s first watchdog slice escaped as a bare error **and left the flow running** (fixed — `_is_timeout_error()` recognises every timeout class, and an abandoned flow is now cancelled instead of tapping the chat). Only an out-of-date copy can still show this: update the code |
 | Change Number used > `max_change_number` in a row | reset to main menu (full flow restart) |
 | Change Number tap ignored by the bot | retried (`change_number_retries` extra taps) inside `change_number_timeout_seconds` / `change_number_budget_seconds` — no menu restart |
 | Reroll lands on **⏳ Setting things up…** | the bot's preparing transient: classified as its own `working` state and waited out (`working_screen_waits` extra rounds) so a throttled bot holding it past one step timeout no longer fails with "Offer screen has no reroll button" (and never cancels a paid number for it). If it *never* resolves the failure says exactly that — give the bot a rest before the next number |

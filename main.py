@@ -2045,7 +2045,7 @@ class ParallelAutomationCoordinator:
                 # again instead of typing the next number into a wrong screen.
                 # A checker screen means a number check took the conversation
                 # over - say so, it is the one conflict worth warning about.
-                if self._bot_in_checker_screen():
+                if self._bot_in_checker_screen() and self._checks_can_use_primes_chat():
                     log("Parked offer prompt is gone: a number check is using "
                         "the PRIMES conversation (no dedicated checker bot, or "
                         "the check was routed to the login chat). Re-arming "
@@ -2175,6 +2175,39 @@ class ParallelAutomationCoordinator:
         except Exception:
             return False
 
+    def _checks_can_use_primes_chat(self):
+        """
+        May a number check drive the PRIMES (login) Telegram conversation?
+
+        True when no dedicated checker bot is configured, when the configured
+        one IS the login bot (same @handle - it uses the one conversation the
+        claim guards), or when PRIMES fallback is enabled. With a separate
+        dedicated bot and fallback_to_primes=false a check NEVER taps this
+        chat (the router cancels the number instead), so a checker-looking
+        screen here belongs to the login flow itself and must not be reported
+        as "a number check is using the conversation" - that message sent the
+        user hunting for a checker conflict that did not exist.
+        """
+        checker = getattr(self, "checker", None)
+        if checker is None:
+            return True
+        # api mode (or a plain CheckerClient) never uses a bot conversation.
+        if not getattr(checker, "mode_wants_bot", True):
+            return False
+        bot_checker = getattr(checker, "bot", None)
+        if bot_checker is None:
+            return True
+        if not getattr(bot_checker, "has_preferred", False):
+            # No dedicated checker bot: checks use the PRIMES conversation.
+            return True
+        if bool(getattr(bot_checker, "fallback_to_primes", False)):
+            return True
+        try:
+            return bool(bot_checker.preferred_shares_login(
+                bot_checker.preferred_client))
+        except Exception:
+            return True
+
     def _bot_warm_once(self):
         """Walk the bot to an agreed offer and park it there (best effort).
 
@@ -2203,8 +2236,12 @@ class ParallelAutomationCoordinator:
             # A number check that drives the SAME chat (no dedicated checker
             # bot, or one mis-bound to the PRIMES bot) walks the bot off the
             # offer screen mid-reroll - that is a conflict, not a bot bug:
-            # say so instead of a bare "pre-warm failed".
-            if self._bot_in_checker_screen():
+            # say so instead of a bare "pre-warm failed". With a separate
+            # dedicated checker bot and fallback_to_primes=false no check can
+            # have touched this chat, so the conflict line would be a false
+            # alarm (the pre-warm's own number-prompt / "fetching your offer"
+            # copy reads as checker-like) - report the real reason instead.
+            if self._bot_in_checker_screen() and self._checks_can_use_primes_chat():
                 log("Offer pre-warm stopped: the PRIMES bot is on its number "
                     "checker screen - a number check is using the same "
                     "conversation. Configure a dedicated checker bot "

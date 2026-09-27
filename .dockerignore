@@ -1,0 +1,30 @@
+# Runtime files that must never enter the build context / image.
+# config.json is DELIBERATELY not ignored: it holds no secrets and the tool
+# writes to it at runtime (/referral <link>, /checker <mode>, --checker-mode).
+.git
+.gitignore
+.venv
+__pycache__
+
+# Credentials / sessions / notification targets
+userbot.session.txt
+*.session
+*.session-journal
+
+# Local runtime state (per-instance names covered too)
+stats.json
+stats.*.json
+stats.tmp
+state.json
+state.*.json
+state.tmp
+pending_cancels.json
+pending_cancels.*.json
+.signals/
+.signals-*/
+cancel_refused_otp.jsonl
+cancel_refused_otp.*.jsonl
+
+# Docs / tests are not needed in the image
+SETUP_*.md
+test_*.py
