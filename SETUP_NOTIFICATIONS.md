@@ -338,3 +338,48 @@ prewarm) talks to the PRIMES chat at a time — the others wait a bounded time
 or cancel-with-refund instead of interleaving. Trade-offs: one shared
 stats/state file for all three providers, and the bot serializes whatever it
 touches (the provider workers themselves still run fully parallel).
+
+### Mixed layout: one provider in tab 1, two in tab 2
+
+`--instance` (which PRIMES account / command bot / stats files a tab owns)
+and `--provider` (which workers that tab runs) are independent:
+
+```bash
+# Tab 1: tempora only
+python main.py --provider tempora
+
+# Tab 2: vsimpro + otpindia sharing the vsimpro account and files
+python main.py --instance vsimpro --provider vsimpro,otpindia
+```
+
+The explicit `--instance vsimpro` on tab 2 matters: a multi-provider
+`--provider` alone derives no instance name (it would fall back to the
+top-level userbot session / command bot instead of this tab's own).
+
+Alternatively put the mix in the instance block and start the tab with only
+`--instance`:
+
+```json
+"instances": {
+  "vsimpro": { "active_otp_provider": "vsimpro,otpindia" }
+}
+```
+
+```bash
+python main.py --instance vsimpro
+```
+
+Switch a tab live from its own command chat — no restart needed:
+
+| Command (tab 2's bot chat) | Runs |
+|---|---|
+| `/run vsimpro` | only vsimpro |
+| `/run otpindia` | only otpindia |
+| `/run vsimpro,otpindia` | both again |
+| `/run` | whatever the tab started with |
+
+otpindia rides on tab 2's existing PRIMES account: both workers are in ONE
+process, so the in-process bot-claim lock serializes everything they do in
+the bot chat — no third Telegram account is required. (Until `otpindia.api_key`
+is set, tab 2 simply runs vsimpro only; `/run vsimpro,otpindia` replies with
+the reason instead.)

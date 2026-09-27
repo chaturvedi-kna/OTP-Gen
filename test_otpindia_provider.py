@@ -492,6 +492,66 @@ def test_worker_requests_number_with_service_and_server():
           (res, params))
 
 
+def test_two_tab_layout():
+    """Tab 1 = tempora, tab 2 = vsimpro + otpindia, switchable when needed.
+
+    Verifies both wiring styles:
+      * CLI:   --provider tempora  |  --instance vsimpro --provider vsimpro,otpindia
+      * config: instances.<name>.active_otp_provider selected by --instance alone
+    plus the /run equivalents used to switch a tab live.
+    """
+    from runtime import apply_instance_overrides, resolve_instance
+    from otp_client import validate_provider_selection
+
+    config = json.load(open(os.path.join(REPO_DIR, "config.json"), encoding="utf-8"))
+    config["otpindia"]["api_key"] = "ind-key"
+    config["instances"] = {
+        "tempora": {"active_otp_provider": "tempora"},
+        "vsimpro": {"active_otp_provider": "vsimpro,otpindia"},
+    }
+
+    # Tab 1: --provider tempora (instance auto-derived -> tempora account/bot/files)
+    inst1 = resolve_instance(None, "tempora")
+    cfg1 = apply_instance_overrides(config, inst1)
+    names1 = [c.name for c in create_otp_clients(cfg1, provider_override="tempora")]
+    check("layout: tab 1 runs tempora only",
+          inst1 == "tempora" and names1 == ["tempora"], (inst1, names1))
+
+    # Tab 2, CLI style: --instance vsimpro --provider vsimpro,otpindia
+    # (the explicit --instance is REQUIRED here: a multi-provider --provider
+    #  alone derives instance "" and would miss the tab's account overrides)
+    inst2 = resolve_instance("vsimpro", "vsimpro,otpindia")
+    cfg2 = apply_instance_overrides(config, inst2)
+    names2 = [c.name for c in create_otp_clients(cfg2, provider_override="vsimpro,otpindia")]
+    check("layout: tab 2 runs vsimpro + otpindia",
+          inst2 == "vsimpro" and names2 == ["vsimpro", "otpindia"], (inst2, names2))
+
+    # Tab 2, config style: --instance vsimpro only, selection from the block
+    cfg2b = apply_instance_overrides(config, resolve_instance("vsimpro", None))
+    names2b = [c.name for c in create_otp_clients(cfg2b, provider_override=None)]
+    check("layout: instances.vsimpro.active_otp_provider drives the tab",
+          names2b == ["vsimpro", "otpindia"], names2b)
+
+    # Live switch on tab 2 (what a /run <provider> sends):
+    names3 = [c.name for c in create_otp_clients(cfg2, provider_override="vsimpro")]
+    check("layout: /run vsimpro narrows tab 2 to vsimpro only",
+          names3 == ["vsimpro"], names3)
+    names4 = [c.name for c in create_otp_clients(cfg2, provider_override="vsimpro,otpindia")]
+    check("layout: /run vsimpro,otpindia brings otpindia back",
+          names4 == ["vsimpro", "otpindia"], names4)
+
+    # Same providers without otpindia credentials -> otpindia is skipped
+    # (and the Telegram /run path REJECTS with an explanation instead).
+    no_key = json.loads(json.dumps(config))
+    no_key["otpindia"]["api_key"] = ""
+    names5 = [c.name for c in create_otp_clients(no_key, provider_override="vsimpro,otpindia")]
+    check("layout: missing otpindia key leaves tab 2 on vsimpro (skipped)",
+          names5 == ["vsimpro"], names5)
+    ok, err = validate_provider_selection(no_key, "vsimpro,otpindia")
+    check("layout: /run tells the user why otpindia was refused",
+          not ok and "otpindia" in err, (ok, err))
+
+
 def main():
     print("=" * 60)
     print("OTPINDIA PROVIDER + /run <provider> CHECK")
@@ -507,6 +567,7 @@ def main():
     test_request_run_selection()
     test_request_run_otpindia()
     test_worker_requests_number_with_service_and_server()
+    test_two_tab_layout()
 
     print("=" * 60)
     if FAILURES:

@@ -531,9 +531,13 @@ class ParallelAutomationCoordinator:
     def get_status_summary(self):
         """Returns live tool status."""
         state_str = "🟢 RUNNING" if self.is_running else "⚪ IDLE / STOPPED"
+        # Show what THIS tab actually runs (the --provider / instance selection),
+        # not the raw config string, which can differ on a mixed-layout tab.
+        mode_text = ", ".join(c.name.upper() for c in self.configured_clients) \
+            or str(self.config.get("active_otp_provider", "both")).upper()
         lines = [
             f"🤖 Meesho Automation: {state_str}",
-            f"Mode: {self.config.get('active_otp_provider', 'both').upper()}",
+            f"Mode: {mode_text}",
         ]
         run_names = [c.name for c in self.clients]
         configured_names = [c.name for c in self.configured_clients]
