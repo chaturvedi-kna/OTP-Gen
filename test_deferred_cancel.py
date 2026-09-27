@@ -15,6 +15,8 @@ This check drives the real coordinator with a scripted provider:
   * an OTP arriving during the wait is reported with its code and the charge
     is accepted (no cancel retry),
   * at expiry the cancel is retried and only then the refund is tallied,
+  * a structured refusal (OTPIndia's ACCESS_CANCEL_WAIT) is retried after the
+    provider's own wait window instead of the assumed activation expiry,
   * a hold that cannot be measured suspends the tally instead of stopping,
   * pending cancellations survive a restart.
 
@@ -68,6 +70,8 @@ if "websocket" not in sys.modules:
 
 import main as m  # noqa: E402
 from cancel_watch import (  # noqa: E402
+    CANCEL_RETRY_TYPES,
+    CANCEL_SUCCESS_TYPES,
     CancelWatchManager,
     PendingCancelStore,
     resolve_settings,
@@ -96,10 +100,10 @@ def wait_until(condition, timeout=25.0, interval=0.05):
 class FakeProvider(object):
     """Scripted provider: balance, cancel answers and status answers."""
 
-    name = "tempora"
-
     def __init__(self, balance_before=100.0, price=7.0,
-                 cancel_script=None, status_script=None, balance_error=False):
+                 cancel_script=None, status_script=None, balance_error=False,
+                 name="tempora"):
+        self.name = name
         self.price = price
         self.refunded = False
         self.balance_error = balance_error
@@ -107,6 +111,7 @@ class FakeProvider(object):
         self.cancel_script = list(cancel_script or [])
         self.status_script = list(status_script or [])
         self.cancel_calls = []
+        self.cancel_times = []
         self.status_calls = []
         self.finished = []
 
@@ -128,6 +133,7 @@ class FakeProvider(object):
 
     def cancel(self, activation_id):
         self.cancel_calls.append(activation_id)
+        self.cancel_times.append(time.time())
         answer = self.cancel_script.pop(0) if self.cancel_script else {"type": "ACCESS_CANCEL"}
         if isinstance(answer, Exception):
             raise answer
@@ -541,6 +547,73 @@ def scenario_opt_out():
           (coordinator.pending_cancels.pending(), coordinator.stats.snapshot()["refunds_missing"]))
 
 
+# ---------------------------------------------------------------------------
+# 8. OTPIndia's ACCESS_CANCEL_WAIT: retried after the provider's wait window
+# ---------------------------------------------------------------------------
+
+def scenario_cancel_wait_window():
+    # OTPIndia refuses a cancel until 2 minutes after the number was issued
+    # and answers {"type": "ACCESS_CANCEL_WAIT", "seconds": ...}. That wait is
+    # short and KNOWN: the watcher must retry after the provider's wait window
+    # - NOT after the assumed 600s activation expiry configured here on purpose.
+    coordinator = build_coordinator(cancel_error_expiry_seconds=600,
+                                    cancel_error_grace_seconds=0,
+                                    cancel_error_poll_interval_seconds=0.2,
+                                    cancel_error_retry_attempts=3,
+                                    cancel_error_retry_delay_seconds=0.2)
+    client = FakeProvider(
+        name="otpindia",
+        cancel_script=[{"type": "ACCESS_CANCEL_WAIT", "seconds": 2},
+                       {"type": "ACCESS_CANCEL"}],
+    )
+    coordinator.clients = [client]
+    coordinator._note_balance("otpindia", 100.0)
+
+    started = time.time()
+    result = coordinator.handle_cancellation(client, "act-wait", "9999999999",
+                                             "Already registered on Meesho")
+    elapsed = time.time() - started
+
+    check("wait: ACCESS_CANCEL_WAIT is 'retry later', not a cancel success",
+          "ACCESS_CANCEL_WAIT" in CANCEL_RETRY_TYPES
+          and "ACCESS_CANCEL_WAIT" not in CANCEL_SUCCESS_TYPES)
+    check("wait: deferred immediately (the worker is not blocked)",
+          elapsed < 10.0 and result.get("deferred") is True, result)
+    check("wait: no CRITICAL STOP while the money is still held",
+          not coordinator.stopped, coordinator.stopped)
+
+    record = coordinator.pending_cancels.store.get("act-wait")
+    horizon = (float(record.get("expiry_at", 0))
+               - float(record.get("deferred_at_epoch", 0))) if record else -1
+    check("wait: the retry horizon is the provider's wait window (~2s), not the expiry",
+          record is not None and not record.get("expiry_assumed")
+          and 0.5 <= horizon <= 10,
+          ((record or {}).get("expiry_at"), horizon))
+    check("wait: the user is told the answer and the retry window",
+          any("ACCESS_CANCEL_WAIT" in body and "wait window" in body
+              for _, body in coordinator.messages),
+          coordinator.messages)
+
+    resolved = wait_until(
+        lambda: coordinator.pending_cancels.store.get("act-wait") is None,
+        timeout=30)
+    check("wait: the watcher finished the cancellation",
+          resolved and not coordinator.pending_cancels.pending(),
+          coordinator.pending_cancels.pending())
+    check("wait: the cancel was retried after the wait window, not the expiry",
+          client.cancel_calls == ["act-wait", "act-wait"]
+          and (client.cancel_times[-1] - client.cancel_times[0]) < 30.0,
+          (client.cancel_calls,
+           [round(t - client.cancel_times[0], 2) for t in client.cancel_times]))
+    snapshot = coordinator.stats.snapshot()
+    check("wait: the refund tallied and was counted",
+          snapshot["cancel_deferred_refunded"] == 1
+          and snapshot["refunds_missing"] == 0
+          and not coordinator.stopped, snapshot)
+
+    coordinator.stop_requested.set()
+
+
 def main():
     scenario_defer_instead_of_stop()
     scenario_retry_at_expiry()
@@ -549,6 +622,7 @@ def main():
     scenario_unknown_hold()
     scenario_persistence_and_resume()
     scenario_opt_out()
+    scenario_cancel_wait_window()
 
     print()
     if FAILURES:

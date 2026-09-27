@@ -15,13 +15,22 @@ Endpoints used by the automation:
 - getStatus    -> STATUS_WAIT_CODE / STATUS_OK:<sms> / STATUS_CANCEL
                   (standard handler_api polling action; see note below)
 - setStatus    -> documented: 3 = request new SMS, 8 = cancel (ACCESS_CANCEL
-                  / WAIT_CANCEL:<seconds>); 6 = finish is attempted
-                  best-effort only - see finish()
+                  / ACCESS_CANCEL_WAIT / WAIT_CANCEL:<seconds>); 6 = finish
+                  is attempted best-effort only - see finish()
+
+Cancel window (OTPIndia-specific, unlike TemporaSMS / VSImpro which cancel
+immediately): a cancel that arrives before `cancel_wait_seconds` (default
+120) have elapsed since getNumber issued the number is answered with
+ACCESS_CANCEL_WAIT - the activation stays open and the money stays held
+until the window has passed. See set_status() / _cancel_wait_seconds().
 
 Note: the published spec snippets cover getBalance / getNumber / setStatus;
 getStatus follows the handler_api convention this protocol is based on
 (action=getStatus&id=... -> STATUS_OK:<sms>).
 """
+
+import math
+import time
 
 from base_otp import (
     BaseOTPClient,
@@ -39,7 +48,8 @@ class OtpIndiaClient(BaseOTPClient):
         default_service="meesho",
         default_server="",
         max_price=None,
-        timeout=15
+        timeout=15,
+        cancel_wait_seconds=120
     ):
         super().__init__(
             name="otpindia",
@@ -50,6 +60,10 @@ class OtpIndiaClient(BaseOTPClient):
         self.default_service = (default_service or "meesho").strip()
         self.default_server = (default_server or "").strip()
         self.max_price = max_price
+        # OTPIndia refuses to cancel a number until this long after it was
+        # issued (2 minutes by default) - see _cancel_wait_seconds().
+        self.cancel_wait_seconds = float(cancel_wait_seconds or 120)
+        self._acquired_at = {}
 
     def get_balance(self):
         raw = self._request("getBalance")
@@ -101,9 +115,13 @@ class OtpIndiaClient(BaseOTPClient):
             if len(parts) != 3:
                 raise OTPError(f"[{self.name}] Malformed ACCESS_NUMBER: {raw}")
 
+            activation_id = parts[1].strip()
+            # The cancel window is counted from the moment the number is
+            # issued: remember when that was.
+            self._acquired_at[activation_id] = time.time()
             return {
                 "type": "ACCESS_NUMBER",
-                "activation_id": parts[1].strip(),
+                "activation_id": activation_id,
                 "number": parts[2].strip()
             }
 
@@ -142,6 +160,7 @@ class OtpIndiaClient(BaseOTPClient):
             }
 
         if raw == "STATUS_CANCEL":
+            self._acquired_at.pop(str(activation_id), None)
             return {"type": "STATUS_CANCEL"}
 
         if raw in {"BAD_KEY", "NO_ACTIVATION", "USER_BANNED", "ERROR"}:
@@ -155,13 +174,26 @@ class OtpIndiaClient(BaseOTPClient):
         3 = Request next SMS
         6 = Finish / complete activation (ACCESS_ACTIVATION)
         8 = Cancel activation (ACCESS_CANCEL)
+
+        A cancel (8) issued before the cancel window has passed is refused
+        with ACCESS_CANCEL_WAIT; the answer carries `seconds` = how long the
+        caller should wait before the cancel will be accepted (see
+        _cancel_wait_seconds).
         """
         raw = self._request("setStatus", {
             "id": str(activation_id),
             "status": int(status)
         })
 
+        # Must be checked BEFORE the ACCESS_CANCEL prefix match below.
+        if raw == "ACCESS_CANCEL_WAIT" or raw.startswith("ACCESS_CANCEL_WAIT:"):
+            return {
+                "type": "ACCESS_CANCEL_WAIT",
+                "seconds": self._cancel_wait_seconds(activation_id, raw)
+            }
+
         if raw.startswith("ACCESS_CANCEL") or raw.startswith("ACCESS_ACTIVATION"):
+            self._acquired_at.pop(str(activation_id), None)
             return {"type": raw.split(":", 1)[0]}
 
         if raw.startswith("WAIT_CANCEL"):
@@ -179,6 +211,32 @@ class OtpIndiaClient(BaseOTPClient):
 
         raise OTPError(f"[{self.name}] Unexpected setStatus response: {raw}")
 
+    def _cancel_wait_seconds(self, activation_id, raw):
+        """
+        How long until this activation may be cancelled.
+
+        A wait reported by the server itself ("ACCESS_CANCEL_WAIT:<seconds>")
+        wins; otherwise the remainder of the OTPIndia cancel window is used
+        (cancel_wait_seconds, counted from the moment getNumber issued the
+        number - the provider only accepts a cancel after that). A full
+        window is assumed when the issue time is unknown (a pending cancel
+        resumed after a restart) or when the provider still refuses after
+        our own window has passed.
+        """
+        if ":" in raw:
+            try:
+                return max(1, int(raw.split(":", 1)[1].strip()))
+            except ValueError:
+                pass
+
+        acquired = self._acquired_at.get(str(activation_id))
+        if acquired is not None:
+            remaining = self.cancel_wait_seconds - (time.time() - acquired)
+            if remaining > 0:
+                return max(1, int(math.ceil(remaining)))
+
+        return max(1, int(self.cancel_wait_seconds))
+
     def finish(self, activation_id):
         """
         Complete the activation once the OTP has been processed.
@@ -188,7 +246,8 @@ class OtpIndiaClient(BaseOTPClient):
         providers) is attempted but never required: a rejection comes back
         as FINISH_UNSUPPORTED instead of an error. After the OTP is consumed
         the charge stands either way - only a cancel (status 8, documented)
-        moves money back, and that one works normally.
+        moves money back, and that one works normally once the cancel window
+        has passed (ACCESS_CANCEL_WAIT - see set_status).
         """
         res = self.set_status(activation_id, 6)
         if res.get("type") in {"BAD_STATUS", "BAD_ACTION", "ERROR", "NO_ACTIVATION"}:

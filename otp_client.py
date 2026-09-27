@@ -173,7 +173,8 @@ def build_otpindia_client(config):
         default_service=india_conf.get("service", "meesho"),
         default_server=india_conf.get("server", ""),
         max_price=india_conf.get("max_price"),
-        timeout=india_conf.get("timeout", 15)
+        timeout=india_conf.get("timeout", 15),
+        cancel_wait_seconds=india_conf.get("cancel_wait_seconds", 120)
     )
 
 
