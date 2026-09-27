@@ -214,6 +214,17 @@ def test_status_and_cancel():
     check("otpindia: finish (status 6)",
           client.finish("12345") == {"type": "ACCESS_ACTIVATION"})
 
+    # OTPIndia documents only 3 (new SMS) and 8 (cancel): an unsupported
+    # finish must NOT raise (both callers only log it).
+    respond("BAD_STATUS")
+    res = client.finish("12345")
+    check("otpindia: unsupported finish tolerated",
+          res == {"type": "FINISH_UNSUPPORTED", "rejected_as": "BAD_STATUS"}, res)
+
+    respond("ACCESS_CANCEL")
+    check("otpindia: documented cancel (status 8) still works after that",
+          client.cancel("12345") == {"type": "ACCESS_CANCEL"})
+
 
 # --- factory + selection validation ------------------------------------------
 

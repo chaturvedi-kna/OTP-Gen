@@ -47,7 +47,7 @@
     "base_url": "https://otpindia.org/api/stubs/handler_api.php",
     "api_key": "",
     "service": "meesho",
-    "server": "",
+    "server": "Operator-1",
     "max_attempts": 500
   },
   "checker": {

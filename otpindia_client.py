@@ -2,16 +2,25 @@
 OTPIndia (otpindia.org) client implementing the SMS-Activate handler_api protocol.
 
 All requests go to https://otpindia.org/api/stubs/handler_api.php via GET with
-the API key passed as the api_key query parameter.
+the API key passed as the api_key query parameter. Rate limit: 900 requests
+per minute.
 
 Endpoints used by the automation:
 - getBalance   -> ACCESS_BALANCE:<amount>
-- getNumber    -> ACCESS_NUMBER:<activation_id>:<number> / NO_NUMBERS / NO_BALANCE / ...
-                  (OTPIndia-specific: requires the service code AND the server
-                   code listed for that service, e.g. service=wa&server=SERVER_CODE)
+- getNumber    -> ACCESS_NUMBER:<activation_id>:<number>
+                  (OTPIndia-specific: requires the service code AND a server
+                   code listed for that service, e.g.
+                   service=meesho&server=Operator-1 or service=wa&server=...)
+                  Routes: IN / FR / MX / GB catalogs.
 - getStatus    -> STATUS_WAIT_CODE / STATUS_OK:<sms> / STATUS_CANCEL
-- setStatus    -> status 3 = request next SMS, 6 = finish, 8 = cancel
-                  (ACCESS_CANCEL / WAIT_CANCEL:<seconds> / EARLY_CANCEL_DENIED)
+                  (standard handler_api polling action; see note below)
+- setStatus    -> documented: 3 = request new SMS, 8 = cancel (ACCESS_CANCEL
+                  / WAIT_CANCEL:<seconds>); 6 = finish is attempted
+                  best-effort only - see finish()
+
+Note: the published spec snippets cover getBalance / getNumber / setStatus;
+getStatus follows the handler_api convention this protocol is based on
+(action=getStatus&id=... -> STATUS_OK:<sms>).
 """
 
 from base_otp import (
@@ -169,3 +178,19 @@ class OtpIndiaClient(BaseOTPClient):
             return {"type": raw}
 
         raise OTPError(f"[{self.name}] Unexpected setStatus response: {raw}")
+
+    def finish(self, activation_id):
+        """
+        Complete the activation once the OTP has been processed.
+
+        OTPIndia documents only status 3 (request new SMS) and 8 (cancel),
+        so the standard finish (status 6, used by the other handler_api
+        providers) is attempted but never required: a rejection comes back
+        as FINISH_UNSUPPORTED instead of an error. After the OTP is consumed
+        the charge stands either way - only a cancel (status 8, documented)
+        moves money back, and that one works normally.
+        """
+        res = self.set_status(activation_id, 6)
+        if res.get("type") in {"BAD_STATUS", "BAD_ACTION", "ERROR", "NO_ACTIVATION"}:
+            return {"type": "FINISH_UNSUPPORTED", "rejected_as": res.get("type")}
+        return res

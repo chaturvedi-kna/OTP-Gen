@@ -95,16 +95,18 @@ Every provider lives in its own `config.json` block and is picked up by
   "base_url": "https://otpindia.org/api/stubs/handler_api.php",
   "api_key": "YOUR_API_KEY",
   "service": "meesho",
-  "server": "SERVER_CODE_FOR_THE_SERVICE",
+  "server": "Operator-1",
   "max_attempts": 500
 }
 ```
 
 - `api_key` — from your OTPIndia account (the provider is skipped everywhere,
   including `/run otpindia`, until this is set).
-- `service` — the service short code (e.g. `meesho`, `wa`).
-- `server` — the server code listed for that service on otpindia.org
-  (sent as `server=` with `getNumber`; leave empty to let the API decide).
+- `service` — the service display code (e.g. `meesho`, `wa`).
+- `server` — a server code listed for that service on otpindia.org. For
+  Meesho the listed codes are `Operator-1` … `Operator-4`, `Operator-9`,
+  `Operator-10` and `v1-22` (sent as `server=` with `getNumber`).
+- Rate limit is 900 requests/minute — the defaults are far below it.
 - CLI: `python main.py --provider otpindia` (also accepts the alias `india`).
 
 ## 5. Dual OTP Providers (TemporaSMS + OtpDoctor)
@@ -264,3 +266,75 @@ and typed numbers would interleave with tab A's login/OTP screens (the
 bot-claim lock only guards threads inside one process, not two). Give each
 tab its own account via the `instances` block above - that is exactly what it
 is for. One account + one bot-driving tab at a time stays safe.
+
+### Adding a third parallel tab (e.g. OTPIndia)
+
+The PRIMES userbot is the per-tab resource: **one Telegram account drives one
+process** — the bot's chat history with PRIMES is shared server-side, so tab
+B's taps and typed numbers would interleave with tab A's login/OTP screens
+(the claim lock only guards threads inside ONE process), and two processes
+must not share one Telethon session file either. A third tab therefore needs
+a third account — and its own command bot, because every process long-polls
+`getUpdates` with its token (two processes on one bot token would randomly
+swallow each other's `/run` / `/status` messages):
+
+```json
+"instances": {
+  "tempora": {
+    "meesho_bot": { "api_id": 1111111, "api_hash": "aaaa...",
+                    "session_file": "userbot.tempora.session.txt" },
+    "telegram":   { "bot_token": "<tab1 command bot token>", "chat_id": "..." }
+  },
+  "vsimpro": {
+    "meesho_bot": { "api_id": 2222222, "api_hash": "bbbb...",
+                    "session_file": "userbot.vsimpro.session.txt" },
+    "telegram":   { "bot_token": "<tab2 command bot token>", "chat_id": "..." }
+  },
+  "otpindia": {
+    "meesho_bot": { "api_id": 3333333, "api_hash": "cccc...",
+                    "session_file": "userbot.otpindia.session.txt" },
+    "telegram":   { "bot_token": "<tab3 command bot token>", "chat_id": "..." }
+  }
+}
+```
+
+```bash
+python login_userbot.py --instance otpindia   # once, with the third account
+python main.py --provider otpindia            # third tab
+```
+
+Each tab then owns its PRIMES conversation exclusively — login, checks and
+prewarm never collide across tabs, and a FloodWait cooldown on one account
+only self-heals that tab.
+
+### No third PRIMES account? Two alternatives
+
+**1. Bot-free third tab.** The PRIMES account is only needed for the
+auto login/link flow and the bot-based number checker. Run the OTPIndia tab
+without one:
+
+```json
+"instances": {
+  "otpindia": {
+    "meesho_bot": { "enabled": false },
+    "checker": { "mode": "api" }
+  }
+}
+```
+
+Checks go through the checker API, the manual trigger flow delivers the OTP
+through the Telegram buttons — zero PRIMES usage. (`"auto"` also degrades to
+API-only when no bot is ready; `"api"` just makes it explicit.)
+
+**2. One process, three providers.** `active_otp_provider` accepts a list:
+
+```json
+"active_otp_provider": "tempora,vsimpro,otpindia"
+```
+
+`python main.py` runs all three workers against ONE PRIMES account: the
+in-process `_BotClaim` lock already guarantees only one flow (login / check /
+prewarm) talks to the PRIMES chat at a time — the others wait a bounded time
+or cancel-with-refund instead of interleaving. Trade-offs: one shared
+stats/state file for all three providers, and the bot serializes whatever it
+touches (the provider workers themselves still run fully parallel).
