@@ -42,6 +42,14 @@
     "max_attempts": 1000,
     "operator_services": {}
   },
+  "otpindia": {
+    "enabled": true,
+    "base_url": "https://otpindia.org/api/stubs/handler_api.php",
+    "api_key": "",
+    "service": "meesho",
+    "server": "Operator-1",
+    "max_attempts": 500
+  },
   "checker": {
     "mode": "auto",
     "base_url": "https://tubesave.in",

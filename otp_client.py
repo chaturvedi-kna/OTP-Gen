@@ -1,6 +1,7 @@
 """
 Unified OTP Client Facade providing backwards compatibility, client factories,
-and multi-provider management for OtpDoctor and TemporaSMS.
+and multi-provider management for OtpDoctor, TemporaSMS, VSImpro, OTPCart and
+OTPIndia.
 """
 
 import sys
@@ -15,9 +16,100 @@ from otpdoctor_client import OTPDoctorClient
 from tempora_client import TemporaClient
 from otpcart_client import OTPCartClient
 from vsimpro_client import VSImproClient
+from otpindia_client import OtpIndiaClient
 
 # Backward compatibility alias
 OTPClient = OTPDoctorClient
+
+# Every provider this tool knows, in display order, with its accepted aliases.
+PROVIDER_ORDER = ("tempora", "otpdoctor", "otpcart", "vsimpro", "otpindia")
+PROVIDER_ALIASES = {
+    "tempora": "tempora",
+    "temporasms": "tempora",
+    "otp": "otpdoctor",
+    "otpdoctor": "otpdoctor",
+    "doctor": "otpdoctor",
+    "otpcart": "otpcart",
+    "cart": "otpcart",
+    "vsimpro": "vsimpro",
+    "vsi": "vsimpro",
+    "otpindia": "otpindia",
+    "india": "otpindia",
+}
+# --provider / "/run" values that mean "every enabled provider".
+PROVIDER_WILDCARDS = ("all", "both")
+
+
+def parse_provider_selection(provider_val):
+    """Normalize a provider selection (string or list) to lowercase tokens."""
+    if provider_val is None:
+        return []
+    if isinstance(provider_val, (list, tuple, set)):
+        return [str(p).strip().lower() for p in provider_val if str(p).strip()]
+    return [p.strip().lower() for p in str(provider_val).split(",") if p.strip()]
+
+
+def canonical_provider(token):
+    """Map an alias ("vsi", "doctor", "india", ...) to its canonical name."""
+    return PROVIDER_ALIASES.get(str(token or "").strip().lower())
+
+
+def provider_config(config, name):
+    """Config block for a canonical provider name (OtpDoctor lives under "otp")."""
+    config = config or {}
+    if name == "otpdoctor":
+        return config.get("otpdoctor") or config.get("otp") or {}
+    return config.get(name) or {}
+
+
+def provider_ready(config, name):
+    """True when the provider is enabled and has credentials in config.json."""
+    conf = provider_config(config, name)
+    if not conf.get("enabled", True):
+        return False
+    if name == "otpcart":
+        return bool(conf.get("token"))
+    return bool(conf.get("api_key"))
+
+
+def validate_provider_selection(config, provider_val):
+    """
+    Validate a --provider / Telegram "/run <provider>" selection.
+
+    Returns (True, None) when the selection can be turned into clients, or
+    (False, "<reason>") with a user-facing explanation otherwise. Unknown
+    names and providers without credentials are rejected instead of silently
+    falling back to "whatever is configured".
+    """
+    tokens = parse_provider_selection(provider_val)
+    if not tokens:
+        return True, None
+    if any(t in PROVIDER_WILDCARDS for t in tokens):
+        return True, None
+
+    unknown = []
+    not_ready = []
+    for token in tokens:
+        canonical = canonical_provider(token)
+        if canonical is None:
+            unknown.append(token)
+        elif not provider_ready(config, canonical):
+            not_ready.append(canonical)
+
+    if unknown:
+        return False, (
+            f"Unknown provider '{unknown[0]}'. Known providers: "
+            f"{', '.join(PROVIDER_ORDER)} "
+            f"(aliases: tempora/temporasms, otp/otpdoctor/doctor, "
+            f"otpcart/cart, vsimpro/vsi, otpindia/india)."
+        )
+    if not_ready:
+        names = ", ".join(sorted(set(not_ready)))
+        return False, (
+            f"Provider(s) {names} not usable: set \"enabled\": true and an "
+            f"api_key (otpcart: token) for it in config.json."
+        )
+    return True, None
 
 
 def build_tempora_client(config):
@@ -72,13 +164,27 @@ def build_vsimpro_client(config):
     )
 
 
+def build_otpindia_client(config):
+    """Build an OtpIndiaClient instance from config dictionary."""
+    india_conf = config.get("otpindia", {})
+    return OtpIndiaClient(
+        base_url=india_conf.get("base_url", "https://otpindia.org/api/stubs/handler_api.php"),
+        api_key=india_conf.get("api_key", ""),
+        default_service=india_conf.get("service", "meesho"),
+        default_server=india_conf.get("server", ""),
+        max_price=india_conf.get("max_price"),
+        timeout=india_conf.get("timeout", 15)
+    )
+
+
 def create_otp_clients(config, provider_override=None):
     """
     Returns a list of active OTP client instances based on config and override.
     Options for provider:
-      - 'all': runs all enabled providers (otpdoctor, tempora, otpcart, vsimpro)
+      - 'all': runs all enabled providers (otpdoctor, tempora, otpcart, vsimpro, otpindia)
       - list of names: e.g. ['tempora', 'vsimpro']
-      - specific name: 'vsimpro', 'otpcart', 'tempora', 'otpdoctor'
+      - specific name: 'vsimpro', 'otpcart', 'tempora', 'otpdoctor', 'otpindia'
+        (aliases accepted too: 'vsi', 'cart', 'doctor', 'india', ...)
     """
     provider_val = (
         provider_override
@@ -88,22 +194,15 @@ def create_otp_clients(config, provider_override=None):
         or "all"
     )
 
-    if isinstance(provider_val, (list, tuple)):
-        requested = [str(p).strip().lower() for p in provider_val]
-    else:
-        requested = [p.strip().lower() for p in str(provider_val).split(",") if p.strip()]
+    requested = parse_provider_selection(provider_val)
 
     clients = []
 
-    tempora_conf = config.get("tempora", {})
-    otp_conf = config.get("otp", {})
-    cart_conf = config.get("otpcart", {})
-    vsi_conf = config.get("vsimpro", {})
-
-    tempora_enabled = tempora_conf.get("enabled", True) and bool(tempora_conf.get("api_key"))
-    otp_enabled = otp_conf.get("enabled", True) and bool(otp_conf.get("api_key"))
-    cart_enabled = cart_conf.get("enabled", True) and bool(cart_conf.get("token"))
-    vsi_enabled = vsi_conf.get("enabled", True) and bool(vsi_conf.get("api_key"))
+    tempora_enabled = provider_ready(config, "tempora")
+    otp_enabled = provider_ready(config, "otpdoctor")
+    cart_enabled = provider_ready(config, "otpcart")
+    vsi_enabled = provider_ready(config, "vsimpro")
+    india_enabled = provider_ready(config, "otpindia")
 
     if "all" in requested or "both" in requested:
         if tempora_enabled:
@@ -114,16 +213,21 @@ def create_otp_clients(config, provider_override=None):
             clients.append(build_otpcart_client(config))
         if vsi_enabled:
             clients.append(build_vsimpro_client(config))
+        if india_enabled:
+            clients.append(build_otpindia_client(config))
     else:
         for p in requested:
-            if p in ("tempora", "temporasms") and tempora_enabled:
+            canonical = canonical_provider(p)
+            if canonical == "tempora" and tempora_enabled:
                 clients.append(build_tempora_client(config))
-            elif p in ("otp", "otpdoctor", "doctor") and otp_enabled:
+            elif canonical == "otpdoctor" and otp_enabled:
                 clients.append(build_otpdoctor_client(config))
-            elif p in ("otpcart", "cart") and cart_enabled:
+            elif canonical == "otpcart" and cart_enabled:
                 clients.append(build_otpcart_client(config))
-            elif p in ("vsimpro", "vsi") and vsi_enabled:
+            elif canonical == "vsimpro" and vsi_enabled:
                 clients.append(build_vsimpro_client(config))
+            elif canonical == "otpindia" and india_enabled:
+                clients.append(build_otpindia_client(config))
 
     if not clients:
         # Fallback to whatever has credentials enabled
@@ -135,6 +239,8 @@ def create_otp_clients(config, provider_override=None):
             clients.append(build_otpcart_client(config))
         if vsi_enabled:
             clients.append(build_vsimpro_client(config))
+        if india_enabled:
+            clients.append(build_otpindia_client(config))
 
     return clients
 

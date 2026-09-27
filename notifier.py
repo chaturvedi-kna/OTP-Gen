@@ -3,7 +3,7 @@ Notification layer for the Meesho OTP automation.
 
 Two independent backends:
   * Termux  -- native Android notifications via termux-notification
-  * Telegram -- interactive messages, copy button, button feedback, and bot commands (/run, /status, /balance, /stop)
+  * Telegram -- interactive messages, copy button, button feedback, and bot commands (/run [provider], /status, /balance, /stop)
 """
 
 import json
@@ -451,8 +451,21 @@ class TelegramBackend:
                     self.send("Live Balances", balance_text)
                     continue
                 elif cmd == "run" and self.run_callback:
-                    self.run_callback()
-                    self.send("Automation Started", "▶️ Started search for target number.")
+                    # /run - configured providers; /run <provider> - only that
+                    # provider for this run (e.g. /run vsimpro, /run otpindia,
+                    # /run tempora,vsimpro, /run all).
+                    parts = raw_text.split(None, 1)
+                    argument = parts[1].strip() if len(parts) > 1 else ""
+                    try:
+                        reply = self.run_callback(argument)
+                    except Exception as exc:
+                        self.send("Run Not Started", f"❌ /run failed: {exc}")
+                        continue
+                    if isinstance(reply, str) and reply.startswith("❌"):
+                        self.send("Run Not Started", reply)
+                    else:
+                        self.send("Automation Started",
+                                  reply or "▶️ Started search for target number.")
                     continue
                 elif cmd == "stop" and self.stop_callback:
                     self.stop_callback()
@@ -485,6 +498,9 @@ class TelegramBackend:
                         "Meesho Automation Bot",
                         "Commands available:\n"
                         "▶️ /run - Start searching for fresh numbers\n"
+                        "▶️ /run <provider> - Start ONLY that provider for this "
+                        "run (e.g. /run vsimpro, /run otpindia, "
+                        "/run tempora,vsimpro, /run all)\n"
                         "ℹ️ /status - Check current tool status & progress\n"
                         "💰 /balance - Check live balances on all providers\n"
                         "🎁 /referral <link> - Save the Meesho referral link "
@@ -565,7 +581,9 @@ class Notifier:
                               stop_cb=None, referral_cb=None, checker_cb=None):
         """
         Attach callbacks for interactive Telegram commands (/status, /balance,
-        /run, /stop, /referral <link>, /checker <mode>).
+        /run [provider], /stop, /referral <link>, /checker <mode>). The run
+        callback receives the optional /run argument ("" when none), so it can
+        narrow the run to specific provider(s).
         """
         self.telegram.status_callback = status_cb
         self.telegram.balance_callback = balance_cb

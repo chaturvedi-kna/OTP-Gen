@@ -2,9 +2,10 @@
 Meesho OTP Automation Orchestrator.
 
 Parallel worker execution for SMS providers (TemporaSMS, VSImpro, OtpDoctor,
-OTPCart) with checker validation, refund/balance safety gating, interactive
-Telegram commands (/run, /status, /balance, /stop), and optional end-to-end
-automation of the PRIMES Meesho concierge Telegram bot via a Telethon userbot.
+OTPCart, OTPIndia) with checker validation, refund/balance safety gating,
+interactive Telegram commands (/run [provider], /status, /balance, /stop), and
+optional end-to-end automation of the PRIMES Meesho concierge Telegram bot via
+a Telethon userbot.
 """
 
 import argparse
@@ -34,7 +35,8 @@ from otp_client import (
     OTPClient,
     build_tempora_client,
     build_otpdoctor_client,
-    create_otp_clients
+    create_otp_clients,
+    validate_provider_selection
 )
 from checker_client import (
     CheckerClient,
@@ -366,8 +368,15 @@ class ParallelAutomationCoordinator:
 
         # Build active clients
         self.clients = create_otp_clients(config, provider_override=provider_override)
+        # The startup selection: a bare /run returns to it, /balance always
+        # covers it, and a Telegram "/run <provider>" narrows self.clients for
+        # that run only (see request_run).
+        self.configured_clients = list(self.clients)
+        # Every client ever built here, so a deferred cancellation from an
+        # earlier /run selection stays resolvable after the selection changed.
+        self.client_registry = {c.name: c for c in self.clients}
         for c in self.clients:
-            c_conf = self.config.get(c.name, {}) or (self.config.get("otp", {}) if c.name == "otpdoctor" else {})
+            c_conf = self._client_conf(c)
             self.worker_max_attempts[c.name] = c_conf.get("max_attempts") or self.settings.get("max_attempts", 200)
             self.worker_attempts[c.name] = 0
 
@@ -424,11 +433,20 @@ class ParallelAutomationCoordinator:
 
     # -- hooks for the deferred-cancellation watcher (cancel_watch.py) -------
 
+    def _client_conf(self, client):
+        """The config.json block for a client (OtpDoctor lives under "otp")."""
+        return self.config.get(client.name, {}) or (
+            self.config.get("otp", {}) if client.name == "otpdoctor" else {}
+        )
+
     def client_by_name(self, name):
         for client in self.clients:
             if client.name == name:
                 return client
-        return None
+        # A provider that was selected by an earlier "/run <provider>" but is
+        # not part of the current selection: still resolvable, so its deferred
+        # cancellations are not stranded.
+        return self.client_registry.get(name)
 
     def expected_balance(self, name, activation_id=None):
         return self._expected_balance(name, activation_id)
@@ -491,9 +509,18 @@ class ParallelAutomationCoordinator:
     # -- Status and Balances for Telegram & CLI ------------------------------
 
     def get_balances_summary(self):
-        """Fetches live balance from all configured clients."""
+        """Fetches live balance from every provider this instance can run
+        (the configured selection plus anything a /run <provider> added)."""
         lines = ["💰 Current OTP Balances:"]
-        for client in self.clients:
+        seen = set()
+        current_names = {c.name for c in self.clients}
+        clients = list(self.clients) + [
+            c for c in self.client_registry.values() if c.name not in current_names
+        ]
+        for client in clients:
+            if client.name in seen:
+                continue
+            seen.add(client.name)
             try:
                 bal = client.get_balance()
                 lines.append(f"• {client.name.upper()}: {bal:.4f}")
@@ -504,10 +531,22 @@ class ParallelAutomationCoordinator:
     def get_status_summary(self):
         """Returns live tool status."""
         state_str = "🟢 RUNNING" if self.is_running else "⚪ IDLE / STOPPED"
+        # Show what THIS tab actually runs (the --provider / instance selection),
+        # not the raw config string, which can differ on a mixed-layout tab.
+        mode_text = ", ".join(c.name.upper() for c in self.configured_clients) \
+            or str(self.config.get("active_otp_provider", "both")).upper()
         lines = [
             f"🤖 Meesho Automation: {state_str}",
-            f"Mode: {self.config.get('active_otp_provider', 'both').upper()}",
+            f"Mode: {mode_text}",
         ]
+        run_names = [c.name for c in self.clients]
+        configured_names = [c.name for c in self.configured_clients]
+        if run_names != configured_names:
+            lines.append(
+                "Run selection: "
+                f"{', '.join(n.upper() for n in run_names)} "
+                "(/run <provider>; a bare /run uses Mode again)"
+            )
         if self.instance:
             lines.append(f"Instance: {self.instance} (own stats / state / signals)")
         lines += [
@@ -736,12 +775,62 @@ class ParallelAutomationCoordinator:
         log(f"Checker mode changed via Telegram: {previous} -> {mode}.")
         return f"✅ Checker mode set to {mode.upper()}.{saved}\n\n" + self.checker_status_text()
 
-    def request_run(self):
+    def request_run(self, provider=None):
+        """
+        Telegram /run handler, optionally with a provider selection:
+
+          /run                 -> the configured active_otp_provider set
+          /run vsimpro         -> only VSImpro for this run
+          /run tempora,vsimpro  -> only those two for this run
+          /run otpindia         -> only OTPIndia for this run
+          /run all              -> every enabled provider with credentials
+
+        The selection applies to this run only: a later bare /run returns to
+        the configured set (and to the same instance's stats/state files).
+
+        Returns the reply text for the Telegram message; an "❌ ..." reply
+        means the run was NOT started.
+        """
+        selection = str(provider or "").strip()
+
+        new_clients = None
+        if selection:
+            ok, error = validate_provider_selection(self.config, selection)
+            if not ok:
+                log(f"/run rejected: {error}")
+                return f"❌ {error}"
+            new_clients = create_otp_clients(self.config, provider_override=selection)
+            if not new_clients:
+                error = (
+                    f"No usable provider in '{selection}' - check "
+                    f"config.json (enabled + api_key/token)."
+                )
+                log(f"/run rejected: {error}")
+                return f"❌ {error}"
+
         if self.is_running:
             log("Restart requested while running. Stopping current workers first...")
             self.stop_requested.set()
             time.sleep(1.5)
+
+        if new_clients:
+            self.clients = new_clients
+        else:
+            self.clients = list(self.configured_clients)
+        for c in self.clients:
+            self.client_registry[c.name] = c
+            c_conf = self._client_conf(c)
+            self.worker_max_attempts[c.name] = c_conf.get("max_attempts") or self.settings.get("max_attempts", 200)
+            self.worker_attempts[c.name] = 0
+
         threading.Thread(target=self.run, daemon=True).start()
+
+        names = ", ".join(c.name.upper() for c in self.clients)
+        if selection:
+            log(f"/run selection: {names} (this run only; a bare /run uses "
+                f"active_otp_provider again).")
+            return f"▶️ Started search for {names} only (this run)."
+        return "▶️ Started search for target number."
 
     def request_stop(self):
         self.stop_requested.set()
@@ -1114,7 +1203,7 @@ class ParallelAutomationCoordinator:
         pname = client.name.upper()
         log(f"Worker started.", prefix=pname)
 
-        client_conf = self.config.get(client.name, {}) or (self.config.get("otp", {}) if client.name == "otpdoctor" else {})
+        client_conf = self._client_conf(client)
         client_max_attempts = client_conf.get("max_attempts") or self.settings.get("max_attempts", 200)
         self.worker_max_attempts[client.name] = client_max_attempts
         self.worker_attempts[client.name] = 0
@@ -1198,6 +1287,12 @@ class ParallelAutomationCoordinator:
                     )
                 elif client.name == "otpcart":
                     res = client.get_number()
+                elif client.name == "otpindia":
+                    india_conf = self.config.get("otpindia", {})
+                    res = client.get_number(
+                        service=india_conf.get("service"),
+                        server=india_conf.get("server")
+                    )
                 else:
                     otp_conf = self.config.get("otp", {})
                     res = client.get_number(
@@ -2408,7 +2503,10 @@ class ParallelAutomationCoordinator:
 
         log("=" * 60)
         log("STARTING PARALLEL MEESHO OTP AUTOMATION")
-        log(f"Active Providers: {', '.join(c.name.upper() for c in self.clients)}")
+        # Snapshot the selection: a /run <provider> while this run is live
+        # swaps self.clients for the NEXT run, never this one.
+        clients = list(self.clients)
+        log(f"Active Providers: {', '.join(c.name.upper() for c in clients)}")
         if self.instance:
             log(f"Instance: {self.instance} "
                 f"(stats: {self.stats.path.name}, state: {self.state.path.name}, "
@@ -2483,7 +2581,7 @@ class ParallelAutomationCoordinator:
                 "fallback).")
         log("=" * 60)
 
-        for client in self.clients:
+        for client in clients:
             try:
                 bal = client.get_balance()
                 log(f"[{client.name.upper()}] Initial Balance: {bal:.4f}")
@@ -2491,7 +2589,7 @@ class ParallelAutomationCoordinator:
                 log(f"[{client.name.upper()}] Warning: Balance fetch failed: {exc}")
 
         workers = []
-        for client in self.clients:
+        for client in clients:
             t = threading.Thread(target=self.worker_loop, args=(client,), name=f"Worker-{client.name}", daemon=True)
             workers.append(t)
             t.start()
@@ -2513,12 +2611,12 @@ class ParallelAutomationCoordinator:
                 if not alive_workers and not self.target_found_event.is_set():
                     all_reached_max = all(
                         self.worker_attempts.get(c.name, 0) >= self.worker_max_attempts.get(c.name, 200)
-                        for c in self.clients
+                        for c in clients
                     )
                     if all_reached_max:
                         summary_att = ", ".join(
                             f"{c.name.upper()}: {self.worker_attempts.get(c.name, 0)}/{self.worker_max_attempts.get(c.name, 200)}"
-                            for c in self.clients
+                            for c in clients
                         )
                         log(f"All workers reached configured max attempts ({summary_att}).")
                         self.notify.alert("Automation Finished",
@@ -2986,8 +3084,8 @@ def set_checker_mode(config_path, mode):
 def main():
     parser = argparse.ArgumentParser(description="Meesho OTP automation with parallel provider clients.")
     parser.add_argument("--provider",
-                        help="Provider(s): tempora, vsimpro, otpdoctor, otpcart, 'all', or comma-combinations "
-                             "e.g. 'tempora,vsimpro'")
+                        help="Provider(s): tempora, vsimpro, otpdoctor, otpcart, otpindia, "
+                             "'all', or comma-combinations e.g. 'tempora,vsimpro'")
     parser.add_argument("--instance",
                         help="Name of this run, for parallel copies (e.g. one Termux tab per provider). "
                              "Namespaces stats.json / state.json / pending_cancels.json / .signals/ "
@@ -3082,7 +3180,7 @@ def main():
     coordinator.run()
 
     if coordinator.notify.telegram.configured:
-        log("Listening for Telegram commands (/run, /status, /balance, /stop). Press Ctrl+C to exit.")
+        log("Listening for Telegram commands (/run [provider], /status, /balance, /stop). Press Ctrl+C to exit.")
         try:
             while True:
                 coordinator.notify.telegram.poll_signal({"run": "run", "stop": "stop"})
