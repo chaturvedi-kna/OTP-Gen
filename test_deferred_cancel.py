@@ -17,6 +17,8 @@ This check drives the real coordinator with a scripted provider:
   * at expiry the cancel is retried and only then the refund is tallied,
   * a structured refusal (OTPIndia's ACCESS_CANCEL_WAIT) is retried after the
     provider's own wait window instead of the assumed activation expiry,
+  * an OTPIndia worker that runs out of balance while cancels are pending
+    resumes as soon as the FIRST of them refunds (not once all have),
   * a hold that cannot be measured suspends the tally instead of stopping,
   * pending cancellations survive a restart.
 
@@ -642,9 +644,161 @@ def scenario_otpindia_no_balance_waits_for_pending_refund():
     coordinator.stop_requested.set()
 
 
+def scenario_otpindia_no_balance_resumes_after_first_refund():
+    """
+    Out of balance with SEVERAL OTPIndia cancels pending: the worker must ask
+    for the next number as soon as the FIRST one refunds - not once all of
+    them have (the old behaviour, which idled the worker for the whole tail of
+    the queue although one refund pays for a number).
+    """
+    coordinator = build_coordinator()
+    # A long poll on purpose: the early return must come from the wake-up
+    # the resolved cancellation sends, not from a lucky poll.
+    coordinator.settings["otpindia_balance_wait_poll_seconds"] = 5.0
+    client = FakeProvider(name="otpindia", balance_before=20.0)
+    client.refunded = True
+    store = coordinator.pending_cancels.store
+    now_ts = time.time()
+    store.add({"provider": "otpindia", "activation_id": "ind-1", "number": "9000000001",
+               "hold": 7.0, "expiry_at": now_ts + 0.3, "deferred_at_epoch": now_ts})
+    store.add({"provider": "otpindia", "activation_id": "ind-2", "number": "9000000002",
+               "hold": 7.0, "expiry_at": now_ts + 60.0, "deferred_at_epoch": now_ts})
+
+    def resolve_first():
+        time.sleep(0.3)
+        store.remove("ind-1")
+        coordinator.on_pending_resolved("otpindia")
+
+    threading.Thread(target=resolve_first, daemon=True).start()
+    started = time.time()
+    resumed = coordinator._wait_for_pending_otpindia_refunds(client)
+    elapsed = time.time() - started
+    check("first refund: the wait ends when ONE pending cancel is resolved",
+          resumed and 0.25 <= elapsed < 2.0 and not coordinator.stopped,
+          (resumed, round(elapsed, 2), coordinator.stopped))
+    check("first refund: woken by the resolution itself, not by the 5s poll",
+          elapsed < 1.5, round(elapsed, 2))
+    check("first refund: the other cancel keeps maturing in the background",
+          [r["activation_id"] for r in coordinator.pending_cancels.pending()] == ["ind-2"],
+          coordinator.pending_cancels.pending())
+    check("first refund: balance refreshed before the next number",
+          coordinator._ledger("otpindia").get("expected_balance") == 20.0,
+          coordinator._ledger("otpindia"))
+    check("first refund: /status explains what the worker waits for",
+          "first of" in str(coordinator.worker_statuses.get("otpindia", "")),
+          coordinator.worker_statuses.get("otpindia"))
+
+    # A cancel deferred DURING the wait is not progress: the worker still
+    # waits for one of the cancels it started out with.
+    coordinator.settings["otpindia_balance_wait_poll_seconds"] = 0.05
+
+    def add_then_resolve():
+        time.sleep(0.15)
+        store.add({"provider": "otpindia", "activation_id": "ind-3", "number": "9000000003",
+                   "hold": 7.0, "expiry_at": time.time() + 60.0,
+                   "deferred_at_epoch": time.time()})
+        coordinator._pending_resolved_event.set()   # spurious wake-up
+        time.sleep(0.3)
+        store.remove("ind-2")
+        coordinator.on_pending_resolved("otpindia")
+
+    threading.Thread(target=add_then_resolve, daemon=True).start()
+    started = time.time()
+    resumed = coordinator._wait_for_pending_otpindia_refunds(client)
+    elapsed = time.time() - started
+    check("first refund: a cancel deferred meanwhile does not end the wait",
+          resumed and elapsed >= 0.4
+          and [r["activation_id"] for r in coordinator.pending_cancels.pending()] == ["ind-3"],
+          (resumed, round(elapsed, 2), coordinator.pending_cancels.pending()))
+
+    # Nothing pending -> not this path (the ordinary NO_BALANCE handling runs).
+    store.remove("ind-3")
+    check("first refund: nothing pending -> False (ordinary NO_BALANCE handling)",
+          coordinator._wait_for_pending_otpindia_refunds(client) is False)
+    check("first refund: other providers never take this path",
+          coordinator._wait_for_pending_otpindia_refunds(FakeProvider(name="tempora")) is False)
+
+    # A stop request ends the wait at once (the caller checks stop_requested).
+    store.add({"provider": "otpindia", "activation_id": "ind-4", "number": "9000000004",
+               "hold": 7.0, "expiry_at": time.time() + 60.0, "deferred_at_epoch": time.time()})
+    coordinator.settings["otpindia_balance_wait_poll_seconds"] = 5.0
+    threading.Timer(0.2, lambda: (coordinator.stop_requested.set(),
+                                  coordinator._pending_resolved_event.set())).start()
+    started = time.time()
+    resumed = coordinator._wait_for_pending_otpindia_refunds(client)
+    elapsed = time.time() - started
+    check("first refund: a stop request ends the wait promptly",
+          resumed is True and elapsed < 2.0, (resumed, round(elapsed, 2)))
+
+
+def scenario_otpindia_resume_with_real_watcher():
+    """
+    Same thing end to end with the real deferred-cancel watcher: two OTPIndia
+    cancels are refused with ACCESS_CANCEL_WAIT (1s and 4s windows); the
+    out-of-balance wait must end when the 1s one has refunded, and the hook
+    that wakes the worker must fire only after the record has left the store
+    (otherwise the waiting worker - and the "remaining held" bookkeeping -
+    still sees the cancel that just completed).
+    """
+    coordinator = build_coordinator(cancel_error_grace_seconds=0,
+                                    cancel_error_poll_interval_seconds=0.2,
+                                    cancel_error_retry_attempts=3,
+                                    cancel_error_retry_delay_seconds=0.2)
+    coordinator.settings["otpindia_balance_wait_poll_seconds"] = 5.0
+    client = FakeProvider(
+        name="otpindia",
+        cancel_script=[{"type": "ACCESS_CANCEL_WAIT", "seconds": 1},
+                       {"type": "ACCESS_CANCEL_WAIT", "seconds": 4},
+                       {"type": "ACCESS_CANCEL"},
+                       {"type": "ACCESS_CANCEL"}],
+    )
+    coordinator.clients = [client]
+    coordinator._note_balance("otpindia", 100.0)
+
+    in_store_at_hook = []
+    original_hook = coordinator.on_pending_resolved
+
+    def hook(provider):
+        in_store_at_hook.append(coordinator.pending_cancels.store.get("ind-1"))
+        return original_hook(provider)
+
+    coordinator.on_pending_resolved = hook
+
+    r1 = coordinator.handle_cancellation(client, "ind-1", "9000000001",
+                                         "Already registered on Meesho")
+    r2 = coordinator.handle_cancellation(client, "ind-2", "9000000002",
+                                         "Already registered on Meesho")
+    check("watcher resume: both cancels deferred behind their windows",
+          r1.get("deferred") is True and r2.get("deferred") is True
+          and len(coordinator.pending_cancels.pending()) == 2,
+          (r1, r2, coordinator.pending_cancels.pending()))
+
+    started = time.time()
+    resumed = coordinator._wait_for_pending_otpindia_refunds(client)
+    elapsed = time.time() - started
+    check("watcher resume: the worker resumes after the FIRST refund (~1s), "
+          "not after both (~4s)",
+          resumed and 0.7 <= elapsed < 3.5 and not coordinator.stopped,
+          (resumed, round(elapsed, 2), coordinator.stopped))
+    check("watcher resume: the 4s cancel is still pending meanwhile",
+          [r["activation_id"] for r in coordinator.pending_cancels.pending()] == ["ind-2"],
+          coordinator.pending_cancels.pending())
+    check("watcher resume: the wake-up hook fires after the record left the store",
+          in_store_at_hook and in_store_at_hook[0] is None, in_store_at_hook)
+
+    finished = wait_until(lambda: not coordinator.pending_cancels.pending(), timeout=30)
+    check("watcher resume: the second cancel still completes in the background",
+          finished and client.cancel_calls == ["ind-1", "ind-2", "ind-1", "ind-2"]
+          and not coordinator.stopped,
+          (finished, client.cancel_calls, coordinator.stopped))
+    coordinator.stop_requested.set()
+
+
 def main():
     scenario_defer_instead_of_stop()
     scenario_otpindia_no_balance_waits_for_pending_refund()
+    scenario_otpindia_no_balance_resumes_after_first_refund()
+    scenario_otpindia_resume_with_real_watcher()
     scenario_retry_at_expiry()
     scenario_late_otp_during_wait()
     scenario_deferred_otp_record()

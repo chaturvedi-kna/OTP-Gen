@@ -104,6 +104,17 @@ class BaseOTPClient:
         """Request next SMS (status 3)."""
         return self.set_status(activation_id, 3)
 
+    def cancel_window_remaining(self, activation_id):
+        """
+        Seconds until this activation may be cancelled (0.0 = right away).
+
+        Most providers accept a cancel at any time, so the base answer is 0.
+        A provider that refuses cancels for a while after issuing the number
+        (OTPIndia's cancel window) overrides this so the coordinator can keep
+        waiting for the OTP until a cancel would actually be accepted.
+        """
+        return 0.0
+
     @staticmethod
     def extract_code(sms_text):
         """Extract a 4 to 8 digit OTP code from SMS text."""

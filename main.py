@@ -359,6 +359,10 @@ class ParallelAutomationCoordinator:
             store=PendingCancelStore(filename=pending_filename(self.instance)),
             log_fn=log,
         )
+        # Set every time a deferred cancellation is resolved: a worker that is
+        # out of balance because of pending cancels wakes up on it and asks
+        # for the next number right away (see _wait_for_pending_otpindia_refunds).
+        self._pending_resolved_event = threading.Event()
         # Providers whose refund tally is suspended because a deferred
         # cancellation holds an unknown amount (the balance could not be read
         # when the cancel was deferred). Suspending beats critical-stopping on
@@ -837,42 +841,72 @@ class ParallelAutomationCoordinator:
         log("Stop requested via command.")
 
     def _wait_for_pending_otpindia_refunds(self, client):
-        """Wait quietly for OTPIndia's expected cancel window/refunds to clear.
+        """Wait quietly until ONE of OTPIndia's pending cancels has refunded.
 
         OTPIndia holds the purchase amount until its two-minute cancel window
         elapses. If the worker has used the available balance while one or more
         routine cancels are pending, NO_BALANCE is a temporary back-pressure
         signal, not a reason to stop the provider worker.
+
+        The wait ends as soon as the FIRST pending cancellation is resolved
+        (its refund has been verified by the watcher), not when all of them
+        are: one refund pays for the next number, so the worker asks for it
+        right away and the remaining cancels keep maturing in the background.
+        If that one refund was not enough (or the activation was consumed by a
+        late OTP instead of refunded), getNumber answers NO_BALANCE again and
+        the worker simply comes back here to wait for the next one.
+
+        Returns True when the caller should retry getNumber (also when the run
+        is stopping - the caller checks stop_requested), False when there is
+        nothing pending to wait for.
         """
-        if getattr(client, "name", "") != "otpindia":
+        provider = getattr(client, "name", "")
+        if provider != "otpindia":
             return False
-        if not self.pending_cancels.has_pending("otpindia"):
+
+        def provider_pending():
+            return [r for r in self.pending_cancels.pending()
+                    if r.get("provider") == provider]
+
+        pending = provider_pending()
+        if not pending:
             return False
+        pname = provider.upper()
+        # Everything pending at this moment; the wait is over once any of
+        # these is gone (a cancel deferred later does not count as progress).
+        waiting_on = {str(r.get("activation_id")) for r in pending}
 
         poll_seconds = max(0.25, float(self.settings.get(
             "otpindia_balance_wait_poll_seconds", 2.0) or 2.0))
-        log("OTPIndia has no currently spendable balance; waiting for pending "
-            "cancellations to pass their normal cancel window.", prefix="OTPINDIA")
+        log(f"{pname} has no currently spendable balance; {len(pending)} "
+            f"cancellation(s) are still inside their cancel window. Waiting for "
+            f"the first refund only, then requesting the next number.", prefix=pname)
+        self._pending_resolved_event.clear()
         while not self.stop_requested.is_set():
-            pending = self.pending_cancels.pending()
-            provider_pending = [r for r in pending if r.get("provider") == "otpindia"]
-            if not provider_pending:
+            pending = provider_pending()
+            still_open = {str(r.get("activation_id")) for r in pending}
+            resolved = waiting_on - still_open
+            if resolved:
                 try:
                     balance = client.get_balance()
-                    self._note_balance("otpindia", balance)
-                    log(f"Pending cancellations cleared; balance is {balance:.4f}. "
-                        "Resuming number requests.", prefix="OTPINDIA")
+                    self._note_balance(provider, balance)
+                    log(f"{len(resolved)} pending cancellation(s) resolved "
+                        f"({len(pending)} still waiting); balance is {balance:.4f}. "
+                        f"Requesting the next number.", prefix=pname)
                 except Exception as exc:
-                    log(f"Pending cancellations cleared, but balance refresh failed: {exc}",
-                        prefix="OTPINDIA")
+                    log(f"{len(resolved)} pending cancellation(s) resolved "
+                        f"({len(pending)} still waiting), but the balance refresh "
+                        f"failed: {exc}. Requesting the next number.", prefix=pname)
                 return True
-            soonest = min(float(r.get("expiry_at", time.time())) for r in provider_pending)
+            soonest = min(float(r.get("expiry_at", time.time())) for r in pending)
             wait_left = max(0, int(soonest - time.time()))
-            self.worker_statuses["otpindia"] = (
-                f"Waiting for {len(provider_pending)} pending cancel(s) "
-                f"({wait_left}s until next retry)"
+            self.worker_statuses[provider] = (
+                f"Out of balance: waiting for the first of {len(pending)} pending "
+                f"cancel(s) to refund ({wait_left}s until its retry)"
             )
-            self.stop_requested.wait(poll_seconds)
+            # Woken early by on_pending_resolved(); otherwise a periodic re-check.
+            if self._pending_resolved_event.wait(poll_seconds):
+                self._pending_resolved_event.clear()
         return True
 
     # -- Cancellation, salvage & refund tally --------------------------------
@@ -1254,6 +1288,9 @@ class ParallelAutomationCoordinator:
             remaining = self.pending_cancels.hold_total(provider)[0]
             log(f"Deferred cancellation resolved; remaining held on "
                 f"{provider.upper()}: {remaining:.4f}", prefix=provider.upper())
+        # Wake a worker that ran out of balance while these cancels were
+        # pending: one refund is enough for the next number.
+        self._pending_resolved_event.set()
 
     # -- Parallel Worker Loop ------------------------------------------------
 
@@ -2484,6 +2521,54 @@ class ParallelAutomationCoordinator:
             on_tick=probe_provider
         )
 
+    def _otp_wait_timeout(self, context):
+        """
+        How long to wait for the OTP on this number.
+
+        automation.otp_timeout_seconds applies to every provider. A provider
+        that refuses to cancel a number for a while after issuing it (OTPIndia:
+        cancel_wait_seconds, 2 minutes from getNumber) cannot refund it before
+        that window has passed anyway - giving up on the OTP earlier only parks
+        the cancel in the background, and an SMS that lands in the rest of the
+        window (say at 119s) is then a paid OTP nobody uses, with no refund.
+
+        So for such a provider the wait is stretched to the end of the cancel
+        window whenever the configured timeout would end before it: the number
+        is only abandoned once it can actually be refunded. When the OTP was
+        triggered late enough (slow bot flow, manual trigger) that the
+        configured timeout already ends after the window, the configured value
+        stands and the cancel goes through right after it, exactly like on the
+        other providers. automation.otp_wait_covers_cancel_window=false turns
+        the stretch off.
+        """
+        try:
+            configured = max(0.0, float(self.settings.get("otp_timeout_seconds", 180) or 0.0))
+        except (TypeError, ValueError):
+            configured = 180.0
+        if not self.settings.get("otp_wait_covers_cancel_window", True):
+            return configured
+
+        getter = getattr(context.client, "cancel_window_remaining", None)
+        if not callable(getter):
+            return configured
+        try:
+            window_left = max(0.0, float(getter(context.activation_id) or 0.0))
+        except Exception:
+            window_left = 0.0
+        if window_left <= configured:
+            return configured
+
+        pname = context.provider_name.upper()
+        window_total = getattr(context.client, "cancel_wait_seconds", None)
+        window_note = (f" ({window_total:.0f}s cancel window from number issue)"
+                       if isinstance(window_total, (int, float)) else "")
+        log(f"A cancel for {context.clean_number} is only accepted in "
+            f"{window_left:.0f}s{window_note}, later than the configured OTP "
+            f"timeout of {configured:.0f}s. Waiting for the OTP until the number "
+            f"can actually be refunded ({window_left:.0f}s) - an SMS arriving in "
+            f"that time is used instead of paid for and lost.", prefix=pname)
+        return window_left
+
     def wait_for_otp(self, context):
         """
         Poll the provider for the SMS.
@@ -2493,13 +2578,16 @@ class ParallelAutomationCoordinator:
           ("late", status)      - OTP found by the final salvage probes after timeout
           ("cancelled", None)   - provider cancelled the activation
           ("timeout", None)     - no OTP (and no late salvage)
+
+        The wait is automation.otp_timeout_seconds, or longer on a provider
+        whose cancel window has not passed yet - see _otp_wait_timeout().
         """
-        timeout = self.settings.get("otp_timeout_seconds", 180)
+        timeout = self._otp_wait_timeout(context)
         poll_interval = self.settings.get("otp_poll_interval_seconds", 3)
         start_time = time.time()
         pname = context.provider_name.upper()
 
-        log(f"Waiting for OTP on {context.clean_number} ({pname}) (Timeout: {timeout}s)...", prefix=pname)
+        log(f"Waiting for OTP on {context.clean_number} ({pname}) (Timeout: {timeout:.0f}s)...", prefix=pname)
         last_log = 0
 
         while (time.time() - start_time) < timeout and not self.stop_requested.is_set():
@@ -2534,13 +2622,13 @@ class ParallelAutomationCoordinator:
 
             if status_type == "STATUS_WAIT_CODE":
                 if elapsed - last_log >= 15:
-                    log(f"Waiting for OTP ({elapsed}s/{timeout}s)...", prefix=pname)
+                    log(f"Waiting for OTP ({elapsed}s/{timeout:.0f}s)...", prefix=pname)
                     last_log = elapsed
             time.sleep(poll_interval)
 
         # FINAL SALVAGE: the SMS can land in the seconds between timeout and a
         # cancel call. Probe a few times before declaring the number dead.
-        log(f"OTP wait window elapsed ({timeout}s). Running final salvage probes...", prefix=pname)
+        log(f"OTP wait window elapsed ({timeout:.0f}s). Running final salvage probes...", prefix=pname)
         late = self.guard.salvage_late_otp(
             context.client, context.activation_id,
             probes=self.settings.get("timeout_salvage_probes", 3),

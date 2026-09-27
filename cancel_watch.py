@@ -623,10 +623,22 @@ class CancelWatchManager:
         # The money for this activation is spent: the live balance is the
         # baseline for everything that follows.
         self._settle_ledger(record, client, pname, consumed=True)
-        self._resolved(record)
+        self._close(record)
+
+    def _close(self, record):
+        """
+        Drop a finished record and tell the coordinator.
+
+        The record leaves the store BEFORE the coordinator hook runs: the hook
+        re-reads the store (remaining holds; a worker out of balance waits for
+        the first pending record to disappear), so it must already reflect
+        that this activation is closed.
+        """
+        activation_id = str(record["activation_id"])
         self.store.remove(activation_id)
         with self._lock:
             self._threads.pop(activation_id, None)
+        self._resolved(record)
 
     def _resolve_refund(self, record, client, res_type, pname):
         """The activation should be closed now: check that the refund landed."""
@@ -690,10 +702,7 @@ class CancelWatchManager:
                 except Exception:
                     pass
             self._settle_ledger(record, client, pname, consumed=False)
-            self._resolved(record)
-            self.store.remove(activation_id)
-            with self._lock:
-                self._threads.pop(activation_id, None)
+            self._close(record)
             return
 
         # Not refunded - a real discrepancy now, not a timing accident.

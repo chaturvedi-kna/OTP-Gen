@@ -24,6 +24,12 @@ immediately): a cancel that arrives before `cancel_wait_seconds` (default
 ACCESS_CANCEL_WAIT - the activation stays open and the money stays held
 until the window has passed. See set_status() / _cancel_wait_seconds().
 
+Because of that window the coordinator also keeps waiting for the OTP until
+the number can actually be refunded: cancel_window_remaining() tells it how
+long that is, and the OTP wait is stretched to cover it whenever the
+configured automation.otp_timeout_seconds would end earlier (an SMS that
+lands at 119s is then still used instead of paid for and thrown away).
+
 Note: the published spec snippets cover getBalance / getNumber / setStatus;
 getStatus follows the handler_api convention this protocol is based on
 (action=getStatus&id=... -> STATUS_OK:<sms>).
@@ -229,13 +235,30 @@ class OtpIndiaClient(BaseOTPClient):
             except ValueError:
                 pass
 
-        acquired = self._acquired_at.get(str(activation_id))
-        if acquired is not None:
-            remaining = self.cancel_wait_seconds - (time.time() - acquired)
+        if str(activation_id) in self._acquired_at:
+            remaining = self.cancel_window_remaining(activation_id)
             if remaining > 0:
                 return max(1, int(math.ceil(remaining)))
 
         return max(1, int(self.cancel_wait_seconds))
+
+    def cancel_window_remaining(self, activation_id):
+        """
+        Seconds left until OTPIndia accepts a cancel for this activation.
+
+        Counted from the moment getNumber issued the number
+        (cancel_wait_seconds, 2 minutes by default). 0.0 once the window has
+        passed, and 0.0 for an activation this client did not issue (nothing
+        is known about it, so nobody should wait on its account).
+
+        The coordinator uses this to keep waiting for the OTP until the number
+        can actually be refunded - see wait_for_otp() in main.py.
+        """
+        acquired = self._acquired_at.get(str(activation_id))
+        if acquired is None:
+            return 0.0
+        remaining = self.cancel_wait_seconds - (time.time() - acquired)
+        return max(0.0, float(remaining))
 
     def finish(self, activation_id):
         """

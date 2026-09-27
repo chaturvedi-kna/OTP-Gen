@@ -96,6 +96,7 @@ Every provider lives in its own `config.json` block and is picked up by
   "api_key": "YOUR_API_KEY",
   "service": "meesho",
   "server": "Operator-1",
+  "cancel_wait_seconds": 120,
   "max_attempts": 500
 }
 ```
@@ -106,8 +107,31 @@ Every provider lives in its own `config.json` block and is picked up by
 - `server` — a server code listed for that service on otpindia.org. For
   Meesho the listed codes are `Operator-1` … `Operator-4`, `Operator-9`,
   `Operator-10` and `v1-22` (sent as `server=` with `getNumber`).
+- `cancel_wait_seconds` — OTPIndia's cancel window: a cancel sent earlier than
+  this after `getNumber` is answered with `ACCESS_CANCEL_WAIT` (the number
+  stays open, the money stays held) and is retried in the background once the
+  window has passed. Keep it at the provider's 2 minutes unless they change it.
 - Rate limit is 900 requests/minute — the defaults are far below it.
 - CLI: `python main.py --provider otpindia` (also accepts the alias `india`).
+
+How the cancel window shapes an OTPIndia run:
+
+- **OTP wait**: a found number waits for its OTP for
+  `automation.otp_timeout_seconds` like on every provider — but never shorter
+  than the rest of its cancel window. Giving up at, say, 80s cannot refund the
+  number before 120s anyway; an SMS arriving at 119s would then be paid for and
+  unused. So when the OTP was triggered soon after the number was bought, the
+  wait runs to `cancel_wait_seconds` from `getNumber` (an SMS in that time is
+  used normally); when the trigger came late enough that the configured timeout
+  already ends after the window, the configured timeout stands and the cancel
+  is accepted immediately after it. `automation.otp_wait_covers_cancel_window:
+  false` disables the stretch.
+- **Out of balance while cancels are pending**: `NO_BALANCE` with routine
+  cancels still inside their window is back-pressure, not a stop. The worker
+  waits for the **first** pending cancel to refund, then requests the next
+  number right away — it does not wait for all of them. If that refund was not
+  enough, it waits for the next one, and so on; only `NO_BALANCE` with nothing
+  pending stops the worker with the usual recharge alert.
 
 ## 5. Dual OTP Providers (TemporaSMS + OtpDoctor)
 

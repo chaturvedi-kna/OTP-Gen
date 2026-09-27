@@ -189,6 +189,7 @@
     "trigger_wait_seconds": 300,
     "trigger_poll_interval_seconds": 2,
     "otp_timeout_seconds": 180,
+    "otp_wait_covers_cancel_window": true,
     "otp_poll_interval_seconds": 3,
     "auto_finish_activation": true,
     "stop_after_success": false,
