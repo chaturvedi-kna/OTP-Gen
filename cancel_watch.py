@@ -33,6 +33,13 @@ What happens instead now:
   4. At expiry the cancel is retried (bounded), and only then is the refund
      tally run - a mismatch after that is a real one and still stops the run.
 
+OTPIndia is a structured variant of this: instead of a plain ERROR it answers
+ACCESS_CANCEL_WAIT - a cancel is only accepted once `cancel_wait_seconds`
+(default 120) have passed since the number was issued. That answer belongs to
+the same "not yet, try later" family; the only difference is that the retry
+happens after the provider's own wait window instead of the assumed activation
+expiry (see CancelWatchManager.defer(retry_after_seconds=...)).
+
 Pending cancellations are persisted (pending_cancels.json), so restarting the
 tool after a crash resumes the watchers instead of silently losing the money.
 """
@@ -55,8 +62,11 @@ CANCEL_SUCCESS_TYPES = {
 }
 
 # Answers that mean "not yet, try later": the wait is resumed, not abandoned.
-CANCEL_RETRY_TYPES = {"ERROR", "WAIT_CANCEL", "EARLY_CANCEL_DENIED",
-                      "NO_ACTIVATION", "TRY_AGAIN", "TOO_MANY_REQUESTS"}
+# ACCESS_CANCEL_WAIT is OTPIndia-specific: the cancel only becomes legal
+# `cancel_wait_seconds` (default 120) after the number was issued.
+CANCEL_RETRY_TYPES = {"ERROR", "WAIT_CANCEL", "ACCESS_CANCEL_WAIT",
+                      "EARLY_CANCEL_DENIED", "NO_ACTIVATION", "TRY_AGAIN",
+                      "TOO_MANY_REQUESTS"}
 
 DEFAULT_SETTINGS = {
     # Assumed activation lifetime when the provider does not publish one.
@@ -320,15 +330,23 @@ class CancelWatchManager:
     # -- deferring -----------------------------------------------------------
 
     def defer(self, client, activation_id, number, reason, expected_balance,
-              hold=None, error_detail=""):
+              hold=None, error_detail="", retry_after_seconds=None):
         """
         Hand a refused cancellation to a background watcher.
+
+        retry_after_seconds: when the provider itself says how long to wait
+        before the cancel will be accepted (OTPIndia's ACCESS_CANCEL_WAIT),
+        the retry happens after that window instead of the assumed activation
+        expiry.
 
         Returns the pending record. The caller treats it as "the number is on
         its way out" - it must not run a refund tally for it.
         """
         settings = self.settings
         now_ts = time.time()
+        wait_seconds = (settings["cancel_error_expiry_seconds"]
+                        if retry_after_seconds is None
+                        else max(1.0, float(retry_after_seconds)))
         record = {
             "provider": client.name,
             "activation_id": str(activation_id),
@@ -340,18 +358,23 @@ class CancelWatchManager:
             "hold_unknown": hold is None,
             "deferred_at": now(),
             "deferred_at_epoch": now_ts,
-            "expiry_at": now_ts + settings["cancel_error_expiry_seconds"],
-            "expiry_assumed": True,
+            "expiry_at": now_ts + wait_seconds,
+            "expiry_assumed": retry_after_seconds is None,
             "attempts": 0,
             "notifications": 0,
         }
         self.store.add(record)
         self._start(record)
+        if retry_after_seconds is None:
+            why = ("The provider refused the cancel with ERROR; the "
+                   "activation stays open and is retried at expiry")
+        else:
+            why = ("The provider only accepts the cancel after its wait "
+                   "window; the activation stays open and is retried when "
+                   "the window has passed")
         self._log(
-            f"[DEFERRED-CANCEL] The provider refused the cancel with ERROR; the "
-            f"activation stays open and is retried at expiry "
-            f"(~{settings['cancel_error_expiry_seconds']:.0f}s). The worker keeps "
-            f"hunting - {number} / {activation_id}.",
+            f"[DEFERRED-CANCEL] {why} (~{wait_seconds:.0f}s). The worker "
+            f"keeps hunting - {number} / {activation_id}.",
             client.name.upper()
         )
         return record
@@ -502,7 +525,7 @@ class CancelWatchManager:
                 res_type = cancel_res.get("type")
                 if res_type in CANCEL_SUCCESS_TYPES:
                     break
-                if res_type == "WAIT_CANCEL":
+                if res_type in ("WAIT_CANCEL", "ACCESS_CANCEL_WAIT"):
                     wait_seconds = cancel_res.get("seconds", delay)
                     if attempt < attempts:
                         time.sleep(max(1.0, float(wait_seconds)))
@@ -652,8 +675,8 @@ class CancelWatchManager:
                 except Exception:
                     pass
             self._log(
-                f"[DEFERRED-CANCEL] {number} cancelled after the expiry wait; "
-                f"refund tallied (last cancel answer: {res_type}).",
+                f"[DEFERRED-CANCEL] {number} cancelled once the provider "
+                f"allowed it; refund tallied (last cancel answer: {res_type}).",
                 pname
             )
             if notify is not None:
@@ -682,7 +705,7 @@ class CancelWatchManager:
         waited = ""
         try:
             waited = (f"\\nWaited: {max(0.0, time.time() - float(record.get('deferred_at_epoch', time.time()))):.0f}s "
-                      f"for the activation to expire")
+                      f"before the cancel was retried")
         except Exception:
             pass
         critical = getattr(self.owner, "critical_stop", None)
@@ -691,9 +714,9 @@ class CancelWatchManager:
             f"Expected balance: ~{expected}\\nActual balance: {actual}\\n"
             f"Last cancel answer: {res_type}\\n"
             f"Reason for cancel: {record.get('reason')}{waited}\\n\\n"
-            f"The cancellation was deferred to the activation expiry and retried, "
-            f"and the refund still did not tally. Verify this activation in the "
-            f"provider panel before buying more numbers."
+            f"The cancellation was deferred until the provider allowed it and "
+            f"was retried, and the refund still did not tally. Verify this "
+            f"activation in the provider panel before buying more numbers."
         )
         if callable(critical):
             critical(f"[{pname}] REFUND DID NOT TALLY (deferred cancel)", message)

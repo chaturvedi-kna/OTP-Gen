@@ -48,6 +48,7 @@
     "api_key": "",
     "service": "meesho",
     "server": "Operator-1",
+    "cancel_wait_seconds": 120,
     "max_attempts": 500
   },
   "checker": {

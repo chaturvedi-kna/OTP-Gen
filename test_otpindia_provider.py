@@ -24,6 +24,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import types
 
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -210,6 +211,53 @@ def test_status_and_cancel():
     check("otpindia: WAIT_CANCEL cooldown parsed",
           client.cancel("12345") == {"type": "WAIT_CANCEL", "seconds": 120})
 
+    # OTPIndia-specific cancel window: a cancel is refused with
+    # ACCESS_CANCEL_WAIT until 2 minutes after the number was issued. The
+    # answer must carry how long the caller should wait before retrying.
+    respond("ACCESS_NUMBER:777:919812345678")
+    client.get_number(service="wa", server="1")
+    act = "777"
+
+    respond("ACCESS_CANCEL_WAIT")
+    res = client.cancel(act)
+    check("otpindia: ACCESS_CANCEL_WAIT parsed with the wait",
+          res.get("type") == "ACCESS_CANCEL_WAIT"
+          and 115 <= int(res.get("seconds", 0)) <= 120, res)
+
+    client._acquired_at[act] = time.time() - 60
+    respond("ACCESS_CANCEL_WAIT")
+    res = client.cancel(act)
+    check("otpindia: the wait counts down from number issue",
+          res.get("type") == "ACCESS_CANCEL_WAIT"
+          and 55 <= int(res.get("seconds", 0)) <= 62, res)
+
+    respond("ACCESS_CANCEL_WAIT:30")
+    check("otpindia: a wait reported by the server wins",
+          client.cancel(act).get("seconds") == 30)
+
+    respond("ACCESS_CANCEL_WAIT")
+    res = OtpIndiaClient(api_key="KEY123").cancel("unknown")
+    check("otpindia: unknown activation assumes the full window",
+          res == {"type": "ACCESS_CANCEL_WAIT", "seconds": 120}, res)
+
+    respond("ACCESS_CANCEL_WAIT")
+    res = OtpIndiaClient(api_key="KEY123", cancel_wait_seconds=30).cancel("unknown")
+    check("otpindia: the cancel window is configurable",
+          res == {"type": "ACCESS_CANCEL_WAIT", "seconds": 30}, res)
+
+    client._acquired_at[act] = time.time() - 300
+    respond("ACCESS_CANCEL_WAIT")
+    res = client.cancel(act)
+    check("otpindia: still refused after the window -> a fresh full window",
+          res.get("type") == "ACCESS_CANCEL_WAIT" and res.get("seconds") == 120,
+          res)
+
+    respond("ACCESS_CANCEL")
+    check("otpindia: the cancel is accepted once the window has passed",
+          client.cancel(act) == {"type": "ACCESS_CANCEL"})
+    check("otpindia: the issue time is dropped once the activation is closed",
+          act not in client._acquired_at, client._acquired_at)
+
     respond("ACCESS_ACTIVATION")
     check("otpindia: finish (status 6)",
           client.finish("12345") == {"type": "ACCESS_ACTIVATION"})
@@ -258,6 +306,14 @@ def test_create_clients():
           and c.default_server == "3"
           and c.base_url == "https://otpindia.org/api/stubs/handler_api.php",
           (c.api_key, c.default_service, c.default_server, c.base_url))
+    check("factory: otpindia cancel window defaults to 2 minutes",
+          c.cancel_wait_seconds == 120.0, c.cancel_wait_seconds)
+
+    tuned = india_config()
+    tuned["otpindia"]["cancel_wait_seconds"] = 45
+    c2 = create_otp_clients(tuned, provider_override="otpindia")[0]
+    check("factory: otpindia cancel window configurable via config.json",
+          c2.cancel_wait_seconds == 45.0, c2.cancel_wait_seconds)
 
     clients = create_otp_clients(cfg, provider_override="india")
     check("factory: 'india' alias maps to otpindia",

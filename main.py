@@ -583,7 +583,7 @@ class ParallelAutomationCoordinator:
 
         pending = self.pending_cancels.pending()
         if pending:
-            lines.append("\n⏳ Cancellations deferred to activation expiry:")
+            lines.append("\n⏳ Deferred cancellations (waiting to become cancelable):")
             for record in pending:
                 hold = record.get("hold")
                 hold_text = "amount unknown" if hold is None else f"holding {float(hold):.4f}"
@@ -1103,8 +1103,10 @@ class ParallelAutomationCoordinator:
 
         TemporaSMS / VSImpro answer a cancel that arrives before the activation
         is old enough with a plain {"type": "ERROR"}: the activation stays open
-        and the money stays deducted. Tallies against the balance right now can
-        only fail, so the cancellation is deferred to the activation expiry.
+        and the money stays deducted. OTPIndia answers {"type": "ACCESS_CANCEL_WAIT"}
+        (its cancel window is 2 minutes from number issue). Tallies against the
+        balance right now can only fail, so the cancellation is deferred and
+        retried when the provider allows it.
         """
         if not self.settings.get("defer_refused_cancels", True):
             return False
@@ -1135,9 +1137,22 @@ class ParallelAutomationCoordinator:
             hold = max(0.0, round(float(expected_balance) - balance, 6))
 
         detail = " ".join(part for part in (str(cancel_error or ""), str(cancel_res or "")) if part)
+
+        # OTPIndia answers ACCESS_CANCEL_WAIT with the wait itself: a cancel
+        # is only accepted once its cancel window (2 minutes from number
+        # issue) has passed. The watcher retries after that window instead of
+        # the assumed activation expiry, so the refund lands as soon as the
+        # provider allows it.
+        retry_after = None
+        if cancel_res and cancel_res.get("type") == "ACCESS_CANCEL_WAIT":
+            try:
+                retry_after = max(1.0, float(cancel_res.get("seconds", 120)))
+            except (TypeError, ValueError):
+                retry_after = 120.0
+
         record = self.pending_cancels.defer(
             client, activation_id, number, reason, expected_balance,
-            hold=hold, error_detail=detail,
+            hold=hold, error_detail=detail, retry_after_seconds=retry_after,
         )
 
         if hold is None:
@@ -1147,7 +1162,6 @@ class ParallelAutomationCoordinator:
                 f"could not be measured (the balance could not be read)"
             )
 
-        settings = resolve_cancel_settings(self.settings)
         self.state.save({
             "status": "CANCEL_DEFERRED",
             "provider": client.name,
@@ -1159,13 +1173,19 @@ class ParallelAutomationCoordinator:
             "retry_at": record.get("expiry_at"),
             "deferred_at": now()
         })
+        try:
+            retry_in = max(0.0, float(record.get("expiry_at", 0.0)) - time.time())
+        except (TypeError, ValueError):
+            retry_in = 0.0
+        retry_note = ("the provider's cancel wait window" if retry_after is not None
+                      else "activation expiry")
         self.notify.send(
             f"⏳ [{pname}] Cancel refused - deferred",
             f"Number: {number}\nActivation: {activation_id}\nReason: {reason}\n\n"
             f"The provider answered `{detail or 'ERROR'}`, so the activation is "
-            f"still open. It is retried in ~{settings['cancel_error_expiry_seconds']:.0f}s "
-            f"(activation expiry) in the background; this worker keeps hunting "
-            f"and the refund is tallied after the retry."
+            f"still open. It is retried in ~{retry_in:.0f}s ({retry_note}) in "
+            f"the background; this worker keeps hunting and the refund is "
+            f"tallied after the retry."
             + ("" if hold else "\n\n⚠️ The balance could not be read, so the "
                "refund tally for this provider is suspended until it resolves.")
         )
