@@ -836,6 +836,45 @@ class ParallelAutomationCoordinator:
         self.stop_requested.set()
         log("Stop requested via command.")
 
+    def _wait_for_pending_otpindia_refunds(self, client):
+        """Wait quietly for OTPIndia's expected cancel window/refunds to clear.
+
+        OTPIndia holds the purchase amount until its two-minute cancel window
+        elapses. If the worker has used the available balance while one or more
+        routine cancels are pending, NO_BALANCE is a temporary back-pressure
+        signal, not a reason to stop the provider worker.
+        """
+        if getattr(client, "name", "") != "otpindia":
+            return False
+        if not self.pending_cancels.has_pending("otpindia"):
+            return False
+
+        poll_seconds = max(0.25, float(self.settings.get(
+            "otpindia_balance_wait_poll_seconds", 2.0) or 2.0))
+        log("OTPIndia has no currently spendable balance; waiting for pending "
+            "cancellations to pass their normal cancel window.", prefix="OTPINDIA")
+        while not self.stop_requested.is_set():
+            pending = self.pending_cancels.pending()
+            provider_pending = [r for r in pending if r.get("provider") == "otpindia"]
+            if not provider_pending:
+                try:
+                    balance = client.get_balance()
+                    self._note_balance("otpindia", balance)
+                    log(f"Pending cancellations cleared; balance is {balance:.4f}. "
+                        "Resuming number requests.", prefix="OTPINDIA")
+                except Exception as exc:
+                    log(f"Pending cancellations cleared, but balance refresh failed: {exc}",
+                        prefix="OTPINDIA")
+                return True
+            soonest = min(float(r.get("expiry_at", time.time())) for r in provider_pending)
+            wait_left = max(0, int(soonest - time.time()))
+            self.worker_statuses["otpindia"] = (
+                f"Waiting for {len(provider_pending)} pending cancel(s) "
+                f"({wait_left}s until next retry)"
+            )
+            self.stop_requested.wait(poll_seconds)
+        return True
+
     # -- Cancellation, salvage & refund tally --------------------------------
 
     def handle_cancellation(self, client, activation_id, number, reason,
@@ -1179,16 +1218,20 @@ class ParallelAutomationCoordinator:
             retry_in = 0.0
         retry_note = ("the provider's cancel wait window" if retry_after is not None
                       else "activation expiry")
-        self.notify.send(
-            f"⏳ [{pname}] Cancel refused - deferred",
-            f"Number: {number}\nActivation: {activation_id}\nReason: {reason}\n\n"
-            f"The provider answered `{detail or 'ERROR'}`, so the activation is "
-            f"still open. It is retried in ~{retry_in:.0f}s ({retry_note}) in "
-            f"the background; this worker keeps hunting and the refund is "
-            f"tallied after the retry."
-            + ("" if hold else "\n\n⚠️ The balance could not be read, so the "
-               "refund tally for this provider is suspended until it resolves.")
-        )
+        # OTPIndia's ACCESS_CANCEL_WAIT is its documented, routine two-minute
+        # window. Keep it in logs/status, but don't alert the user for each
+        # expected cancellation.
+        if client.name != "otpindia":
+            self.notify.send(
+                f"⏳ [{pname}] Cancel refused - deferred",
+                f"Number: {number}\nActivation: {activation_id}\nReason: {reason}\n\n"
+                f"The provider answered `{detail or 'ERROR'}`, so the activation is "
+                f"still open. It is retried in ~{retry_in:.0f}s ({retry_note}) in "
+                f"the background; this worker keeps hunting and the refund is "
+                f"tallied after the retry."
+                + ("" if hold else "\n\n⚠️ The balance could not be read, so the "
+                   "refund tally for this provider is suspended until it resolves.")
+            )
         return {
             "tally_ok": True,
             "deferred": True,
@@ -1321,6 +1364,10 @@ class ParallelAutomationCoordinator:
                         max_price=otp_conf.get("max_price", 9.5)
                     )
             except OTPNoBalance as exc:
+                if self._wait_for_pending_otpindia_refunds(client):
+                    if self.stop_requested.is_set():
+                        break
+                    continue
                 balance_wait = getattr(client, "balance_wait_seconds", 0) or client_conf.get("balance_update_delay_seconds", 0)
                 if balance_wait > 0:
                     log(f"Provider reported OTPNoBalance. Waiting up to {balance_wait}s for balance/refund update...", prefix=pname)
@@ -1375,6 +1422,10 @@ class ParallelAutomationCoordinator:
                 continue
 
             if res_type == "NO_BALANCE":
+                if self._wait_for_pending_otpindia_refunds(client):
+                    if self.stop_requested.is_set():
+                        break
+                    continue
                 log(f"Provider reported fatal error: NO_BALANCE (Insufficient Balance)", prefix=pname)
                 self.worker_statuses[client.name] = "Stopped (NO_BALANCE)"
                 self.notify.alert(

@@ -545,7 +545,7 @@ class CancelWatchManager:
 
     def _notify_resumed(self, record, pname):
         notify = getattr(self.owner, "notify", None)
-        if notify is None:
+        if notify is None or pname == "OTPINDIA":
             return
         try:
             notify.alert(
@@ -679,7 +679,7 @@ class CancelWatchManager:
                 f"allowed it; refund tallied (last cancel answer: {res_type}).",
                 pname
             )
-            if notify is not None:
+            if notify is not None and pname != "OTPINDIA":
                 try:
                     notify.send(
                         f"✅ [{pname}] Deferred cancel completed",

@@ -246,6 +246,17 @@ class TelegramBackend:
     def get_me(self):
         return self._call("getMe")
 
+    def register_commands(self, commands):
+        """Publish commands in Telegram's native bot-command menu."""
+        if not self.configured:
+            return None
+        normalized = [
+            {"command": str(command).lstrip("/")[:32],
+             "description": str(description)[:256]}
+            for command, description in commands
+        ]
+        return self._call("setMyCommands", {"commands": normalized})
+
     def discover_chat_id(self):
         updates = self._call("getUpdates", {"timeout": 0, "limit": 100})
         if not updates:
@@ -591,6 +602,22 @@ class Notifier:
         self.telegram.stop_callback = stop_cb
         self.telegram.referral_callback = referral_cb
         self.telegram.checker_callback = checker_cb
+
+        # Telegram shows these from the slash-command/menu button, rather than
+        # users needing to remember or discover commands from a help message.
+        commands = [("start", "Show command help"),
+                    ("run", "Start search; optionally specify provider")]
+        if status_cb:
+            commands.append(("status", "Show automation status"))
+        if balance_cb:
+            commands.append(("balance", "Show provider balances"))
+        if referral_cb:
+            commands.append(("referral", "View or set Meesho referral link"))
+        if checker_cb:
+            commands.append(("checker", "View or change checker mode"))
+        if stop_cb:
+            commands.append(("stop", "Stop the active search"))
+        self.telegram.register_commands(commands)
 
     def send(self, title, message, priority="default", notif_id=NOTIF_ID_STATUS,
              termux_buttons=None, telegram_buttons=None, ongoing=False, silent=False):
