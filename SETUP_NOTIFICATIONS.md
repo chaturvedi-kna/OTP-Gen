@@ -75,12 +75,37 @@ When an unregistered number is found:
 ### Bot Commands
 You can interact with the running tool via Telegram anytime:
 - **`/status`**: Checks whether the tool is RUNNING or IDLE, global attempts, active target number, and provider balances.
-- **`/run`**: Starts searching for fresh numbers from Telegram if the script was stopped or idle.
-- **`/balance`**: Retrieves live balances for TemporaSMS and OtpDoctor.
+- **`/run`**: Starts searching for fresh numbers from Telegram if the script was stopped or idle (uses `active_otp_provider` from `config.json`).
+- **`/run <provider>`**: Starts **only that provider** for this run — e.g. `/run vsimpro`, `/run otpindia`, `/run tempora,vsimpro` or `/run all`. Unknown names and providers without credentials are rejected with an explanation. The choice applies to this run only; the next bare `/run` returns to `active_otp_provider`. (`/status` shows the current run selection while it differs from Mode.)
+- **`/balance`**: Retrieves live balances for every configured provider (TemporaSMS, VSImpro, OtpDoctor, OTPCart, OTPIndia).
 - **`/stop`**: Gracefully stops the active search.
 - **`/referral <link>`**: Saves/updates the Meesho referral link (`/referral off` clears it, `/referral` shows it).
 - **`/checker api|bot|auto`**: Shows or switches the number-checker strategy (API only / PRIMES bot only / API first with the bot as fallback). See `SETUP_CHECKER.md`.
 - **`/start`**: Shows available bot commands.
+
+### Adding an OTP provider (example: OTPIndia)
+
+Every provider lives in its own `config.json` block and is picked up by
+`--provider` / `active_otp_provider` / `/run <provider>`. For OTPIndia
+(`otpindia.org`, handler_api protocol):
+
+```json
+"otpindia": {
+  "enabled": true,
+  "base_url": "https://otpindia.org/api/stubs/handler_api.php",
+  "api_key": "YOUR_API_KEY",
+  "service": "meesho",
+  "server": "SERVER_CODE_FOR_THE_SERVICE",
+  "max_attempts": 500
+}
+```
+
+- `api_key` — from your OTPIndia account (the provider is skipped everywhere,
+  including `/run otpindia`, until this is set).
+- `service` — the service short code (e.g. `meesho`, `wa`).
+- `server` — the server code listed for that service on otpindia.org
+  (sent as `server=` with `getNumber`; leave empty to let the API decide).
+- CLI: `python main.py --provider otpindia` (also accepts the alias `india`).
 
 ## 5. Dual OTP Providers (TemporaSMS + OtpDoctor)
 
