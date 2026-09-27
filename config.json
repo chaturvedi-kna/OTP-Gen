@@ -176,7 +176,9 @@
   "telegram": {
     "enabled": true,
     "bot_token": "8670376621:AAEoyDlUzzKZshZEkJfxiyVtSWm-nvUDbXU",
-    "chat_id": "883480917"
+    "chat_id": "883480917",
+    "notify_level": "all",
+    "silent_routine": true
   },
   "automation": {
     "target_registered": false,
@@ -189,6 +191,7 @@
     "trigger_wait_seconds": 300,
     "trigger_poll_interval_seconds": 2,
     "otp_timeout_seconds": 180,
+    "otp_wait_covers_cancel_window": true,
     "otp_poll_interval_seconds": 3,
     "auto_finish_activation": true,
     "stop_after_success": false,

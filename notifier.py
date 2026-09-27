@@ -26,6 +26,30 @@ NOTIF_ID_STATUS = "meesho-status"
 NOTIF_ID_ACTION = "meesho-action"
 NOTIF_ID_OTP = "meesho-otp"
 
+# Telegram verbosity (telegram.notify_level / the /notify command).
+#
+# Every message carries a tier; a level lets through the tiers up to its rank:
+#   quiet  -> critical only (stops, balance, refund mismatch, provider/bot
+#             errors, anything that needs a hand) + "Account linked"
+#   normal -> + per-number outcomes (wrong / expired / blocked OTP, timeouts)
+#   all    -> + routine progress (OTP requested, changing number, deferred
+#             cancel notices, late-OTP salvage, trigger acknowledgements)
+# Whatever a level mutes is still printed to the console log. Routine
+# messages are delivered without sound (telegram.silent_routine).
+NOTIFY_LEVELS = {"quiet": 1, "normal": 2, "all": 3}
+NOTIFY_TIERS = {"critical": 1, "linked": 1, "important": 2, "routine": 3}
+DEFAULT_NOTIFY_LEVEL = "all"
+
+
+def normalize_notify_level(value, default=DEFAULT_NOTIFY_LEVEL):
+    text = str(value or "").strip().lower()
+    aliases = {"min": "quiet", "minimal": "quiet", "critical": "quiet",
+               "silent": "quiet", "mute": "quiet", "muted": "quiet",
+               "less": "normal", "reduced": "normal", "default": "normal",
+               "max": "all", "full": "all", "everything": "all", "verbose": "all"}
+    text = aliases.get(text, text)
+    return text if text in NOTIFY_LEVELS else default
+
 
 def normalize_instance(value):
     """Delegate to runtime.normalize_instance (import kept local, see signal_dir_for)."""
@@ -195,6 +219,9 @@ class TelegramBackend:
         self.stop_callback = None
         self.referral_callback = None
         self.checker_callback = None
+        self.accounts_callback = None
+        self.milestone_callback = None
+        self.notify_callback = None
 
     @property
     def configured(self):
@@ -504,6 +531,40 @@ class TelegramBackend:
                         reply = f"❌ Referral command failed: {exc}"
                     self.send("Referral Link", reply or "Referral command handled.")
                     continue
+                elif cmd in ("accounts", "linked") and self.accounts_callback:
+                    # /accounts - linked accounts per provider + since the
+                    # last milestone; /accounts list - the numbers since it.
+                    parts = raw_text.split(None, 1)
+                    argument = parts[1].strip() if len(parts) > 1 else ""
+                    try:
+                        reply = self.accounts_callback(argument)
+                    except Exception as exc:
+                        reply = f"❌ Accounts command failed: {exc}"
+                    for chunk in self._chunks(reply or "No linked accounts yet."):
+                        self.send("Linked Accounts", chunk)
+                    continue
+                elif cmd == "milestone" and self.milestone_callback:
+                    # /milestone <last shared number> <note> - add;
+                    # /milestone - show; /milestone remove - drop the last.
+                    parts = raw_text.split(None, 1)
+                    argument = parts[1].strip() if len(parts) > 1 else ""
+                    try:
+                        reply = self.milestone_callback(argument)
+                    except Exception as exc:
+                        reply = f"❌ Milestone command failed: {exc}"
+                    self.send("Milestone", reply or "Milestone command handled.")
+                    continue
+                elif cmd == "notify" and self.notify_callback:
+                    # /notify all|normal|quiet - Telegram verbosity;
+                    # /notify alone - show the current level.
+                    parts = raw_text.split(None, 1)
+                    argument = parts[1].strip() if len(parts) > 1 else ""
+                    try:
+                        reply = self.notify_callback(argument)
+                    except Exception as exc:
+                        reply = f"❌ Notify command failed: {exc}"
+                    self.send("Notifications", reply or "Notify command handled.")
+                    continue
                 elif cmd == "start":
                     self.send(
                         "Meesho Automation Bot",
@@ -514,6 +575,13 @@ class TelegramBackend:
                         "/run tempora,vsimpro, /run all)\n"
                         "ℹ️ /status - Check current tool status & progress\n"
                         "💰 /balance - Check live balances on all providers\n"
+                        "👤 /accounts - Linked accounts per provider + new since "
+                        "the last milestone (/accounts list for the numbers)\n"
+                        "📍 /milestone <last shared number> <note> - Mark everything "
+                        "up to that number as used/shared (/milestone to show, "
+                        "/milestone remove to undo)\n"
+                        "🔔 /notify all|normal|quiet - How much Telegram reports "
+                        "(/notify to show)\n"
                         "🎁 /referral <link> - Save the Meesho referral link "
                         "(/referral off to clear, /referral to show)\n"
                         "🔎 /checker api|bot|auto - Number checker strategy "
@@ -536,6 +604,24 @@ class TelegramBackend:
         updates = self._call("getUpdates", payload, timeout=10)
         for update in updates or []:
             self._update_offset = update["update_id"] + 1
+
+    @staticmethod
+    def _chunks(text, limit=3500):
+        """Split a long reply on line boundaries (Telegram caps at 4096 chars)."""
+        text = str(text or "")
+        if len(text) <= limit:
+            return [text]
+        chunks, current = [], ""
+        for line in text.split("\n"):
+            candidate = f"{current}\n{line}" if current else line
+            if len(candidate) > limit and current:
+                chunks.append(current)
+                current = line
+            else:
+                current = candidate
+        if current:
+            chunks.append(current)
+        return chunks
 
     @staticmethod
     def _escape(text):
@@ -572,10 +658,37 @@ class Notifier:
         self.warned_termux = False
         self.warned_telegram = False
 
+        # Telegram verbosity - see NOTIFY_LEVELS. Routine messages go out
+        # without sound unless telegram.silent_routine is false.
+        self.level = normalize_notify_level(telegram_conf.get("notify_level"))
+        self.silent_routine = bool(telegram_conf.get("silent_routine", True))
+        self.muted_count = 0
+
         try:
             self.signal_dir.mkdir(exist_ok=True)
         except Exception:
             pass
+
+    # -- verbosity -----------------------------------------------------------
+
+    def set_level(self, value):
+        """Switch the Telegram verbosity (all / normal / quiet); returns the level set."""
+        level = normalize_notify_level(value, default=None)
+        if level is None:
+            raise ValueError(f"unknown notify level {value!r} (use all, normal or quiet)")
+        self.level = level
+        return self.level
+
+    @staticmethod
+    def describe_levels():
+        return ("all - everything (routine progress is delivered silently)\n"
+                "normal - Account linked, wrong/expired/blocked OTP, timeouts + critical\n"
+                "quiet - Account linked + critical alerts only")
+
+    def telegram_passes(self, tier):
+        """Does the current level let a message of this tier reach Telegram?"""
+        rank = NOTIFY_TIERS.get(str(tier or "critical").lower(), 1)
+        return rank <= NOTIFY_LEVELS.get(self.level, NOTIFY_LEVELS[DEFAULT_NOTIFY_LEVEL])
 
     def notif_id(self, base):
         """Per-instance notification id, so parallel tabs do not overwrite.
@@ -589,12 +702,13 @@ class Notifier:
         return base if str(base).endswith(suffix) else f"{base}{suffix}"
 
     def set_command_callbacks(self, status_cb=None, balance_cb=None, run_cb=None,
-                              stop_cb=None, referral_cb=None, checker_cb=None):
+                              stop_cb=None, referral_cb=None, checker_cb=None,
+                              accounts_cb=None, milestone_cb=None, notify_cb=None):
         """
         Attach callbacks for interactive Telegram commands (/status, /balance,
-        /run [provider], /stop, /referral <link>, /checker <mode>). The run
-        callback receives the optional /run argument ("" when none), so it can
-        narrow the run to specific provider(s).
+        /run [provider], /stop, /referral <link>, /checker <mode>, /accounts,
+        /milestone, /notify). Callbacks with an argument receive the text after
+        the command ("" when none).
         """
         self.telegram.status_callback = status_cb
         self.telegram.balance_callback = balance_cb
@@ -602,6 +716,9 @@ class Notifier:
         self.telegram.stop_callback = stop_cb
         self.telegram.referral_callback = referral_cb
         self.telegram.checker_callback = checker_cb
+        self.telegram.accounts_callback = accounts_cb
+        self.telegram.milestone_callback = milestone_cb
+        self.telegram.notify_callback = notify_cb
 
         # Telegram shows these from the slash-command/menu button, rather than
         # users needing to remember or discover commands from a help message.
@@ -611,6 +728,12 @@ class Notifier:
             commands.append(("status", "Show automation status"))
         if balance_cb:
             commands.append(("balance", "Show provider balances"))
+        if accounts_cb:
+            commands.append(("accounts", "Linked accounts per provider + since last milestone"))
+        if milestone_cb:
+            commands.append(("milestone", "Mark accounts up to a number as used/shared"))
+        if notify_cb:
+            commands.append(("notify", "Telegram verbosity: all, normal or quiet"))
         if referral_cb:
             commands.append(("referral", "View or set Meesho referral link"))
         if checker_cb:
@@ -620,7 +743,15 @@ class Notifier:
         self.telegram.register_commands(commands)
 
     def send(self, title, message, priority="default", notif_id=NOTIF_ID_STATUS,
-             termux_buttons=None, telegram_buttons=None, ongoing=False, silent=False):
+             termux_buttons=None, telegram_buttons=None, ongoing=False, silent=False,
+             level="critical"):
+        """
+        Deliver one notification.
+
+        `level` is the message tier (critical / linked / important / routine,
+        see NOTIFY_TIERS). The Telegram verbosity decides whether the tier is
+        sent or only logged; routine messages are sent without sound.
+        """
         _log(f"\n[NOTIFICATION: {title}]\n{message}\n")
 
         # Keep every id per-instance: two tabs must not replace each other's
@@ -640,6 +771,14 @@ class Notifier:
             _log(f"  [android notification not sent] {self.termux.last_error}")
             self.warned_termux = True
 
+        if not self.telegram_passes(level):
+            self.muted_count += 1
+            _log(f"  [telegram muted: {level} message, level {self.level}]")
+            return delivered
+
+        if str(level).lower() == "routine" and self.silent_routine:
+            silent = True
+
         if self.telegram.send(title, message, buttons=telegram_buttons, silent=silent):
             delivered.append("telegram")
             _log("  [telegram delivered successfully]")
@@ -650,6 +789,7 @@ class Notifier:
 
     def alert(self, title, message, **kwargs):
         kwargs.setdefault("priority", "max")
+        kwargs.setdefault("level", "critical")
         return self.send(title, message, **kwargs)
 
     def otp_result(self, code, number, sms, provider_name=""):

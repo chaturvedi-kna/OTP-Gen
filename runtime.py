@@ -21,6 +21,7 @@ An *instance name* namespaces all of them:
     state.json        -> state.tempora.json
     .signals/         -> .signals-tempora/
     pending_cancels.json -> pending_cancels.tempora.json
+    accounts.json     -> accounts.tempora.json
 
 The instance name is derived from --provider automatically when that names
 exactly one provider, so the two-tab setup needs no extra flag. Pass
@@ -47,6 +48,7 @@ DEFAULT_STATS_FILE = "stats.json"
 DEFAULT_STATE_FILE = "state.json"
 DEFAULT_PENDING_FILE = "pending_cancels.json"
 DEFAULT_DISPUTE_FILE = "cancel_refused_otp.jsonl"
+DEFAULT_ACCOUNTS_FILE = "accounts.json"
 DEFAULT_SIGNAL_DIR = ".signals"
 
 # An instance name becomes part of a file name, so keep it boring.
@@ -122,6 +124,11 @@ def pending_filename(instance):
 def dispute_filename(instance=None):
     """Persistent per-activation complaint records (cancel refused + OTP)."""
     return namespaced_name(DEFAULT_DISPUTE_FILE, instance)
+
+
+def accounts_filename(instance=None):
+    """Linked-account ledger + milestones (accounts.<instance>.json)."""
+    return namespaced_name(DEFAULT_ACCOUNTS_FILE, instance)
 
 
 def signal_dirname(instance):

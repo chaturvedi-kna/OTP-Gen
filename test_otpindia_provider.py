@@ -14,7 +14,11 @@ Runs without network access by stubbing requests, then checks:
     and reports rejections with a "Run Not Started" reply,
   * ParallelAutomationCoordinator.request_run() narrows this run only:
     the selection applies, /status shows it, /balance still covers every
-    known provider, and a bare /run restores the configured set.
+    known provider, and a bare /run restores the configured set,
+  * the OTP wait never ends before OTPIndia's cancel window has passed
+    (cancel_window_remaining() + wait_for_otp()): a number is only abandoned
+    once it can actually be refunded, while a late trigger keeps the
+    configured timeout like on every other provider.
 
     python test_otpindia_provider.py
 """
@@ -274,6 +278,48 @@ def test_status_and_cancel():
           client.cancel("12345") == {"type": "ACCESS_CANCEL"})
 
 
+def test_cancel_window_remaining():
+    """The client tells the coordinator how long until a cancel is accepted."""
+    client = OtpIndiaClient(api_key="KEY123")
+    respond("ACCESS_NUMBER:501:919811111111")
+    client.get_number(service="meesho", server="1")
+
+    left = client.cancel_window_remaining("501")
+    check("window: counts down from number issue (full window right after getNumber)",
+          115.0 <= left <= 120.0, left)
+
+    client._acquired_at["501"] = time.time() - 80
+    left = client.cancel_window_remaining("501")
+    check("window: 40s left 80s after a number was issued",
+          38.0 <= left <= 41.0, left)
+
+    client._acquired_at["501"] = time.time() - 300
+    check("window: 0 once the window has passed",
+          client.cancel_window_remaining("501") == 0.0,
+          client.cancel_window_remaining("501"))
+
+    check("window: 0 for an activation this client never issued",
+          client.cancel_window_remaining("nope") == 0.0)
+
+    short = OtpIndiaClient(api_key="k", cancel_wait_seconds=30)
+    respond("ACCESS_NUMBER:502:919822222222")
+    short.get_number(service="meesho", server="1")
+    left = short.cancel_window_remaining("502")
+    check("window: follows the configured cancel_wait_seconds",
+          25.0 <= left <= 30.0, left)
+
+    respond("ACCESS_CANCEL")
+    client._acquired_at["501"] = time.time()
+    client.cancel("501")
+    check("window: gone once the activation is closed",
+          client.cancel_window_remaining("501") == 0.0)
+
+    from base_otp import BaseOTPClient
+    plain = BaseOTPClient(name="plain", base_url="http://x", api_key="k")
+    check("window: other providers cancel right away (base answer 0)",
+          plain.cancel_window_remaining("anything") == 0.0)
+
+
 # --- factory + selection validation ------------------------------------------
 
 def india_config(api_key="ind-key"):
@@ -436,13 +482,16 @@ def test_telegram_start_help_mentions_run_provider():
         status_cb=lambda: "status", balance_cb=lambda: "balance",
         run_cb=lambda arg: "run", stop_cb=lambda: None,
         referral_cb=lambda arg: "referral", checker_cb=lambda arg: "checker",
+        accounts_cb=lambda arg: "accounts", milestone_cb=lambda arg: "milestone",
+        notify_cb=lambda arg: "notify",
     )
     registrations = [payload for method, payload in backend.sent
                      if method == "setMyCommands"]
     registered = {item["command"]: item["description"]
                   for item in registrations[-1]["commands"]} if registrations else {}
     check("telegram: native command menu lists supported bot commands",
-          {"start", "run", "status", "balance", "referral", "checker", "stop"}
+          {"start", "run", "status", "balance", "referral", "checker", "stop",
+           "accounts", "milestone", "notify"}
           <= set(registered), registered)
     check("telegram: command menu explains provider-specific /run",
           "provider" in registered.get("run", "").lower(), registered)
@@ -567,6 +616,128 @@ def test_worker_requests_number_with_service_and_server():
           (res, params))
 
 
+class WindowedProvider(object):
+    """Fake provider with a cancel window and a scripted getStatus."""
+
+    def __init__(self, name="otpindia", window_left=0.0, status_script=None,
+                 cancel_wait_seconds=120):
+        self.name = name
+        self.window_left = window_left
+        self.cancel_wait_seconds = cancel_wait_seconds
+        self.status_script = list(status_script or [])
+        self.status_calls = []
+
+    def cancel_window_remaining(self, activation_id):
+        return self.window_left
+
+    def get_status(self, activation_id):
+        self.status_calls.append(time.time())
+        if self.status_script:
+            return dict(self.status_script.pop(0))
+        return {"type": "STATUS_WAIT_CODE"}
+
+    def get_balance(self):
+        return 100.0
+
+
+def otp_wait_coordinator(timeout, covers_window=None):
+    coordinator = build_coordinator()
+    coordinator.settings["otp_timeout_seconds"] = timeout
+    coordinator.settings["otp_poll_interval_seconds"] = 0.05
+    coordinator.settings["timeout_salvage_probes"] = 1
+    coordinator.settings["timeout_salvage_delay"] = 0
+    if covers_window is None:
+        coordinator.settings.pop("otp_wait_covers_cancel_window", None)
+    else:
+        coordinator.settings["otp_wait_covers_cancel_window"] = covers_window
+    return coordinator
+
+
+def test_otp_wait_covers_cancel_window():
+    """
+    The OTP wait on OTPIndia never ends before the number can be refunded.
+
+    A cancel before the cancel window has passed is refused anyway (the money
+    stays held), so abandoning the number at the configured timeout only
+    parks the cancel - and an SMS that lands in the rest of the window would
+    be paid for and lost. Scaled down: "80s timeout / 120s window" becomes
+    0.3s / 0.9s.
+    """
+    # 1) window ends after the configured timeout -> wait until the window ends
+    coordinator = otp_wait_coordinator(timeout=0.3)
+    client = WindowedProvider(window_left=0.9)
+    ctx = m.NumberContext(client, "act-1", "919800000001", "9800000001")
+    started = time.time()
+    kind, status = coordinator.wait_for_otp(ctx)
+    elapsed = time.time() - started
+    check("otp wait: timeout shorter than the cancel window -> waits for the window",
+          kind == "timeout" and status is None and 0.85 <= elapsed < 3.0,
+          (kind, round(elapsed, 2)))
+    check("otp wait: the number kept being polled during the stretch",
+          len(client.status_calls) >= 10, len(client.status_calls))
+
+    # 2) OTP arriving late inside the window (the "119s" case) is USED
+    coordinator = otp_wait_coordinator(timeout=0.3)
+    waits = [{"type": "STATUS_WAIT_CODE"}] * 12          # ~0.6s of waiting
+    waits.append({"type": "STATUS_OK", "sms": "Your OTP is 445566", "code": "445566"})
+    client = WindowedProvider(window_left=0.9, status_script=waits)
+    ctx = m.NumberContext(client, "act-2", "919800000002", "9800000002")
+    started = time.time()
+    kind, status = coordinator.wait_for_otp(ctx)
+    elapsed = time.time() - started
+    check("otp wait: an OTP that lands after the configured timeout but inside "
+          "the window is received normally",
+          kind == "ok" and status and status.get("code") == "445566"
+          and elapsed > 0.3, (kind, status, round(elapsed, 2)))
+
+    # 3) window already (nearly) over -> the configured timeout stands
+    #    (late trigger: 80s from now ends after the 120s window anyway)
+    coordinator = otp_wait_coordinator(timeout=0.3)
+    client = WindowedProvider(window_left=0.1)
+    ctx = m.NumberContext(client, "act-3", "919800000003", "9800000003")
+    started = time.time()
+    kind, _ = coordinator.wait_for_otp(ctx)
+    elapsed = time.time() - started
+    check("otp wait: cancel window ending before the timeout -> configured timeout, "
+          "cancel follows immediately",
+          kind == "timeout" and 0.28 <= elapsed < 0.8, (kind, round(elapsed, 2)))
+
+    # 4) a provider without a cancel window (TemporaSMS / VSImpro) is untouched
+    coordinator = otp_wait_coordinator(timeout=0.3)
+    client = WindowedProvider(name="tempora", window_left=0.0)
+    ctx = m.NumberContext(client, "act-4", "919800000004", "9800000004")
+    started = time.time()
+    kind, _ = coordinator.wait_for_otp(ctx)
+    elapsed = time.time() - started
+    check("otp wait: providers that cancel immediately keep the configured timeout",
+          kind == "timeout" and 0.28 <= elapsed < 0.8, (kind, round(elapsed, 2)))
+
+    # 5) opt-out
+    coordinator = otp_wait_coordinator(timeout=0.3, covers_window=False)
+    client = WindowedProvider(window_left=0.9)
+    ctx = m.NumberContext(client, "act-5", "919800000005", "9800000005")
+    started = time.time()
+    kind, _ = coordinator.wait_for_otp(ctx)
+    elapsed = time.time() - started
+    check("otp wait: otp_wait_covers_cancel_window=false keeps the plain timeout",
+          kind == "timeout" and 0.28 <= elapsed < 0.8, (kind, round(elapsed, 2)))
+
+    # 6) the real client: the stretch is derived from getNumber's issue time
+    coordinator = otp_wait_coordinator(timeout=0.2)
+    real = OtpIndiaClient(api_key="k", cancel_wait_seconds=0.7)
+    respond("ACCESS_NUMBER:601:919800000006")
+    real.get_number(service="meesho", server="1")
+    respond(*(["STATUS_WAIT_CODE"] * 40))
+    ctx = m.NumberContext(real, "601", "919800000006", "9800000006")
+    started = time.time()
+    kind, _ = coordinator.wait_for_otp(ctx)
+    elapsed = time.time() - started
+    check("otp wait: OtpIndiaClient stretches the wait to cancel_wait_seconds "
+          "from getNumber",
+          kind == "timeout" and 0.6 <= elapsed < 3.0, (kind, round(elapsed, 2)))
+    SCRIPTED[:] = []
+
+
 def test_two_tab_layout():
     """Tab 1 = tempora, tab 2 = vsimpro + otpindia, switchable when needed.
 
@@ -635,6 +806,7 @@ def main():
     test_balance()
     test_get_number()
     test_status_and_cancel()
+    test_cancel_window_remaining()
     test_create_clients()
     test_validate_selection()
     test_telegram_run_command()
@@ -642,6 +814,7 @@ def main():
     test_request_run_selection()
     test_request_run_otpindia()
     test_worker_requests_number_with_service_and_server()
+    test_otp_wait_covers_cancel_window()
     test_two_tab_layout()
 
     print("=" * 60)

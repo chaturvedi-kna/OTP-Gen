@@ -11,6 +11,7 @@ a Telethon userbot.
 import argparse
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -57,11 +58,18 @@ from state import StateStore
 from stats import StatsStore
 from balance_guard import BalanceGuard
 from runtime import (
+    accounts_filename,
     apply_instance_overrides,
     pending_filename,
     resolve_instance,
     state_filename,
     stats_filename,
+)
+from accounts import (
+    LinkedAccountsStore,
+    clean_number as clean_account_number,
+    local_time,
+    looks_like_number,
 )
 from cancel_watch import (
     CANCEL_RETRY_TYPES,
@@ -77,7 +85,7 @@ from meesho_bot_client import (
     MeeshoBotUnknownScreen,
     S_OTP_WAIT,
 )
-from notifier import Notifier
+from notifier import Notifier, normalize_notify_level
 
 
 CONFIG_FILES = ["config.json", "config.jon"]
@@ -256,6 +264,9 @@ class ParallelAutomationCoordinator:
 
         self.state = StateStore(filename=state_filename(self.instance))
         self.stats = StatsStore(filename=stats_filename(self.instance))
+        # Every linked account (number / provider / time) + the milestones
+        # for /accounts and /milestone - see accounts.py.
+        self.accounts = LinkedAccountsStore(filename=accounts_filename(self.instance))
         self.guard = BalanceGuard(config.get("balance_guard", {}), log_fn=log)
         self.notify = Notifier(config, instance=self.instance)
         self.bot = MeeshoBotClient(config, log_fn=log)
@@ -359,6 +370,10 @@ class ParallelAutomationCoordinator:
             store=PendingCancelStore(filename=pending_filename(self.instance)),
             log_fn=log,
         )
+        # Set every time a deferred cancellation is resolved: a worker that is
+        # out of balance because of pending cancels wakes up on it and asks
+        # for the next number right away (see _wait_for_pending_otpindia_refunds).
+        self._pending_resolved_event = threading.Event()
         # Providers whose refund tally is suspended because a deferred
         # cancellation holds an unknown amount (the balance could not be read
         # when the cancel was deferred). Suspending beats critical-stopping on
@@ -387,7 +402,10 @@ class ParallelAutomationCoordinator:
             run_cb=self.request_run,
             stop_cb=self.request_stop,
             referral_cb=self.command_referral_link,
-            checker_cb=self.command_checker_mode
+            checker_cb=self.command_checker_mode,
+            accounts_cb=self.command_accounts,
+            milestone_cb=self.command_milestone,
+            notify_cb=self.command_notify_level,
         )
 
     # -- Ledger helpers ------------------------------------------------------
@@ -471,14 +489,12 @@ class ParallelAutomationCoordinator:
             fresh = name not in self._tally_suspended
             self._tally_suspended.add(name)
         if fresh:
-            log(f"Refund tally suspended for {name.upper()} ({reason}); it resumes "
-                f"when the pending cancellation is resolved.", prefix=name.upper())
+            log(f"Refund tally suspended ({reason}) until the pending cancel "
+                f"resolves.", prefix=name.upper())
             self.notify.alert(
                 f"⏳ [{name.upper()}] Refund tally suspended",
-                f"{reason}\\n\\nUntil that money is back, cancellations on "
-                f"{name.upper()} are not compared against the expected balance "
-                f"(a comparison could not tell a missing refund from the pending "
-                f"one). Everything else continues normally."
+                f"{reason}.\nCancels on {name.upper()} are not tallied until that "
+                f"money is back; everything else continues."
             )
 
     def _clear_tally_suspension(self, name):
@@ -504,7 +520,7 @@ class ParallelAutomationCoordinator:
         log(f"CRITICAL STOP: {title} - {message}")
         self.stop_requested.set()
         self.stats.increment("critical_stops")
-        self.notify.alert(f"🛑 {title}", message + "\n\nAutomation STOPPED. Manual intervention required.")
+        self.notify.alert(f"🛑 {title}", message + "\n\nAutomation STOPPED - manual check needed.")
 
     # -- Status and Balances for Telegram & CLI ------------------------------
 
@@ -595,7 +611,7 @@ class ParallelAutomationCoordinator:
         s = self.stats.snapshot()
         lines.append(
             "\n📊 Totals\n"
-            f"  Accounts linked: {s['accounts_linked']}\n"
+            f"  {self.linked_counts_line()}\n"
             f"  Targets found: {s['targets_found']} | OTPs received: {s['otp_received']}\n"
             f"  Wrong OTP: {s['otp_wrong']} | Expired: {s['otp_expired']} | Blocked: {s['user_blocked']}\n"
             f"  OTP timeouts: {s['otp_timeout']} | Change-number: {s['change_number']} "
@@ -615,6 +631,174 @@ class ParallelAutomationCoordinator:
 
         lines.append("\n" + self.get_balances_summary())
         return "\n".join(lines)
+
+    # -- Linked accounts + milestones (/accounts, /milestone) -----------------
+
+    @staticmethod
+    def _provider_counts_text(counts):
+        return ", ".join(f"{name.upper()} {count}" for name, count in counts.items()) or "none"
+
+    def linked_counts_line(self):
+        """'Accounts linked: 53 (TEMPORA 30, VSIMPRO 20, OTPINDIA 3)' for /status."""
+        records = self.accounts.accounts()
+        total = self.stats.snapshot().get("accounts_linked", 0)
+        by_provider = self.accounts.count_by_provider(records)
+        text = f"Accounts linked: {max(total, len(records))}"
+        if by_provider:
+            text += f" ({self._provider_counts_text(by_provider)})"
+        return text
+
+    def get_accounts_summary(self):
+        """Reply for /accounts: totals per provider + what is new since the last milestone."""
+        records = self.accounts.accounts()
+        legacy_total = self.stats.snapshot().get("accounts_linked", 0)
+        by_provider = self.accounts.count_by_provider(records)
+        scope = f" ({self.instance})" if self.instance else ""
+
+        lines = [f"👤 Linked accounts{scope}: {max(legacy_total, len(records))}"]
+        for name, count in by_provider.items():
+            lines.append(f"  • {name.upper()}: {count}")
+        untracked = legacy_total - len(records)
+        if untracked > 0:
+            lines.append(f"  • (before per-provider tracking: {untracked})")
+        if not records:
+            lines.append("  No account has been linked with tracking on yet.")
+
+        milestone = self.accounts.last_milestone()
+        if milestone is None:
+            lines.append("\n📍 No milestone yet. Set one with\n"
+                         "/milestone <last number you shared> <note>")
+            return "\n".join(lines)
+
+        fresh = self.accounts.since(milestone)
+        note = f' "{milestone.get("note")}"' if milestone.get("note") else ""
+        lines.append(
+            f"\n📍 Milestone #{milestone.get('seq')} ({local_time(milestone.get('created_at_epoch'))}):"
+            f"{note}\n  up to {milestone.get('last_number')} = {milestone.get('total')} "
+            f"({self._provider_counts_text(milestone.get('by_provider') or {})})"
+        )
+        lines.append(f"🆕 Since then: {len(fresh)}"
+                     + (f" ({self._provider_counts_text(self.accounts.count_by_provider(fresh))})"
+                        if fresh else ""))
+        if fresh:
+            first, last = fresh[0], fresh[-1]
+            lines.append(f"  First: `{first['number']}` ({first['provider'].upper()}, "
+                         f"{local_time(first.get('linked_at_epoch'))})")
+            lines.append(f"  Last:  `{last['number']}` ({last['provider'].upper()}, "
+                         f"{local_time(last.get('linked_at_epoch'))})")
+            lines.append("/accounts list shows all of them.")
+        return "\n".join(lines)
+
+    def get_accounts_list(self):
+        """Reply for /accounts list: every number linked since the last milestone."""
+        milestone = self.accounts.last_milestone()
+        fresh = self.accounts.since(milestone)
+        if milestone is None:
+            head = f"👤 All linked accounts ({len(fresh)}; no milestone yet):"
+        else:
+            head = (f"🆕 Linked since milestone #{milestone.get('seq')} "
+                    f"(after {milestone.get('last_number')}): {len(fresh)}")
+        if not fresh:
+            return head + "\n  none"
+        lines = [head]
+        for record in fresh:
+            lines.append(f"`{record['number']}`  {str(record.get('provider', '')).upper()}  "
+                         f"{local_time(record.get('linked_at_epoch'))}")
+        return "\n".join(lines)
+
+    def command_accounts(self, argument):
+        """Telegram /accounts handler ("" -> summary, "list" -> numbers since milestone)."""
+        argument = (argument or "").strip().lower()
+        if argument in ("list", "numbers", "all", "since"):
+            return self.get_accounts_list()
+        return self.get_accounts_summary()
+
+    def command_milestone(self, argument):
+        """
+        Telegram /milestone handler.
+
+          /milestone <last shared number> <note>  -> add a milestone
+          /milestone                              -> show the milestones
+          /milestone remove                       -> drop the last one
+        """
+        argument = (argument or "").strip()
+        if argument.lower() in ("", "show", "list", "status", "?"):
+            milestones = self.accounts.milestones()
+            if not milestones:
+                return ("📍 No milestone yet.\n"
+                        "/milestone <last number you shared> <note> marks everything "
+                        "up to that number as used/shared.")
+            lines = [f"📍 Milestones ({len(milestones)}):"]
+            for m in milestones[-8:]:
+                note = f' "{m.get("note")}"' if m.get("note") else ""
+                lines.append(f"  #{m.get('seq')} {local_time(m.get('created_at_epoch'))} - "
+                             f"up to {m.get('last_number')} = {m.get('total')} linked{note}")
+            fresh = self.accounts.since(milestones[-1])
+            lines.append(f"🆕 Since #{milestones[-1].get('seq')}: {len(fresh)}")
+            return "\n".join(lines)
+
+        if argument.lower() in ("remove", "undo", "delete", "pop"):
+            removed = self.accounts.remove_last_milestone()
+            if removed is None:
+                return "❌ There is no milestone to remove."
+            log(f"Milestone #{removed.get('seq')} removed via Telegram.")
+            return (f"🗑 Removed milestone #{removed.get('seq')} (up to {removed.get('last_number')}"
+                    f", {removed.get('total')} linked).")
+
+        parts = argument.split(None, 1)
+        number, note = parts[0], (parts[1].strip() if len(parts) > 1 else "")
+        if not looks_like_number(number):
+            return ("❌ Usage: /milestone <last shared number> <note>\n"
+                    "The first word must be the last number you shared, "
+                    "e.g. /milestone 9876543210 10 used + 40 shared")
+        try:
+            milestone = self.accounts.add_milestone(number, note)
+        except ValueError as exc:
+            recent = self.accounts.accounts()[-3:]
+            hint = ("\nRecent: " + ", ".join(f"`{r['number']}`" for r in recent)) if recent else ""
+            return f"❌ {exc}.{hint}"
+        log(f"Milestone #{milestone['seq']} set via Telegram: up to "
+            f"{milestone['last_number']} ({milestone['total']} linked) {milestone['note']!r}.")
+        fresh = self.accounts.since(milestone)
+        note_text = f' "{milestone["note"]}"' if milestone["note"] else ""
+        return (f"✅ Milestone #{milestone['seq']}{note_text}\n"
+                f"Up to `{milestone['last_number']}`: {milestone['total']} linked "
+                f"({self._provider_counts_text(milestone['by_provider'])})\n"
+                f"🆕 After it: {len(fresh)}"
+                + (f" (first `{fresh[0]['number']}`, last `{fresh[-1]['number']}`)" if fresh else ""))
+
+    # -- Telegram verbosity (/notify) ------------------------------------------
+
+    def notify_level_text(self):
+        muted = self.notify.muted_count
+        return (f"🔔 Telegram level: {self.notify.level.upper()}"
+                + (f" ({muted} message(s) muted this run)" if muted else "")
+                + "\n" + self.notify.describe_levels()
+                + "\nSwitch with /notify all|normal|quiet.")
+
+    def command_notify_level(self, argument):
+        """Telegram /notify handler: show or change the verbosity (saved to config.json)."""
+        argument = (argument or "").strip()
+        if argument.lower() in ("", "show", "status", "?"):
+            return self.notify_level_text()
+        level = normalize_notify_level(argument, default=None)
+        if level is None:
+            return f"❌ Unknown level '{argument}'. Use all, normal or quiet.\n\n" + self.notify_level_text()
+
+        previous = self.notify.level
+        self.notify.set_level(level)
+        self.config.setdefault("telegram", {})["notify_level"] = level
+        config_path = next((name for name in CONFIG_FILES if os.path.exists(name)), None)
+        if config_path is None:
+            saved = "\n⚠️ config.json not found - the change applies to this run only."
+        else:
+            try:
+                set_notify_level(config_path, level)
+                saved = f"\nSaved to {config_path}."
+            except Exception as exc:
+                saved = f"\n⚠️ Could not save to {config_path}: {exc}"
+        log(f"Telegram notify level changed via Telegram: {previous} -> {level}.")
+        return f"✅ Telegram level set to {level.upper()}.{saved}\n\n" + self.notify_level_text()
 
     # -- Referral link (config + Telegram /referral command) -----------------
 
@@ -837,42 +1021,70 @@ class ParallelAutomationCoordinator:
         log("Stop requested via command.")
 
     def _wait_for_pending_otpindia_refunds(self, client):
-        """Wait quietly for OTPIndia's expected cancel window/refunds to clear.
+        """Wait quietly until ONE of OTPIndia's pending cancels has refunded.
 
         OTPIndia holds the purchase amount until its two-minute cancel window
         elapses. If the worker has used the available balance while one or more
         routine cancels are pending, NO_BALANCE is a temporary back-pressure
         signal, not a reason to stop the provider worker.
+
+        The wait ends as soon as the FIRST pending cancellation is resolved
+        (its refund has been verified by the watcher), not when all of them
+        are: one refund pays for the next number, so the worker asks for it
+        right away and the remaining cancels keep maturing in the background.
+        If that one refund was not enough (or the activation was consumed by a
+        late OTP instead of refunded), getNumber answers NO_BALANCE again and
+        the worker simply comes back here to wait for the next one.
+
+        Returns True when the caller should retry getNumber (also when the run
+        is stopping - the caller checks stop_requested), False when there is
+        nothing pending to wait for.
         """
-        if getattr(client, "name", "") != "otpindia":
+        provider = getattr(client, "name", "")
+        if provider != "otpindia":
             return False
-        if not self.pending_cancels.has_pending("otpindia"):
+
+        def provider_pending():
+            return [r for r in self.pending_cancels.pending()
+                    if r.get("provider") == provider]
+
+        pending = provider_pending()
+        if not pending:
             return False
+        pname = provider.upper()
+        # Everything pending at this moment; the wait is over once any of
+        # these is gone (a cancel deferred later does not count as progress).
+        waiting_on = {str(r.get("activation_id")) for r in pending}
 
         poll_seconds = max(0.25, float(self.settings.get(
             "otpindia_balance_wait_poll_seconds", 2.0) or 2.0))
-        log("OTPIndia has no currently spendable balance; waiting for pending "
-            "cancellations to pass their normal cancel window.", prefix="OTPINDIA")
+        log(f"NO_BALANCE with {len(pending)} cancel(s) pending refund - waiting "
+            f"for the first refund, then requesting the next number.", prefix=pname)
+        self._pending_resolved_event.clear()
         while not self.stop_requested.is_set():
-            pending = self.pending_cancels.pending()
-            provider_pending = [r for r in pending if r.get("provider") == "otpindia"]
-            if not provider_pending:
+            pending = provider_pending()
+            still_open = {str(r.get("activation_id")) for r in pending}
+            resolved = waiting_on - still_open
+            if resolved:
                 try:
                     balance = client.get_balance()
-                    self._note_balance("otpindia", balance)
-                    log(f"Pending cancellations cleared; balance is {balance:.4f}. "
-                        "Resuming number requests.", prefix="OTPINDIA")
+                    self._note_balance(provider, balance)
+                    log(f"Refund landed ({len(pending)} cancel(s) still pending); "
+                        f"balance {balance:.4f} - requesting the next number.", prefix=pname)
                 except Exception as exc:
-                    log(f"Pending cancellations cleared, but balance refresh failed: {exc}",
-                        prefix="OTPINDIA")
+                    log(f"Refund landed ({len(pending)} cancel(s) still pending) but "
+                        f"the balance refresh failed: {exc} - requesting the next "
+                        f"number.", prefix=pname)
                 return True
-            soonest = min(float(r.get("expiry_at", time.time())) for r in provider_pending)
+            soonest = min(float(r.get("expiry_at", time.time())) for r in pending)
             wait_left = max(0, int(soonest - time.time()))
-            self.worker_statuses["otpindia"] = (
-                f"Waiting for {len(provider_pending)} pending cancel(s) "
-                f"({wait_left}s until next retry)"
+            self.worker_statuses[provider] = (
+                f"NO_BALANCE: waiting for the first of {len(pending)} pending "
+                f"refund(s) ({wait_left}s to next retry)"
             )
-            self.stop_requested.wait(poll_seconds)
+            # Woken early by on_pending_resolved(); otherwise a periodic re-check.
+            if self._pending_resolved_event.wait(poll_seconds):
+                self._pending_resolved_event.clear()
         return True
 
     # -- Cancellation, salvage & refund tally --------------------------------
@@ -967,12 +1179,9 @@ class ParallelAutomationCoordinator:
             log(f"🚨 OTP arrived despite the refused cancel! Code: {code}", prefix=pname)
             self.notify.alert(
                 f"🚨 [{pname}] OTP on a number whose cancel was refused",
-                f"Number: {number}\nActivation: {activation_id}\nReason: {reason}\n\n"
-                f"Code: `{code}`\nSMS: {sms}\n\n"
-                "The provider refused the cancel, but the OTP arrived anyway - "
-                "the SMS was delivered, so this charge stands (no refund) and "
-                "the activation stays open. The PRIMES bot may still be waiting "
-                "for this code."
+                f"`{number}` · code `{code}`\n{sms}\n\n"
+                f"Cancel refused ({reason}) but the OTP arrived: charge stands, "
+                f"activation open - the bot may still take this code."
             )
             # Complaint evidence: provider refused to cancel (ERROR) and the
             # OTP still arrived - persist a record for a provider complaint.
@@ -1048,12 +1257,10 @@ class ParallelAutomationCoordinator:
                 # if the auto-submit fails.
                 self.notify.alert(
                     f"🚨 [{pname}] OTP arrived during cancellation",
-                    f"Number: {number}\nActivation: {activation_id}\nReason: {reason}\n\n"
-                    f"Code: `{code}`\nSMS: {sms}\n\n"
-                    "The SMS was delivered, so the charge stands (no refund). "
-                    "The PRIMES bot is still on its OTP screen - the automation "
-                    "will submit this code itself; if that fails, enter it "
-                    "manually while it is still valid."
+                    f"`{number}` · code `{code}`\n{sms}\n\n"
+                    f"Charge stands (SMS delivered). The bot is still on its OTP "
+                    f"screen - auto-submitting; if that fails, enter it manually "
+                    f"while it is valid."
                 )
                 # The charge legitimately stands: the SMS this number was paid
                 # for was delivered. The current balance becomes the new
@@ -1216,21 +1423,18 @@ class ParallelAutomationCoordinator:
             retry_in = max(0.0, float(record.get("expiry_at", 0.0)) - time.time())
         except (TypeError, ValueError):
             retry_in = 0.0
-        retry_note = ("the provider's cancel wait window" if retry_after is not None
-                      else "activation expiry")
+        retry_note = "cancel window" if retry_after is not None else "activation expiry"
         # OTPIndia's ACCESS_CANCEL_WAIT is its documented, routine two-minute
         # window. Keep it in logs/status, but don't alert the user for each
         # expected cancellation.
         if client.name != "otpindia":
             self.notify.send(
                 f"⏳ [{pname}] Cancel refused - deferred",
-                f"Number: {number}\nActivation: {activation_id}\nReason: {reason}\n\n"
-                f"The provider answered `{detail or 'ERROR'}`, so the activation is "
-                f"still open. It is retried in ~{retry_in:.0f}s ({retry_note}) in "
-                f"the background; this worker keeps hunting and the refund is "
-                f"tallied after the retry."
-                + ("" if hold else "\n\n⚠️ The balance could not be read, so the "
-                   "refund tally for this provider is suspended until it resolves.")
+                f"`{number}` ({reason}): provider said `{detail or 'ERROR'}`; "
+                f"retry in ~{retry_in:.0f}s ({retry_note}). Worker keeps hunting."
+                + ("" if hold else "\n⚠️ Balance unreadable - refund tally "
+                   "suspended until this resolves."),
+                level="routine",
             )
         return {
             "tally_ok": True,
@@ -1252,8 +1456,11 @@ class ParallelAutomationCoordinator:
         else:
             self._clear_tally_suspension(provider)
             remaining = self.pending_cancels.hold_total(provider)[0]
-            log(f"Deferred cancellation resolved; remaining held on "
-                f"{provider.upper()}: {remaining:.4f}", prefix=provider.upper())
+            log(f"Deferred cancel resolved; still held on {provider.upper()}: "
+                f"{remaining:.4f}", prefix=provider.upper())
+        # Wake a worker that ran out of balance while these cancels were
+        # pending: one refund is enough for the next number.
+        self._pending_resolved_event.set()
 
     # -- Parallel Worker Loop ------------------------------------------------
 
@@ -1392,9 +1599,7 @@ class ParallelAutomationCoordinator:
                 self.worker_statuses[client.name] = "Stopped (NO_BALANCE)"
                 self.notify.alert(
                     f"⚠️ [{pname}] Insufficient Balance",
-                    f"Provider {pname} reported insufficient balance (NO_BALANCE).\n"
-                    f"Please recharge your account.\n\n"
-                    f"Once recharged:\n• Send /balance\n• Send /run"
+                    "NO_BALANCE - worker stopped. Recharge, then /balance and /run."
                 )
                 return
             except (OTPProviderUnavailable, OTPNoNumbers) as exc:
@@ -1430,8 +1635,7 @@ class ParallelAutomationCoordinator:
                 self.worker_statuses[client.name] = "Stopped (NO_BALANCE)"
                 self.notify.alert(
                     f"⚠️ [{pname}] Insufficient Balance",
-                    f"Provider {pname} reported NO_BALANCE.\n"
-                    f"Please recharge.\nOnce recharged:\n• Send /balance\n• Send /run"
+                    "NO_BALANCE - worker stopped. Recharge, then /balance and /run."
                 )
                 return
 
@@ -1442,7 +1646,7 @@ class ParallelAutomationCoordinator:
                 self.worker_statuses[client.name] = f"Stopped (PRICE_TOO_HIGH: {price} > {max_price})"
                 self.notify.alert(
                     f"⚠️ [{pname}] Price Exceeded",
-                    f"Provider {pname} price ({price}) exceeded configured max price ({max_price}).\nWorker stopped."
+                    f"Price {price} > max {max_price} - worker stopped."
                 )
                 return
 
@@ -1451,7 +1655,7 @@ class ParallelAutomationCoordinator:
                 self.worker_statuses[client.name] = f"Stopped ({res_type})"
                 self.notify.alert(
                     f"❌ [{pname}] Provider Error",
-                    f"Provider {pname} returned fatal error: {res_type}.\nWorker stopped."
+                    f"{res_type} - worker stopped."
                 )
                 return
 
@@ -1756,11 +1960,9 @@ class ParallelAutomationCoordinator:
             buttons_line = f"Buttons: {' / '.join(buttons)}\n\n" if buttons else ""
             self.notify.alert(
                 f"⚠️ [{pname}] PRIMES bot needs attention",
-                f"Unexpected bot screen while processing {number}:\n\n{exc.screen_text[:600]}\n\n"
-                f"{buttons_line}"
-                "Cancelling this number and resetting the bot flow. The refund is "
-                "checked against the balance - if the number had already reached "
-                "the bot (SMS delivered), the tally will flag it.\n"
+                f"`{number}`: unexpected screen - cancelling and resetting the bot "
+                f"(refund tally flags it if the SMS already went out).\n\n"
+                f"{exc.screen_text[:400]}\n{buttons_line}"
                 f"Referral step: {self.bot.referral_summary}"
             )
             try:
@@ -1783,10 +1985,8 @@ class ParallelAutomationCoordinator:
             log(f"PRIMES bot flow timed out: {exc}", prefix=pname)
             self.notify.alert(
                 f"⏱️ [{pname}] PRIMES bot flow timed out",
-                f"Number: {number}\n{exc}\n\n"
-                "Cancelling this number and resetting the bot flow. If the "
-                "number had already reached Meesho (SMS delivered), the refund "
-                "tally will flag it.\n"
+                f"`{number}`: {exc}\nCancelling and resetting the bot (refund "
+                f"tally flags it if the SMS already went out).\n"
                 f"Referral step: {self.bot.referral_summary}"
             )
             try:
@@ -1801,17 +2001,17 @@ class ParallelAutomationCoordinator:
             return None
         except MeeshoBotError as exc:
             log(f"PRIMES bot error: {exc}", prefix=pname)
-            self.notify.alert(f"⚠️ [{pname}] PRIMES bot error", f"{exc}\nCancelling this number.")
+            self.notify.alert(f"⚠️ [{pname}] PRIMES bot error", f"`{number}`: {exc}\nCancelling this number.")
             self.handle_cancellation(context.client, context.activation_id, number, f"Bot error: {exc}")
             return None
 
         if res.get("stage") == "blocked":
             self.stats.increment("user_blocked")
-            totals = self.stats.summary()
             log(f"Number {number} blocked by Meesho. Changing number.", prefix=pname)
             self.notify.alert(
                 f"🚫 [{pname}] Number blocked by Meesho",
-                f"Number: {number}\n{res.get('message', '')[:300]}\n\n{totals}"
+                f"`{number}`: {res.get('message', '')[:200]}\nChanging number.",
+                level="important",
             )
             try:
                 self.bot.cancel_flow()
@@ -1840,7 +2040,7 @@ class ParallelAutomationCoordinator:
             "requested_at": now()
         })
         referral_action = res.get("referral_action")
-        referral_line = f"Referral: {referral_action}\n" if referral_action else ""
+        referral_line = f" · Referral: {referral_action}" if referral_action else ""
         if isinstance(referral_action, str):
             if referral_action.startswith("pasted"):
                 self.stats.increment("referral_pasted")
@@ -1848,8 +2048,9 @@ class ParallelAutomationCoordinator:
                 self.stats.increment("referral_skipped")
         self.notify.send(
             "📲 OTP requested via PRIMES bot",
-            f"Number: `{number}` ({pname})\nUPI price: ₹{res.get('upi')}\n"
-            f"Offer rerolls: {rerolls}\n{referral_line}Waiting for SMS code..."
+            f"`{number}` ({pname}) · UPI ₹{res.get('upi')} · rerolls {rerolls}"
+            f"{referral_line}\nWaiting for SMS...",
+            level="routine", silent=True,
         )
         return res
 
@@ -1865,12 +2066,11 @@ class ParallelAutomationCoordinator:
             # recovery finish the activation off (the charge legitimately stands).
             self.notify.alert(
                 f"🛑 [{pname}] Referral step failed after OTP - stopping",
-                f"Number: {context.clean_number}\nCode: `{code}`\n\n{exc}\n\n"
-                f"Screen:\n{exc.screen_text[:600]}\n\n"
-                "The code was NOT submitted - use it manually if the account is "
-                "still pending.\n"
-                "Fix the link (/referral <link>) or set "
-                'meesho_bot.referral_failure_action to "skip", then start again.'
+                f"`{context.clean_number}` · code `{code}` NOT submitted - use it "
+                f"manually if the account is still pending.\n{exc}\n\n"
+                f"{exc.screen_text[:400]}\n\n"
+                "Fix /referral <link> or set meesho_bot.referral_failure_action "
+                'to "skip", then /run.'
             )
             self._critical_stop(
                 f"[{pname}] Referral step failed after OTP",
@@ -1883,9 +2083,9 @@ class ParallelAutomationCoordinator:
             buttons_line = f"Buttons: {' / '.join(buttons)}\n\n" if buttons else ""
             self.notify.alert(
                 f"⚠️ [{pname}] PRIMES bot needs attention after OTP",
-                f"Number: {context.clean_number}\nCode: `{code}`\n\n"
-                f"{exc}\n\nUnexpected screen:\n{exc.screen_text[:600]}\n\n"
-                f"{buttons_line}Submit/verify manually if needed."
+                f"`{context.clean_number}` · code `{code}`\n{exc}\n\n"
+                f"{exc.screen_text[:400]}\n{buttons_line}"
+                "Submit/verify manually if needed."
             )
             return "unknown"
         except MeeshoBotTimeout as exc:
@@ -1894,23 +2094,28 @@ class ParallelAutomationCoordinator:
             # it manually; the SMS was delivered, so the charge stands.
             self.notify.alert(
                 f"⏱️ [{pname}] PRIMES bot timed out after OTP",
-                f"Number: {context.clean_number}\nCode: `{code}`\n\n{exc}\n\n"
-                "The code may or may not have reached the bot - check it "
-                "manually while it is still valid. Will change number and retry."
+                f"`{context.clean_number}` · code `{code}`\n{exc}\n"
+                "The code may or may not have reached the bot - check manually "
+                "while it is valid. Changing number."
             )
             return "unknown"
         except MeeshoBotError as exc:
             self.notify.alert(
                 f"⚠️ [{pname}] PRIMES bot error after OTP",
-                f"Number: {context.clean_number}\nCode: `{code}`\n{exc}"
+                f"`{context.clean_number}` · code `{code}`\n{exc}"
             )
             return "unknown"
 
         status = res.get("status", "unknown")
-        totals = self.stats.summary()
 
         if status == "linked":
             n_linked = self.stats.increment("accounts_linked")
+            try:
+                self.accounts.add(context.clean_number, context.provider_name,
+                                  user_id=res.get("user_id"),
+                                  account_number=res.get("account_number"))
+            except Exception as exc:
+                log(f"Note: could not record the linked account: {exc}", prefix=pname)
             # The account is created - accept the provider charge (status 6).
             try:
                 context.client.finish(context.activation_id)
@@ -1941,10 +2146,11 @@ class ParallelAutomationCoordinator:
             })
             self.notify.alert(
                 f"🎉 [{pname}] Account linked! (#{n_linked})",
-                f"Number: {context.clean_number}\n"
-                f"Meesho User ID: {res.get('user_id') or 'n/a'}\n"
-                f"Bot account #{res.get('account_number') or 'n/a'}\n"
-                f"OTP: {code}{' (late salvage)' if late else ''}\n\n{totals}"
+                f"`{context.clean_number}` · Meesho ID {res.get('user_id') or 'n/a'} · "
+                f"bot #{res.get('account_number') or 'n/a'}\n"
+                f"OTP {code}{' (late salvage)' if late else ''}\n"
+                f"{self.linked_counts_line()}",
+                level="linked",
             )
             return "linked"
 
@@ -1952,27 +2158,29 @@ class ParallelAutomationCoordinator:
             n = self.stats.increment("otp_wrong")
             self.notify.alert(
                 f"❌ [{pname}] Wrong OTP (#{n})",
-                f"Number: {context.clean_number}\nCode rejected: {code}\n"
-                f"Will change number and retry.\n\n{totals}"
+                f"`{context.clean_number}` · code {code} rejected. Changing number.",
+                level="important",
             )
         elif status == "otp_expired":
             n = self.stats.increment("otp_expired")
             self.notify.alert(
                 f"⌛ [{pname}] OTP expired (#{n})",
-                f"Number: {context.clean_number}\nWill change number and retry.\n\n{totals}"
+                f"`{context.clean_number}` · code expired. Changing number.",
+                level="important",
             )
         elif status == "blocked":
             n = self.stats.increment("user_blocked")
             self.notify.alert(
                 f"🚫 [{pname}] User blocked (#{n})",
-                f"Number: {context.clean_number} was blocked during verification.\n"
-                f"Will change number and retry.\n\n{totals}"
+                f"`{context.clean_number}` blocked during verification. Changing number.",
+                level="important",
             )
         else:
             self.notify.alert(
                 f"⚠️ [{pname}] Unconfirmed bot result: {status}",
-                f"Number: {context.clean_number}\nCode: `{code}`\n"
-                f"Screen:\n{res.get('screen', '')[:500]}\nWill change number and retry."
+                f"`{context.clean_number}` · code `{code}`\n"
+                f"{res.get('screen', '')[:300]}\nChanging number.",
+                level="important",
             )
         return status
 
@@ -2278,10 +2486,8 @@ class ParallelAutomationCoordinator:
                     f"({detail}) - API answers will not be trusted until it recovers.")
                 self.notify.alert(
                     "⚠️ Checker API is down",
-                    f"Liveness probe (GET /health, no auth): {detail}\n\n"
-                    f"In auto mode checks go through the bot until the API "
-                    f"recovers; in api mode numbers are cancelled with this "
-                    f"reason instead of acting on bad API answers."
+                    f"Health probe: {detail}\nauto mode: bot checks until it "
+                    f"recovers; api mode: numbers are cancelled with this reason."
                 )
                 try:
                     self.checker.mark_api_down(f"liveness probe: {detail}")
@@ -2297,17 +2503,15 @@ class ParallelAutomationCoordinator:
             log(f"Checker API preflight: {exc}")
             self.notify.alert(
                 "⚠️ Checker API needs an Indian proxy",
-                f"{exc}\n\nEvery API check will fail until this is fixed. "
-                f"In auto mode the bot checker covers for the API; in api mode "
-                f"numbers are bought and cancelled until the proxy is added."
+                f"{exc}\nauto mode: the bot checker covers; api mode: numbers "
+                f"are bought and cancelled until this is fixed."
             )
             return
         except CheckerAuthError as exc:
             log(f"Checker API preflight: API key rejected ({exc}).")
             self.notify.alert(
                 "❌ Checker API key rejected",
-                f"{exc}\n\nCheck checker.api_keys in config.json (a revoked key "
-                f"gives a new token in the Speedz Checker bot)."
+                f"{exc}\nCheck checker.api_keys in config.json."
             )
             return
         except Exception as exc:
@@ -2484,6 +2688,52 @@ class ParallelAutomationCoordinator:
             on_tick=probe_provider
         )
 
+    def _otp_wait_timeout(self, context):
+        """
+        How long to wait for the OTP on this number.
+
+        automation.otp_timeout_seconds applies to every provider. A provider
+        that refuses to cancel a number for a while after issuing it (OTPIndia:
+        cancel_wait_seconds, 2 minutes from getNumber) cannot refund it before
+        that window has passed anyway - giving up on the OTP earlier only parks
+        the cancel in the background, and an SMS that lands in the rest of the
+        window (say at 119s) is then a paid OTP nobody uses, with no refund.
+
+        So for such a provider the wait is stretched to the end of the cancel
+        window whenever the configured timeout would end before it: the number
+        is only abandoned once it can actually be refunded. When the OTP was
+        triggered late enough (slow bot flow, manual trigger) that the
+        configured timeout already ends after the window, the configured value
+        stands and the cancel goes through right after it, exactly like on the
+        other providers. automation.otp_wait_covers_cancel_window=false turns
+        the stretch off.
+        """
+        try:
+            configured = max(0.0, float(self.settings.get("otp_timeout_seconds", 180) or 0.0))
+        except (TypeError, ValueError):
+            configured = 180.0
+        if not self.settings.get("otp_wait_covers_cancel_window", True):
+            return configured
+
+        getter = getattr(context.client, "cancel_window_remaining", None)
+        if not callable(getter):
+            return configured
+        try:
+            window_left = max(0.0, float(getter(context.activation_id) or 0.0))
+        except Exception:
+            window_left = 0.0
+        if window_left <= configured:
+            return configured
+
+        pname = context.provider_name.upper()
+        window_total = getattr(context.client, "cancel_wait_seconds", None)
+        window_note = (f" of {window_total:.0f}s"
+                       if isinstance(window_total, (int, float)) else "")
+        log(f"OTP wait for {context.clean_number} extended to {window_left:.0f}s "
+            f"(cancel window{window_note} ends then; configured {configured:.0f}s) "
+            f"- no refund is possible before that.", prefix=pname)
+        return window_left
+
     def wait_for_otp(self, context):
         """
         Poll the provider for the SMS.
@@ -2493,13 +2743,16 @@ class ParallelAutomationCoordinator:
           ("late", status)      - OTP found by the final salvage probes after timeout
           ("cancelled", None)   - provider cancelled the activation
           ("timeout", None)     - no OTP (and no late salvage)
+
+        The wait is automation.otp_timeout_seconds, or longer on a provider
+        whose cancel window has not passed yet - see _otp_wait_timeout().
         """
-        timeout = self.settings.get("otp_timeout_seconds", 180)
+        timeout = self._otp_wait_timeout(context)
         poll_interval = self.settings.get("otp_poll_interval_seconds", 3)
         start_time = time.time()
         pname = context.provider_name.upper()
 
-        log(f"Waiting for OTP on {context.clean_number} ({pname}) (Timeout: {timeout}s)...", prefix=pname)
+        log(f"Waiting for OTP on {context.clean_number} ({pname}) (Timeout: {timeout:.0f}s)...", prefix=pname)
         last_log = 0
 
         while (time.time() - start_time) < timeout and not self.stop_requested.is_set():
@@ -2534,13 +2787,13 @@ class ParallelAutomationCoordinator:
 
             if status_type == "STATUS_WAIT_CODE":
                 if elapsed - last_log >= 15:
-                    log(f"Waiting for OTP ({elapsed}s/{timeout}s)...", prefix=pname)
+                    log(f"Waiting for OTP ({elapsed}s/{timeout:.0f}s)...", prefix=pname)
                     last_log = elapsed
             time.sleep(poll_interval)
 
         # FINAL SALVAGE: the SMS can land in the seconds between timeout and a
         # cancel call. Probe a few times before declaring the number dead.
-        log(f"OTP wait window elapsed ({timeout}s). Running final salvage probes...", prefix=pname)
+        log(f"OTP wait window elapsed ({timeout:.0f}s). Running final salvage probes...", prefix=pname)
         late = self.guard.salvage_late_otp(
             context.client, context.activation_id,
             probes=self.settings.get("timeout_salvage_probes", 3),
@@ -2552,8 +2805,8 @@ class ParallelAutomationCoordinator:
             code = late.get("code")
             self.notify.alert(
                 f"🆘 [{pname}] Late OTP salvaged",
-                f"Number: {context.clean_number}\nCode arrived right at timeout: `{code}`\n"
-                f"Attempting to use it..."
+                f"`{context.clean_number}` · code `{code}` landed at timeout - using it.",
+                level="routine",
             )
             return "late", late
 
@@ -2611,8 +2864,8 @@ class ParallelAutomationCoordinator:
                     self._bot_warned = True
                     self.notify.alert(
                         "PRIMES bot automation inactive",
-                        f"{self.bot.start_error}\n\nFalling back to the manual OTP trigger flow.\n"
-                        "Run login_userbot.py and check meesho_bot config to enable full automation."
+                        f"{self.bot.start_error}\nUsing the manual OTP trigger flow. "
+                        "Run login_userbot.py / check meesho_bot config for full automation."
                     )
         use_bot = self.bot.ready
         log(f"PRIMES bot flow: {'AUTO' if use_bot else 'MANUAL TRIGGER'}")
@@ -2639,12 +2892,9 @@ class ParallelAutomationCoordinator:
                 self.is_running = False
                 self.notify.alert(
                     "🛑 Checker mode 'bot' cannot run",
-                    f"checker.mode is \"bot\" but the PRIMES userbot is not ready:\n"
-                    f"{reason}\n\n"
-                    "No workers were started (each bought number would only be "
-                    "cancelled). Fix meesho_bot (enabled, api_id/api_hash, "
-                    "bot_username, userbot.session.txt) or set checker.mode to "
-                    '"api" or "auto" and run again.'
+                    f"checker.mode is \"bot\" but the userbot is not ready: {reason}\n"
+                    "No workers started. Fix meesho_bot or set checker.mode to "
+                    "api/auto, then /run."
                 )
                 return
             log("Checker mode AUTO: the PRIMES bot fallback is not ready, so an API "
@@ -2691,14 +2941,14 @@ class ParallelAutomationCoordinator:
                         )
                         log(f"All workers reached configured max attempts ({summary_att}).")
                         self.notify.alert("Automation Finished",
-                                          f"All workers finished their max attempts ({summary_att}).\n\n"
+                                          f"All workers hit max attempts ({summary_att}).\n"
                                           f"{self.stats.summary()}")
                     else:
                         log("All worker threads have stopped.")
                         self.notify.alert(
                             "⚠️ All OTP Workers Stopped",
-                            "All worker threads have stopped (insufficient balance, refund mismatch, or fatal errors).\n\n"
-                            "• Send /balance to check balances\n• Send /run to restart"
+                            "Every worker stopped (balance / refund mismatch / fatal error). "
+                            "/balance to check, /run to restart."
                         )
                     break
 
@@ -2771,9 +3021,8 @@ class ParallelAutomationCoordinator:
                         log(traceback.format_exc(), prefix=pname)
                         self.notify.alert(
                             f"🛑 [{pname}] Bot busy - target skipped",
-                            f"Number: {target.clean_number}\nError: {exc}\n\n"
-                            "The activation is cancelled and the refund tally checked; "
-                            "the search continues with the next number."
+                            f"`{target.clean_number}`: {exc}\nCancelled with refund tally; "
+                            "search continues."
                         )
                         if use_bot:
                             try:
@@ -2802,9 +3051,8 @@ class ParallelAutomationCoordinator:
                         log(traceback.format_exc(), prefix=pname)
                         self.notify.alert(
                             f"🛑 [{pname}] Unexpected error - target skipped",
-                            f"Number: {target.clean_number}\nError: {exc}\n\n"
-                            "The activation is cancelled and the refund tally checked; "
-                            "the search continues with the next number."
+                            f"`{target.clean_number}`: {exc}\nCancelled with refund tally; "
+                            "search continues."
                         )
                         if use_bot:
                             try:
@@ -2856,22 +3104,25 @@ class ParallelAutomationCoordinator:
                 decision = self.wait_for_manual_trigger(target)
                 if decision == "skip":
                     self.notify.send("Number Skipped",
-                                     f"⏭ Number {target.clean_number} skipped; continuing search...")
+                                     f"⏭ `{target.clean_number}` skipped; searching on.",
+                                     level="routine")
                     self.handle_cancellation(target.client, target.activation_id, target.clean_number, "Skipped by user")
                     self._clear_target()
                     return "continue" if not self.stop_requested.is_set() else "stop"
                 if decision == "timeout":
                     self.notify.alert("Trigger Timed Out",
-                                      f"No trigger confirmation for {target.clean_number}; cancelling.")
+                                      f"No confirmation for `{target.clean_number}` - cancelling.",
+                                      level="important")
                     self.handle_cancellation(target.client, target.activation_id, target.clean_number,
                                              "Manual trigger timed out")
                     self._clear_target()
                     return "continue" if not self.stop_requested.is_set() else "stop"
                 self.notify.send("Trigger Confirmed",
-                                 f"✅ OTP triggered for {target.clean_number}; waiting for SMS...")
+                                 f"✅ `{target.clean_number}`: waiting for SMS...",
+                                 level="routine")
             else:
                 self.notify.alert("Target Number Found",
-                                  f"Number: {target.clean_number}\nProvider: {target.provider_name}")
+                                  f"`{target.clean_number}` ({target.provider_name.upper()})")
 
         # --- Step 2: wait for the OTP from the provider ---------------------
         kind, status_res = self.wait_for_otp(target)
@@ -2916,8 +3167,9 @@ class ParallelAutomationCoordinator:
         if kind == "cancelled":
             self.notify.alert(
                 f"⚠️ [{pname}] activation cancelled",
-                f"Activation {target.activation_id} ({target.clean_number}) was cancelled remotely.\n"
-                "Checking refund and continuing..."
+                f"`{target.clean_number}` (activation {target.activation_id}) cancelled "
+                "by the provider - checking refund, continuing.",
+                level="important",
             )
             self.handle_cancellation(target.client, target.activation_id, target.clean_number,
                                      "Activation cancelled remotely")
@@ -2930,7 +3182,8 @@ class ParallelAutomationCoordinator:
         else:
             self.notify.alert(
                 f"⚠️ [{pname}] OTP Timed Out",
-                f"No OTP for {target.clean_number}. Cancelling for refund and continuing..."
+                f"No OTP for `{target.clean_number}` - cancelling for refund, continuing.",
+                level="important",
             )
             self.handle_cancellation(target.client, target.activation_id, target.clean_number, "OTP timeout")
         self._clear_target()
@@ -3014,11 +3267,9 @@ class ParallelAutomationCoordinator:
                 # manual entry is only possible while a prompt still exists.
                 self.notify.alert(
                     f"⚠️ [{pname}] Salvaged OTP could not be auto-submitted",
-                    f"Number: {target.clean_number}\nCode: `{code}`\n"
-                    f"Current bot screen: {state or 'unknown'}\n\n"
-                    "The SMS was delivered (the charge stands), but the bot is "
-                    "no longer waiting for a code. If the bot still shows a "
-                    "code prompt anywhere, enter it manually NOW."
+                    f"`{target.clean_number}` · code `{code}`\nBot screen: "
+                    f"{state or 'unknown'} - no code prompt (charge stands). "
+                    "If a prompt is visible anywhere, enter the code NOW."
                 )
 
         # --- 3) clean cancellation: now move the bot to the number prompt ---
@@ -3039,18 +3290,18 @@ class ParallelAutomationCoordinator:
         if self.bot.ready:
             outcome = self._bot_prepare_change_number(target) or {}
             if outcome.get("prompt_ready"):
-                detail = "The bot is waiting for the replacement number."
+                detail = "Bot is waiting for the replacement number."
             elif outcome.get("menu_reset"):
-                detail = ("The bot flow will restart from the menu "
+                detail = ("Bot flow will restart from the menu "
                           f"({outcome.get('reason') or 'reset to the main menu'}).")
             else:
-                detail = ("The bot stays in-flow - no main-menu restart and no offer "
-                          f"reroll ({outcome.get('reason') or 'the checker API is answering'}); "
-                          "the next number is sent from the number prompt when the bot "
-                          "is on one.")
+                detail = ("Bot stays in-flow "
+                          f"({outcome.get('reason') or 'the checker API is answering'}); "
+                          "the next number goes to its prompt.")
             self.notify.send(
                 "🔄 Changing number",
-                f"{target.clean_number} ({reason}). {detail}"
+                f"`{target.clean_number}` ({reason}). {detail}",
+                level="routine",
             )
         return outcome
 
@@ -3102,6 +3353,86 @@ def set_referral_link(config_path, link):
         new_inner = inner[:existing.start(2)] + quoted + inner[existing.end(2):]
     else:
         new_inner = '\n    "referral_link": ' + quoted + "," + inner
+
+    with open(config_path, "w", encoding="utf-8") as f:
+        f.write(text[:inner_start] + new_inner + text[inner_end:])
+    return True
+
+
+def _top_level_section_span(text, section):
+    """
+    (inner_start, inner_end) of the TOP-LEVEL "section": {...} object in a
+    config.json text, or None. Skips strings and nested objects, so a same-named
+    block inside "instances" (e.g. instances.vsimpro.telegram) is never picked.
+    """
+    depth = 0
+    index = 0
+    length = len(text)
+    key_re = re.compile(r'"([^"\\]|\\.)*"')
+    while index < length:
+        char = text[index]
+        if char == '"':
+            match = key_re.match(text, index)
+            if not match:
+                return None
+            token = match.group(0)
+            index = match.end()
+            if depth == 1 and json.loads(token) == section:
+                rest = re.match(r'\s*:\s*\{', text[index:])
+                if rest:
+                    inner_start = index + rest.end()
+                    inner_depth = 1
+                    scan = inner_start
+                    while scan < length and inner_depth:
+                        c = text[scan]
+                        if c == '"':
+                            m = key_re.match(text, scan)
+                            if not m:
+                                return None
+                            scan = m.end()
+                            continue
+                        if c == "{":
+                            inner_depth += 1
+                        elif c == "}":
+                            inner_depth -= 1
+                        scan += 1
+                    if inner_depth:
+                        return None
+                    return inner_start, scan - 1
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+        index += 1
+    return None
+
+
+def set_notify_level(config_path, level):
+    """
+    Write telegram.notify_level into config.json in place (top-level "telegram"
+    block; ordering and other keys untouched). Returns True.
+    """
+    normalized = normalize_notify_level(level, default=None)
+    if normalized is None:
+        raise ValueError(f"unknown notify level: {level!r} (use all, normal or quiet)")
+    level = normalized
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        text = f.read()
+
+    span = _top_level_section_span(text, "telegram")
+    if span is None:
+        raise ValueError(f'no top-level "telegram" section found in {config_path}')
+    inner_start, inner_end = span
+    inner = text[inner_start:inner_end]
+    quoted = json.dumps(level)
+
+    existing = re.search(r'("notify_level"\s*:\s*)("(?:[^"\\]|\\.)*")', inner)
+    if existing:
+        new_inner = inner[:existing.start(2)] + quoted + inner[existing.end(2):]
+    else:
+        new_inner = '\n    "notify_level": ' + quoted + "," + inner
 
     with open(config_path, "w", encoding="utf-8") as f:
         f.write(text[:inner_start] + new_inner + text[inner_end:])
