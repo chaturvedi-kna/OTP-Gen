@@ -176,7 +176,9 @@
   "telegram": {
     "enabled": true,
     "bot_token": "8670376621:AAEoyDlUzzKZshZEkJfxiyVtSWm-nvUDbXU",
-    "chat_id": "883480917"
+    "chat_id": "883480917",
+    "notify_level": "all",
+    "silent_routine": true
   },
   "automation": {
     "target_registered": false,

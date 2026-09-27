@@ -482,13 +482,16 @@ def test_telegram_start_help_mentions_run_provider():
         status_cb=lambda: "status", balance_cb=lambda: "balance",
         run_cb=lambda arg: "run", stop_cb=lambda: None,
         referral_cb=lambda arg: "referral", checker_cb=lambda arg: "checker",
+        accounts_cb=lambda arg: "accounts", milestone_cb=lambda arg: "milestone",
+        notify_cb=lambda arg: "notify",
     )
     registrations = [payload for method, payload in backend.sent
                      if method == "setMyCommands"]
     registered = {item["command"]: item["description"]
                   for item in registrations[-1]["commands"]} if registrations else {}
     check("telegram: native command menu lists supported bot commands",
-          {"start", "run", "status", "balance", "referral", "checker", "stop"}
+          {"start", "run", "status", "balance", "referral", "checker", "stop",
+           "accounts", "milestone", "notify"}
           <= set(registered), registered)
     check("telegram: command menu explains provider-specific /run",
           "provider" in registered.get("run", "").lower(), registered)

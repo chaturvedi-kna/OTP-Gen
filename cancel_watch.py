@@ -365,16 +365,11 @@ class CancelWatchManager:
         }
         self.store.add(record)
         self._start(record)
-        if retry_after_seconds is None:
-            why = ("The provider refused the cancel with ERROR; the "
-                   "activation stays open and is retried at expiry")
-        else:
-            why = ("The provider only accepts the cancel after its wait "
-                   "window; the activation stays open and is retried when "
-                   "the window has passed")
+        why = ("refused (ERROR), retry at activation expiry" if retry_after_seconds is None
+               else "refused until the cancel window passes, retry then")
         self._log(
-            f"[DEFERRED-CANCEL] {why} (~{wait_seconds:.0f}s). The worker "
-            f"keeps hunting - {number} / {activation_id}.",
+            f"[DEFERRED-CANCEL] {number} ({activation_id}): cancel {why} "
+            f"in ~{wait_seconds:.0f}s; worker keeps hunting.",
             client.name.upper()
         )
         return record
@@ -390,9 +385,8 @@ class CancelWatchManager:
             if str(record.get("activation_id")) in self._threads:
                 continue
             self._log(
-                f"[DEFERRED-CANCEL] Resuming the pending cancel of "
-                f"{record.get('number')} ({record.get('provider')}) left over from "
-                f"a previous run.",
+                f"[DEFERRED-CANCEL] {record.get('number')}: resuming the pending "
+                f"cancel left over from a previous run.",
                 str(record.get("provider", "")).upper()
             )
             self._start(record, resumed=True)
@@ -430,9 +424,8 @@ class CancelWatchManager:
         pname = str(record.get("provider", "")).upper()
         if client is None:
             self._log(
-                f"[DEFERRED-CANCEL] No client for {record.get('provider')}; the "
-                f"pending cancel of {record.get('number')} stays on disk for the "
-                f"next run.",
+                f"[DEFERRED-CANCEL] {record.get('number')}: no client for "
+                f"{record.get('provider')}; stays pending for the next run.",
                 pname
             )
             return
@@ -455,8 +448,8 @@ class CancelWatchManager:
                 # The run is stopping: the record stays on disk so the next
                 # run finishes the cancellation instead of losing the money.
                 self._log(
-                    f"[DEFERRED-CANCEL] Run is stopping; {number} stays pending "
-                    f"and is retried on the next start.",
+                    f"[DEFERRED-CANCEL] {number}: run stopping, stays pending for "
+                    f"the next start.",
                     pname
                 )
                 return
@@ -479,8 +472,8 @@ class CancelWatchManager:
                 break
             if now_ts >= deadline:
                 self._log(
-                    f"[DEFERRED-CANCEL] Gave up waiting for the expiry of {number} "
-                    f"after {settings['cancel_error_max_wait_seconds']:.0f}s; "
+                    f"[DEFERRED-CANCEL] {number}: max wait "
+                    f"{settings['cancel_error_max_wait_seconds']:.0f}s reached, "
                     f"retrying the cancel now.",
                     pname
                 )
@@ -498,7 +491,7 @@ class CancelWatchManager:
 
         if stop is not None and stop.is_set():
             self._log(
-                f"[DEFERRED-CANCEL] Run is stopping before the retry; {number} "
+                f"[DEFERRED-CANCEL] {number}: run stopping before the retry, "
                 f"stays pending for the next run.",
                 pname
             )
@@ -518,8 +511,9 @@ class CancelWatchManager:
                              last_attempt_at=now())
             if cancel_res:
                 self._log(
-                    f"[DEFERRED-CANCEL] Cancel retry {attempt}/{attempts} for "
-                    f"{number}: {cancel_res}",
+                    f"[DEFERRED-CANCEL] {number}: cancel retry {attempt}/{attempts} "
+                    f"-> {cancel_res.get('type')}"
+                    + (f" ({cancel_res.get('seconds')}s)" if cancel_res.get("seconds") else ""),
                     pname
                 )
                 res_type = cancel_res.get("type")
@@ -550,11 +544,9 @@ class CancelWatchManager:
         try:
             notify.alert(
                 f"♻️ [{pname}] Pending cancel resumed",
-                f"Number: {record.get('number')}\\nActivation: "
-                f"{record.get('activation_id')}\\n\\n"
-                f"This cancellation was refused by the provider during an earlier "
-                f"run (ERROR) and is still open. It is being retried now; if the "
-                f"refund still does not tally, the run stops as usual."
+                f"`{record.get('number')}`: cancel refused in an earlier run, still "
+                f"open - retrying now (the run stops if the refund does not tally).",
+                level="routine",
             )
         except Exception:
             pass
@@ -577,9 +569,8 @@ class CancelWatchManager:
                 pass
 
         self._log(
-            f"🚨 [DEFERRED-CANCEL] OTP {code} arrived for {number} while the "
-            f"cancellation was waiting for expiry - the SMS was delivered, so "
-            f"this charge stands (no cancel retry).",
+            f"🚨 [DEFERRED-CANCEL] {number}: OTP {code} arrived while the cancel "
+            f"was pending - charge stands, no retry.",
             pname
         )
 
@@ -588,13 +579,10 @@ class CancelWatchManager:
             try:
                 notify.alert(
                     f"🚨 [{pname}] OTP arrived on a number being cancelled",
-                    f"Number: {number}\\nActivation: {activation_id}\\n"
-                    f"Deferred because: {record.get('reason')}\\n\\n"
-                    f"Code: `{code}`\\nSMS: {sms}\\n\\n"
-                    f"The provider refused the cancel with ERROR, so the number was "
-                    f"kept until expiry - and the OTP arrived in the meantime. The "
-                    f"SMS was delivered, so the charge stands (no refund is due) "
-                    f"and the activation is left open for the code to be used."
+                    f"`{number}` · code `{code}`\n{sms}\n\n"
+                    f"Cancel was refused ({record.get('reason')}) and the OTP came "
+                    f"meanwhile: charge stands, activation left open for the code.",
+                    level="important",
                 )
             except Exception:
                 pass
@@ -687,17 +675,15 @@ class CancelWatchManager:
                 except Exception:
                     pass
             self._log(
-                f"[DEFERRED-CANCEL] {number} cancelled once the provider "
-                f"allowed it; refund tallied (last cancel answer: {res_type}).",
+                f"[DEFERRED-CANCEL] {number}: cancelled, refund tallied ({res_type}).",
                 pname
             )
             if notify is not None and pname != "OTPINDIA":
                 try:
                     notify.send(
                         f"✅ [{pname}] Deferred cancel completed",
-                        f"Number: {number}\\nActivation: {activation_id}\\n\\n"
-                        f"The provider had refused the cancel with ERROR; it was "
-                        f"retried at expiry and the refund tallied."
+                        f"`{number}`: cancel accepted after the wait, refund tallied.",
+                        level="routine",
                     )
                 except Exception:
                     pass
@@ -713,19 +699,15 @@ class CancelWatchManager:
                 pass
         waited = ""
         try:
-            waited = (f"\\nWaited: {max(0.0, time.time() - float(record.get('deferred_at_epoch', time.time()))):.0f}s "
-                      f"before the cancel was retried")
+            waited = (f" after {max(0.0, time.time() - float(record.get('deferred_at_epoch', time.time()))):.0f}s")
         except Exception:
             pass
         critical = getattr(self.owner, "critical_stop", None)
         message = (
-            f"Number: {number}\\nActivation: {activation_id}\\n"
-            f"Expected balance: ~{expected}\\nActual balance: {actual}\\n"
-            f"Last cancel answer: {res_type}\\n"
-            f"Reason for cancel: {record.get('reason')}{waited}\\n\\n"
-            f"The cancellation was deferred until the provider allowed it and "
-            f"was retried, and the refund still did not tally. Verify this "
-            f"activation in the provider panel before buying more numbers."
+            f"`{number}` (activation {activation_id}, {record.get('reason')})\n"
+            f"Expected ~{expected}, actual {actual}; last cancel answer {res_type}{waited}.\n"
+            f"Deferred cancel retried and the refund still did not tally - verify "
+            f"this activation in the provider panel before buying more numbers."
         )
         if callable(critical):
             critical(f"[{pname}] REFUND DID NOT TALLY (deferred cancel)", message)
