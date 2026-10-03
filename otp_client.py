@@ -1,7 +1,7 @@
 """
 Unified OTP Client Facade providing backwards compatibility, client factories,
-and multi-provider management for OtpDoctor, TemporaSMS, VSImpro, OTPCart and
-OTPIndia.
+and multi-provider management for OtpDoctor, TemporaSMS, VSImpro, OTPCart,
+OTPIndia and OTPSell.
 """
 
 import sys
@@ -17,12 +17,13 @@ from tempora_client import TemporaClient
 from otpcart_client import OTPCartClient
 from vsimpro_client import VSImproClient
 from otpindia_client import OtpIndiaClient
+from otpsell_client import OtpSellClient
 
 # Backward compatibility alias
 OTPClient = OTPDoctorClient
 
 # Every provider this tool knows, in display order, with its accepted aliases.
-PROVIDER_ORDER = ("tempora", "otpdoctor", "otpcart", "vsimpro", "otpindia")
+PROVIDER_ORDER = ("tempora", "otpdoctor", "otpcart", "vsimpro", "otpindia", "otpsell")
 PROVIDER_ALIASES = {
     "tempora": "tempora",
     "temporasms": "tempora",
@@ -35,6 +36,8 @@ PROVIDER_ALIASES = {
     "vsi": "vsimpro",
     "otpindia": "otpindia",
     "india": "otpindia",
+    "otpsell": "otpsell",
+    "sell": "otpsell",
 }
 # --provider / "/run" values that mean "every enabled provider".
 PROVIDER_WILDCARDS = ("all", "both")
@@ -101,7 +104,7 @@ def validate_provider_selection(config, provider_val):
             f"Unknown provider '{unknown[0]}'. Known providers: "
             f"{', '.join(PROVIDER_ORDER)} "
             f"(aliases: tempora/temporasms, otp/otpdoctor/doctor, "
-            f"otpcart/cart, vsimpro/vsi, otpindia/india)."
+            f"otpcart/cart, vsimpro/vsi, otpindia/india, otpsell/sell)."
         )
     if not_ready:
         names = ", ".join(sorted(set(not_ready)))
@@ -178,14 +181,28 @@ def build_otpindia_client(config):
     )
 
 
+def build_otpsell_client(config):
+    """Build an OtpSellClient instance from config dictionary."""
+    sell_conf = config.get("otpsell", {})
+    return OtpSellClient(
+        base_url=sell_conf.get("base_url", "https://otpsell.com/stubs/handler_api.php"),
+        api_key=sell_conf.get("api_key", ""),
+        default_service=sell_conf.get("service", "meesho"),
+        default_country=sell_conf.get("country", "91"),
+        default_operator=sell_conf.get("operator", ""),
+        max_price=sell_conf.get("max_price"),
+        timeout=sell_conf.get("timeout", 15)
+    )
+
+
 def create_otp_clients(config, provider_override=None):
     """
     Returns a list of active OTP client instances based on config and override.
     Options for provider:
-      - 'all': runs all enabled providers (otpdoctor, tempora, otpcart, vsimpro, otpindia)
+      - 'all': runs all enabled providers (otpdoctor, tempora, otpcart, vsimpro, otpindia, otpsell)
       - list of names: e.g. ['tempora', 'vsimpro']
-      - specific name: 'vsimpro', 'otpcart', 'tempora', 'otpdoctor', 'otpindia'
-        (aliases accepted too: 'vsi', 'cart', 'doctor', 'india', ...)
+      - specific name: 'vsimpro', 'otpcart', 'tempora', 'otpdoctor', 'otpindia', 'otpsell'
+        (aliases accepted too: 'vsi', 'cart', 'doctor', 'india', 'sell', ...)
     """
     provider_val = (
         provider_override
@@ -204,6 +221,7 @@ def create_otp_clients(config, provider_override=None):
     cart_enabled = provider_ready(config, "otpcart")
     vsi_enabled = provider_ready(config, "vsimpro")
     india_enabled = provider_ready(config, "otpindia")
+    sell_enabled = provider_ready(config, "otpsell")
 
     if "all" in requested or "both" in requested:
         if tempora_enabled:
@@ -216,6 +234,8 @@ def create_otp_clients(config, provider_override=None):
             clients.append(build_vsimpro_client(config))
         if india_enabled:
             clients.append(build_otpindia_client(config))
+        if sell_enabled:
+            clients.append(build_otpsell_client(config))
     else:
         for p in requested:
             canonical = canonical_provider(p)
@@ -229,6 +249,8 @@ def create_otp_clients(config, provider_override=None):
                 clients.append(build_vsimpro_client(config))
             elif canonical == "otpindia" and india_enabled:
                 clients.append(build_otpindia_client(config))
+            elif canonical == "otpsell" and sell_enabled:
+                clients.append(build_otpsell_client(config))
 
     if not clients:
         # Fallback to whatever has credentials enabled
@@ -242,6 +264,8 @@ def create_otp_clients(config, provider_override=None):
             clients.append(build_vsimpro_client(config))
         if india_enabled:
             clients.append(build_otpindia_client(config))
+        if sell_enabled:
+            clients.append(build_otpsell_client(config))
 
     return clients
 

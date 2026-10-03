@@ -1563,6 +1563,14 @@ class ParallelAutomationCoordinator:
                         service=india_conf.get("service"),
                         server=india_conf.get("server")
                     )
+                elif client.name == "otpsell":
+                    sell_conf = self.config.get("otpsell", {})
+                    res = client.get_number(
+                        service=sell_conf.get("service", "meesho"),
+                        country=sell_conf.get("country", "91"),
+                        operator=sell_conf.get("operator"),
+                        max_price=sell_conf.get("max_price")
+                    )
                 else:
                     otp_conf = self.config.get("otp", {})
                     res = client.get_number(

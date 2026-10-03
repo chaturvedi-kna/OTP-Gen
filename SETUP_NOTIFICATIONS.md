@@ -162,6 +162,42 @@ How the cancel window shapes an OTPIndia run:
   enough, it waits for the next one, and so on; only `NO_BALANCE` with nothing
   pending stops the worker with the usual recharge alert.
 
+### OTPSell (`otpsell.com`, handler_api protocol)
+
+OTPSell speaks the same SMS-Activate `handler_api` protocol as TemporaSMS /
+VSImpro but takes a **country** (and an optional **operator**) on `getNumber`
+instead of a Tempora-style operator routing string. Add a block like:
+
+```json
+"otpsell": {
+  "enabled": true,
+  "base_url": "https://otpsell.com/stubs/handler_api.php",
+  "api_key": "YOUR_API_KEY",
+  "service": "meesho",
+  "country": "91",
+  "operator": "",
+  "max_price": null,
+  "max_attempts": 500
+}
+```
+
+- `service` — the service id listed on otpsell.com (e.g. `wa`, `tg`, `ig`;
+  use the code that maps to Meesho for this automation).
+- `country` — the country id (e.g. `91` = India).
+- `operator` — optional network operator id. Left empty, the param is omitted
+  and the provider picks the operator. `max_price` is mandatory for operators
+  `6` and `9`.
+- `max_price` — optional price cap forwarded as `maxPrice`.
+- **Cancellation is immediate**: a cancel (`setStatus` status `8`) is answered
+  with `ACCESS_CANCEL` right away — there is no `ACCESS_CANCEL_WAIT` window like
+  OTPIndia. The client therefore reports `cancel_window_remaining() == 0`, so
+  the OTP wait is never stretched and a number is abandoned/refunded the moment
+  `automation.otp_timeout_seconds` fires. Requesting another SMS (status `3`)
+  returns `ACCESS_RETRY_GET`.
+- Catalog helpers `getOperators` / `getCountries` / `getServices` return JSON
+  maps (used for discovery; not required to run).
+- CLI: `python main.py --provider otpsell` (also accepts the alias `sell`).
+
 ## 5. Dual OTP Providers (TemporaSMS + OtpDoctor)
 
 The system supports running **both providers in parallel on independent worker threads**:
