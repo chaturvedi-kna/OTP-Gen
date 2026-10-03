@@ -1041,7 +1041,10 @@ class ParallelAutomationCoordinator:
         nothing pending to wait for.
         """
         provider = getattr(client, "name", "")
-        if provider != "otpindia":
+        # OTPIndia and OTPSell both hold the purchase until their ~2 minute
+        # cancel window elapses, so a NO_BALANCE with cancels still pending is
+        # back-pressure, not a stop, for either of them.
+        if provider not in ("otpindia", "otpsell"):
             return False
 
         def provider_pending():
@@ -1424,10 +1427,10 @@ class ParallelAutomationCoordinator:
         except (TypeError, ValueError):
             retry_in = 0.0
         retry_note = "cancel window" if retry_after is not None else "activation expiry"
-        # OTPIndia's ACCESS_CANCEL_WAIT is its documented, routine two-minute
-        # window. Keep it in logs/status, but don't alert the user for each
-        # expected cancellation.
-        if client.name != "otpindia":
+        # OTPIndia's / OTPSell's ACCESS_CANCEL_WAIT is their documented, routine
+        # two-minute window. Keep it in logs/status, but don't alert the user for
+        # each expected cancellation.
+        if client.name not in ("otpindia", "otpsell"):
             self.notify.send(
                 f"⏳ [{pname}] Cancel refused - deferred",
                 f"`{number}` ({reason}): provider said `{detail or 'ERROR'}`; "

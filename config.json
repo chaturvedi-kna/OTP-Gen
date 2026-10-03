@@ -57,8 +57,10 @@
     "api_key": "EabV2x0Wch3Wblc4QX3TIGGS3dWQbmSS",
     "service": "meesho",
     "country": "91",
-    "operator": "",
-    "max_price": null,
+    "operator": "server-62",
+    "max_price": 9,
+    "cancel_wait_seconds": 120,
+    "timeout": 30,
     "max_attempts": 500
   },
   "checker": {

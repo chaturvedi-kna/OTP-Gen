@@ -191,7 +191,8 @@ def build_otpsell_client(config):
         default_country=sell_conf.get("country", "91"),
         default_operator=sell_conf.get("operator", ""),
         max_price=sell_conf.get("max_price"),
-        timeout=sell_conf.get("timeout", 15)
+        timeout=sell_conf.get("timeout", 15),
+        cancel_wait_seconds=sell_conf.get("cancel_wait_seconds", 120)
     )
 
 

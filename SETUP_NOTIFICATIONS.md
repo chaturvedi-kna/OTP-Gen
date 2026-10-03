@@ -165,8 +165,9 @@ How the cancel window shapes an OTPIndia run:
 ### OTPSell (`otpsell.com`, handler_api protocol)
 
 OTPSell speaks the same SMS-Activate `handler_api` protocol as TemporaSMS /
-VSImpro but takes a **country** (and an optional **operator**) on `getNumber`
-instead of a Tempora-style operator routing string. Add a block like:
+VSImpro but takes a **country** (and a specific **operator**) on `getNumber`
+instead of a Tempora-style operator routing string. It has two OTPSell-specific
+quirks (both handled by the client, but they shape the config):
 
 ```json
 "otpsell": {
@@ -175,25 +176,36 @@ instead of a Tempora-style operator routing string. Add a block like:
   "api_key": "YOUR_API_KEY",
   "service": "meesho",
   "country": "91",
-  "operator": "",
-  "max_price": null,
+  "operator": "server-62",
+  "max_price": 9,
+  "cancel_wait_seconds": 120,
+  "timeout": 30,
   "max_attempts": 500
 }
 ```
 
-- `service` — the service id listed on otpsell.com (e.g. `wa`, `tg`, `ig`;
-  use the code that maps to Meesho for this automation).
-- `country` — the country id (e.g. `91` = India).
-- `operator` — optional network operator id. Left empty, the param is omitted
-  and the provider picks the operator. `max_price` is mandatory for operators
-  `6` and `9`.
+- `service` — the service id listed on otpsell.com. Several codes map to the
+  same app and the right one can be **operator-specific** (e.g. `meesho` works
+  with `server-62`, while `hp` — which also reads "Meesho" in `getServices` —
+  is rejected there with `BAD_SERVICE`). Use the code that works for your chosen
+  operator; check `getServices`.
+- `country` — the country id (e.g. `91` = India, from `getCountries`).
+- `operator` — **must be a specific operator id** (the *value* in
+  `getOperators`, e.g. `server-62`, not the display key `SERVER-62`). Do **not**
+  leave it empty or use `any`: otpsell then assigns an operator you cannot see,
+  and the order can never be cancelled/refunded (`setStatus` needs the exact
+  operator and answers `BAD_STATUS` otherwise). `max_price` is mandatory for
+  operators `6` and `9`.
 - `max_price` — optional price cap forwarded as `maxPrice`.
-- **Cancellation is immediate**: a cancel (`setStatus` status `8`) is answered
-  with `ACCESS_CANCEL` right away — there is no `ACCESS_CANCEL_WAIT` window like
-  OTPIndia. The client therefore reports `cancel_window_remaining() == 0`, so
-  the OTP wait is never stretched and a number is abandoned/refunded the moment
-  `automation.otp_timeout_seconds` fires. Requesting another SMS (status `3`)
-  returns `ACCESS_RETRY_GET`.
+- **Cancel window (~2 minutes, like OTPIndia)**: a cancel (`setStatus` status
+  `8`) sent sooner than `cancel_wait_seconds` after `getNumber` is refused with
+  `BAD_STATUS`; the client surfaces that as `ACCESS_CANCEL_WAIT` so the
+  coordinator defers the cancel, keeps waiting for the OTP until the number can
+  actually be refunded, and retries the cancel once the window passes. So a
+  found number waits up to `cancel_wait_seconds` for its OTP rather than being
+  abandoned early (same as OTPIndia — see the OTP wait / out-of-balance notes
+  above). Set `cancel_wait_seconds: 0` only if the provider ever cancels
+  immediately. Requesting another SMS (status `3`) returns `ACCESS_RETRY_GET`.
 - Catalog helpers `getOperators` / `getCountries` / `getServices` return JSON
   maps (used for discovery; not required to run).
 - CLI: `python main.py --provider otpsell` (also accepts the alias `sell`).

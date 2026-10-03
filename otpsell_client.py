@@ -16,15 +16,28 @@ Endpoints used by the automation:
 - setStatus    -> status 3 = request another SMS (ACCESS_RETRY_GET),
                   status 8 = cancel (ACCESS_CANCEL)
 
-Cancellation is IMMEDIATE: a cancel (status 8) is answered with ACCESS_CANCEL
-right away - the documentation lists no wait/cooldown variant (unlike
-OTPIndia's ACCESS_CANCEL_WAIT). The base client's cancel_window_remaining()
-therefore returns 0.0, so the coordinator keeps the configured OTP timeout and
-never has to stretch the wait for a cancel window to pass - a number can be
-abandoned (and refunded) the moment the timeout fires.
+Two OTPSell quirks the client hides from the rest of the tool:
+
+1) setStatus needs the order's service / country / operator, and they must
+   MATCH what getNumber used - otherwise otpsell answers BAD_STATUS. So a
+   SPECIFIC operator must be used at getNumber (never "any" or omitted: the
+   provider then assigns an operator we cannot see, and the order can never be
+   cancelled/refunded). The context is recorded per activation at getNumber and
+   replayed on every setStatus (see get_number / set_status).
+
+2) Cancel window (like OTPIndia): a cancel (status 8) that arrives before
+   ~cancel_wait_seconds (default 120) have elapsed since getNumber issued the
+   number is refused with BAD_STATUS. set_status() translates that into the
+   ACCESS_CANCEL_WAIT contract the coordinator understands (carrying the seconds
+   left), so the cancel is deferred and retried once the window has passed, and
+   the OTP wait is stretched to cover the window (cancel_window_remaining) - a
+   number is only abandoned once it can actually be refunded. Set
+   cancel_wait_seconds to 0 if the provider ever cancels immediately.
 """
 
 import json
+import math
+import time
 
 from base_otp import (
     BaseOTPClient,
@@ -43,7 +56,8 @@ class OtpSellClient(BaseOTPClient):
         default_country="91",
         default_operator="",
         max_price=None,
-        timeout=15
+        timeout=15,
+        cancel_wait_seconds=120
     ):
         super().__init__(
             name="otpsell",
@@ -55,6 +69,14 @@ class OtpSellClient(BaseOTPClient):
         self.default_country = (default_country or "").strip()
         self.default_operator = (default_operator or "").strip()
         self.max_price = max_price
+        # OTPSell refuses to cancel a number until this long after it was
+        # issued (~2 minutes by default, same as OTPIndia) - see set_status().
+        self.cancel_wait_seconds = float(cancel_wait_seconds or 0)
+        # setStatus needs the order's service / country / operator (they must
+        # match getNumber), so remember both what getNumber used and WHEN it
+        # issued the number, keyed by activation id.
+        self._orders = {}
+        self._acquired_at = {}
 
     def get_balance(self):
         raw = self._request("getBalance")
@@ -82,8 +104,9 @@ class OtpSellClient(BaseOTPClient):
         Purchase a number.
 
         service and country are required; operator and maxPrice are optional
-        (maxPrice is mandatory for operators 6 & 9). The operator is only sent
-        when configured - omitting it lets the provider pick the operator.
+        (maxPrice is mandatory for operators 6 & 9). A SPECIFIC operator should
+        be configured - if it is omitted otpsell assigns one we cannot see and
+        the order can never be cancelled (see set_status / module docstring).
         """
         svc = (service or "").strip() or self.default_service
         ctry = (country if country is not None else self.default_country)
@@ -113,9 +136,19 @@ class OtpSellClient(BaseOTPClient):
             parts = raw.split(":", 2)
             if len(parts) != 3:
                 raise OTPError(f"[{self.name}] Malformed ACCESS_NUMBER: {raw}")
+            activation_id = parts[1].strip()
+            # Remember the exact service / country / operator this order was
+            # created with (setStatus rejects anything else with BAD_STATUS) and
+            # when it was issued (the cancel window counts from here).
+            self._orders[activation_id] = {
+                "service": svc,
+                "country": ctry,
+                "operator": op,
+            }
+            self._acquired_at[activation_id] = time.time()
             return {
                 "type": "ACCESS_NUMBER",
-                "activation_id": parts[1].strip(),
+                "activation_id": activation_id,
                 "number": parts[2].strip()
             }
 
@@ -151,6 +184,8 @@ class OtpSellClient(BaseOTPClient):
             }
 
         if raw == "STATUS_CANCEL":
+            self._acquired_at.pop(str(activation_id), None)
+            self._orders.pop(str(activation_id), None)
             return {"type": "STATUS_CANCEL"}
 
         if raw in {"BAD_KEY", "NO_ACTIVATION", "ERROR", "TOO_MANY_REQUESTS"}:
@@ -162,18 +197,36 @@ class OtpSellClient(BaseOTPClient):
         """
         Status codes (OTPSell):
         3 = request another SMS  -> ACCESS_RETRY_GET
-        8 = cancel               -> ACCESS_CANCEL (immediate)
+        8 = cancel               -> ACCESS_CANCEL
 
-        The cancel is answered with ACCESS_CANCEL straight away - there is no
-        wait window, so the base cancel_window_remaining() stays 0.0 and the
-        coordinator refunds/abandons a number as soon as it cancels it.
+        The order's service / country / operator (recorded at getNumber, matched
+        exactly) are sent alongside id + status, otherwise otpsell answers
+        BAD_STATUS. A cancel that arrives inside the cancel window is also
+        answered BAD_STATUS; it is translated into the ACCESS_CANCEL_WAIT
+        contract (with the seconds left) so the coordinator defers and retries
+        the cancel once the window has passed - exactly like OTPIndia.
         """
-        raw = self._request("setStatus", {
+        ctx = self._orders.get(str(activation_id), {})
+        service = (ctx.get("service") or self.default_service or "").strip()
+        country = (ctx.get("country") or self.default_country or "").strip()
+        operator = str(ctx.get("operator", self.default_operator) or "").strip()
+
+        params = {
             "id": str(activation_id),
             "status": int(status)
-        })
+        }
+        if service:
+            params["service"] = service
+        if country:
+            params["country"] = country
+        if operator:
+            params["operator"] = operator
+
+        raw = self._request("setStatus", params)
 
         if raw.startswith("ACCESS_CANCEL"):
+            self._acquired_at.pop(str(activation_id), None)
+            self._orders.pop(str(activation_id), None)
             return {"type": "ACCESS_CANCEL"}
 
         if raw.startswith("ACCESS_RETRY_GET"):
@@ -182,16 +235,31 @@ class OtpSellClient(BaseOTPClient):
         # status 6 (finish) is not documented for OTPSell; tolerate the
         # standard handler_api answer if the provider happens to support it.
         if raw.startswith("ACCESS_ACTIVATION"):
+            self._acquired_at.pop(str(activation_id), None)
+            self._orders.pop(str(activation_id), None)
             return {"type": "ACCESS_ACTIVATION"}
 
-        if raw in {"NO_ACTIVATION", "BAD_STATUS", "BAD_ACTION", "BAD_KEY",
+        if raw == "BAD_STATUS":
+            # A cancel before the cancel window has passed is refused with
+            # BAD_STATUS. Surface it as ACCESS_CANCEL_WAIT so the coordinator
+            # keeps the money held, waits out the window and retries (a plain
+            # BAD_STATUS is not a retryable cancel type and would otherwise
+            # critical-stop the run over money that is simply still pending).
+            if int(status) == 8:
+                return {
+                    "type": "ACCESS_CANCEL_WAIT",
+                    "seconds": self._cancel_wait_seconds(activation_id)
+                }
+            return {"type": "BAD_STATUS"}
+
+        if raw in {"NO_ACTIVATION", "BAD_ACTION", "BAD_KEY",
                    "ERROR", "TOO_MANY_REQUESTS"}:
             return {"type": raw}
 
         raise OTPError(f"[{self.name}] Unexpected setStatus response: {raw}")
 
     def cancel(self, activation_id):
-        """Cancel activation (status 8). OTPSell cancels immediately."""
+        """Cancel activation (status 8). OTPSell cancels after its ~2 min window."""
         return self.set_status(activation_id, 8)
 
     def request_next_sms(self, activation_id):
@@ -206,19 +274,52 @@ class OtpSellClient(BaseOTPClient):
         so the standard finish (status 6) is attempted best-effort and never
         required: a rejection comes back as FINISH_UNSUPPORTED instead of an
         error. After the OTP is consumed the charge stands either way - only a
-        cancel (status 8) moves money back, and that one is immediate.
+        cancel (status 8) moves money back, and that one needs the cancel window
+        to have passed.
         """
         res = self.set_status(activation_id, 6)
         if res.get("type") in {"BAD_STATUS", "BAD_ACTION", "ERROR", "NO_ACTIVATION"}:
             return {"type": "FINISH_UNSUPPORTED", "rejected_as": res.get("type")}
         return res
 
+    def _cancel_wait_seconds(self, activation_id):
+        """
+        Seconds to wait before a cancel for this activation is accepted.
+
+        The remainder of the cancel window, counted from the moment getNumber
+        issued the number; a full window when the issue time is unknown (a
+        pending cancel resumed after a restart).
+        """
+        acquired = self._acquired_at.get(str(activation_id))
+        if acquired is not None:
+            remaining = self.cancel_wait_seconds - (time.time() - acquired)
+            if remaining > 0:
+                return max(1, int(math.ceil(remaining)))
+        return max(1, int(self.cancel_wait_seconds)) if self.cancel_wait_seconds else 1
+
+    def cancel_window_remaining(self, activation_id):
+        """
+        Seconds left until OTPSell accepts a cancel for this activation.
+
+        Counted from the moment getNumber issued the number (cancel_wait_seconds,
+        ~2 minutes by default). 0.0 once the window has passed, and 0.0 for an
+        activation this client did not issue. The coordinator uses this to keep
+        waiting for the OTP until the number can actually be refunded - see
+        wait_for_otp() / _otp_wait_timeout() in main.py.
+        """
+        acquired = self._acquired_at.get(str(activation_id))
+        if acquired is None:
+            return 0.0
+        remaining = self.cancel_wait_seconds - (time.time() - acquired)
+        return max(0.0, float(remaining))
+
     # -- Catalog endpoints (operator/country/service discovery) ---------------
 
     def get_operators(self):
         """
         action=getOperators.
-        Response: {"Operator 1": "1", "Operator 2": "2", "Any": "any"}
+        Response: {"server-mw3": "server-mw3", ..., "SERVER-62": "server-62", ...}
+        (keys are display names, VALUES are the operator ids to send as operator=)
         """
         raw = self._request("getOperators")
         try:
@@ -229,7 +330,7 @@ class OtpSellClient(BaseOTPClient):
     def get_countries(self):
         """
         action=getCountries.
-        Response: {"1": "Ukraine", "91": "India", "21": "USA"}
+        Response: {"1": "USA", "91": "india", ...}
         """
         raw = self._request("getCountries")
         try:
@@ -240,7 +341,7 @@ class OtpSellClient(BaseOTPClient):
     def get_services(self):
         """
         action=getServices.
-        Response: {"wa": "WhatsApp", "tg": "Telegram", "ig": "Instagram"}
+        Response: {"meesho": "Meesho", "hp": "Meesho", ...}
         """
         raw = self._request("getServices")
         try:
