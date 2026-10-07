@@ -647,6 +647,28 @@ class CancelWatchManager:
         if expected is None:
             expected = record.get("expected_balance")
 
+        # A hold this provider still owns cannot be measured (an activation
+        # whose price is unknown), so the expected balance is a guess - the
+        # coordinator suspends the tally for exactly that reason. Comparing
+        # anyway is what produced "REFUND DID NOT TALLY" for numbers that were
+        # perfectly cancelled: re-baseline and let the record close instead.
+        suspended = getattr(self.owner, "tally_is_suspended", None)
+        if callable(suspended):
+            try:
+                if suspended(record.get("provider")):
+                    self._log(
+                        f"[DEFERRED-CANCEL] {number}: the refund tally is "
+                        f"suspended for {pname} (an activation's price is "
+                        f"unknown), so this cancel is not tallied - "
+                        f"re-baselining instead.",
+                        pname
+                    )
+                    self._settle_ledger(record, client, pname, consumed=False)
+                    self._close(record)
+                    return
+            except Exception:
+                pass
+
         refund_delay = float((getattr(self.owner, "settings", {}) or {}).get(
             "refund_check_delay_seconds", 2) or 0)
         if refund_delay > 0:

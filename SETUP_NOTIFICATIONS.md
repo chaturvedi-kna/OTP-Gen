@@ -197,6 +197,16 @@ quirks (both handled by the client, but they shape the config):
   operator and answers `BAD_STATUS` otherwise). `max_price` is mandatory for
   operators `6` and `9`.
 - `max_price` — optional price cap forwarded as `maxPrice`.
+- `price` — optional, the exact amount ONE number costs (e.g. `9`). The refund
+  tally books every number as holding this much money until it is cancelled or
+  consumed, so a cancel taken while other numbers are still open is not mistaken
+  for a missing refund. Without it the price is measured from the balance drop
+  at purchase time, which can fail (a balance read that errors, or the provider
+  refunding an expired number at the same instant); the price is then taken from
+  the last one measured, and if there is none the refund tally is suspended for
+  this provider until it resolves. Setting `price` removes that guessing
+  entirely — worth doing for any provider that charges a fixed rate. The same
+  key works for `otpindia`.
 - **Cancel window (~2 minutes, like OTPIndia)**: a cancel (`setStatus` status
   `8`) sent sooner than `cancel_wait_seconds` after `getNumber` is refused with
   `BAD_STATUS`; the client surfaces that as `ACCESS_CANCEL_WAIT` so the

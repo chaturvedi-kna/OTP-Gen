@@ -101,7 +101,7 @@ class MultiProvider(object):
     """Provider that keeps every order's price and refunds on cancel."""
 
     def __init__(self, name="otpsell", balance=460.0, price=PRICE,
-                 cancel_script=None, max_price=None):
+                 cancel_script=None, max_price=None, fail_first_balance=False):
         self.name = name
         self.price = price
         self.balance = balance
@@ -114,17 +114,30 @@ class MultiProvider(object):
         self.refunded = []
         self.no_refund = set()
         self._seq = [0]
+        # A balance read that fails once (a network blip right after a purchase)
+        # and a refund the provider makes on its own while we are buying.
+        self.fail_first_balance = fail_first_balance
+        self.balance_calls = 0
+        self.out_of_band_refund = 0.0
 
     def _next_id(self):
         self._seq[0] += 1
         return f"ORD-{self._seq[0]:04d}"
 
     def get_balance(self):
+        self.balance_calls += 1
+        if self.fail_first_balance and self.balance_calls == 1:
+            raise RuntimeError("balance temporarily unavailable")
         return self.balance
 
     def get_number(self, **kwargs):
         activation_id = self._next_id()
         self.balance = round(self.balance - self.price, 6)
+        if self.out_of_band_refund:
+            # The provider refunded an activation of its own (expiry, or a
+            # manual cancel in the panel) at the same moment.
+            self.balance = round(self.balance + self.out_of_band_refund, 6)
+            self.out_of_band_refund = 0.0
         self.orders[activation_id] = {"price": self.price, "open": True}
         return {"type": "ACCESS_NUMBER", "activation_id": activation_id,
                 "number": f"9{self._seq[0]:09d}"}
@@ -620,6 +633,142 @@ def scenario_other_provider_number_survives_a_tally_stop():
     coordinator.stop_requested.set()
 
 
+# ---------------------------------------------------------------------------
+# 7. an unmeasurable price must never turn into a false "did not tally"
+# ---------------------------------------------------------------------------
+
+def scenario_suspended_tally_never_stops_a_deferred_cancel():
+    """
+    The reported sequence.
+
+    The price of one number could not be measured, so the refund tally was
+    suspended - and then a perfectly good cancellation on that same provider was
+    still reported as "REFUND DID NOT TALLY", because the watcher compared
+    against a balance it had been told not to trust. The unknown hold is
+    invisible to the arithmetic, so the expected balance comes out too high by
+    exactly that number's price.
+    """
+    coordinator = build_coordinator(cancel_error_expiry_seconds=600,
+                                    cancel_error_poll_interval_seconds=1)
+    client = MultiProvider(fail_first_balance=True,
+                           cancel_script=[{"type": "ACCESS_CANCEL_WAIT",
+                                           "seconds": 1},
+                                          {"type": "ACCESS_CANCEL"}])
+    coordinator.clients = [client]
+    coordinator._note_balance("otpsell", 460.0)
+
+    # Number A: the balance read right after the purchase failed, so its price
+    # is unknown and the tally is suspended for OTPSell.
+    a = client.get_number()
+    coordinator._open_activation(client, a["activation_id"], a["number"])
+    check("suspended: the price is unknown",
+          coordinator._open_hold("otpsell") == (0.0, True),
+          coordinator._open_hold("otpsell"))
+    check("suspended: the refund tally is suspended",
+          coordinator._tally_is_suspended("otpsell"), coordinator._tally_suspended)
+    check("suspended: the alert says how to stop the guessing",
+          any("config.json" in msg for _t, msg in coordinator.alerts),
+          coordinator.alerts)
+
+    # Number B: a perfectly ordinary number, cancelled while A is still open.
+    b = client.get_number()
+    coordinator._open_activation(client, b["activation_id"], b["number"])
+    result = coordinator.handle_cancellation(
+        client, b["activation_id"], b["number"], "Duplicate target match")
+    check("suspended: B's cancel is deferred (window not passed)",
+          result.get("deferred") is True, result)
+
+    coordinator.pending_cancels.store.update(b["activation_id"],
+                                             expiry_at=time.time() - 1)
+    ok = wait_until(lambda: b["activation_id"] not in
+                    [r["activation_id"] for r in coordinator.pending_cancels.pending()],
+                    timeout=20)
+    check("suspended: the watcher still closes B", ok,
+          coordinator.pending_cancels.pending())
+    check("suspended: NO critical stop for a number that WAS cancelled",
+          not coordinator.stopped, coordinator.stopped)
+    check("suspended: B's money came back",
+          b["activation_id"] in client.refunded, client.refunded)
+    check("suspended: the run keeps going",
+          not coordinator.stop_requested.is_set(),
+          coordinator.stop_requested.is_set())
+    coordinator.stop_requested.set()
+
+
+def scenario_configured_price_removes_the_guessing():
+    """Setting "price" in config.json makes the hold exact and keeps the tally on."""
+    coordinator = build_coordinator(cancel_error_expiry_seconds=600,
+                                    cancel_error_poll_interval_seconds=1)
+    coordinator.config["otpsell"]["price"] = PRICE
+    client = MultiProvider(fail_first_balance=True,
+                           cancel_script=[{"type": "ACCESS_CANCEL_WAIT",
+                                           "seconds": 1},
+                                          {"type": "ACCESS_CANCEL"}])
+    coordinator.clients = [client]
+    coordinator._note_balance("otpsell", 460.0)
+
+    a = client.get_number()
+    price = coordinator._open_activation(client, a["activation_id"], a["number"])
+    check("configured price: the hold is exact despite the failed balance read",
+          price == PRICE and coordinator._open_hold("otpsell") == (PRICE, False),
+          (price, coordinator._open_hold("otpsell")))
+    check("configured price: the tally is NOT suspended",
+          not coordinator._tally_is_suspended("otpsell"),
+          coordinator._tally_suspended)
+
+    result = coordinator.handle_cancellation(
+        client, a["activation_id"], a["number"], "Already registered on Meesho")
+    check("configured price: the cancel is deferred", result.get("deferred") is True,
+          result)
+    coordinator.pending_cancels.store.update(a["activation_id"],
+                                             expiry_at=time.time() - 1)
+    ok = wait_until(lambda: a["activation_id"] not in
+                    [r["activation_id"] for r in coordinator.pending_cancels.pending()],
+                    timeout=20)
+    check("configured price: the watcher closes it", ok,
+          coordinator.pending_cancels.pending())
+    check("configured price: the refund really tallied (no suspension shortcut)",
+          not coordinator._tally_is_suspended("otpsell")
+          and not coordinator.stopped, coordinator.stopped)
+    coordinator.stop_requested.set()
+
+
+def scenario_out_of_band_refund_reanchors_the_ledger():
+    """A refund the provider makes on its own must not corrupt the price."""
+    coordinator = build_coordinator(cancel_error_expiry_seconds=600,
+                                    cancel_error_poll_interval_seconds=1)
+    coordinator.config["otpsell"]["price"] = PRICE
+    client = MultiProvider(cancel_script=[{"type": "ACCESS_CANCEL_WAIT",
+                                           "seconds": 1},
+                                          {"type": "ACCESS_CANCEL"}])
+    coordinator.clients = [client]
+    coordinator._note_balance("otpsell", 460.0)
+
+    # One number first, so a price is known.
+    warm = client.get_number()
+    coordinator._open_activation(client, warm["activation_id"], warm["number"])
+    check("out-of-band: the first price is measured",
+          coordinator._open_hold("otpsell") == (PRICE, False),
+          coordinator._open_hold("otpsell"))
+
+    # Now the provider refunds an expired activation of its own as we buy.
+    client.out_of_band_refund = 25.0
+    client.get_number()
+    price = coordinator._open_activation(
+        client, client.orders and list(client.orders)[-1], "")
+    check("out-of-band: the price is still exact (the ledger was re-anchored)",
+          price == PRICE, price)
+    check("out-of-band: the ledger tracks the real balance again",
+          abs(coordinator.ledger["otpsell"]["expected_balance"]
+              - client.get_balance() - PRICE) < 0.01,
+          f"base {coordinator.ledger['otpsell']['expected_balance']}, "
+          f"live {client.get_balance()}")
+    check("out-of-band: no suspension was needed",
+          not coordinator._tally_is_suspended("otpsell"),
+          coordinator._tally_suspended)
+    coordinator.stop_requested.set()
+
+
 def main():
     print("=" * 70)
     print("Refund tally vs. open activations")
@@ -630,6 +779,9 @@ def main():
         scenario_out_of_band_refund()
         scenario_real_missing_refund_still_stops()
         scenario_other_provider_number_survives_a_tally_stop()
+        scenario_suspended_tally_never_stops_a_deferred_cancel()
+        scenario_configured_price_removes_the_guessing()
+        scenario_out_of_band_refund_reanchors_the_ledger()
         scenario_stop_closes_open_numbers()
         scenario_stop_defers_a_refused_cancel()
         scenario_unmeasurable_price_suspends_tally()

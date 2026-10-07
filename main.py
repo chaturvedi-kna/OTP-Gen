@@ -363,6 +363,10 @@ class ParallelAutomationCoordinator:
         # suspended for that provider instead of guessing (see _suspend_tally).
         self.open_activations = {}
         self.open_activations_lock = threading.Lock()
+        # The last price measured (or configured) per provider, used when a
+        # fresh measurement is not possible.
+        self.known_prices = {}
+        self.price_lock = threading.Lock()
 
         # PRIMES bot flow state
         self.bot_at_number_prompt = False  # bot sitting on offer/number prompt after Change Number
@@ -478,14 +482,21 @@ class ParallelAutomationCoordinator:
 
     def _open_activation(self, client, activation_id, number=""):
         """
-        Record a freshly bought number as open and measure what it cost.
+        Record a freshly bought number as open and work out what it cost.
 
-        The price is the drop between the balance the ledger expected before
-        the purchase and the balance right after it. A drop that is not a
-        believable price (zero, negative, or above the configured max) means
-        something moved out-of-band meanwhile - an expiry refund, a manual
-        cancel in the provider panel - so the price stays unknown and the
-        refund tally is suspended for this provider rather than guessed.
+        The price is what the ledger uses as this activation's hold, so it has
+        to be trustworthy. It is resolved in this order:
+
+          1. MEASURED - the drop between the balance the ledger expected before
+             the purchase and the balance right after it. Ground truth, but it
+             races with refunds the provider makes on its own (expiry, a manual
+             cancel in the panel), which land in the same instant.
+          2. CONFIGURED - "price" in the provider's config.json block. Set it
+             and the measurement is never needed, so the race disappears.
+          3. REMEMBERED - the last price measured on this provider.
+
+        A price that is still unknown suspends the refund tally for that
+        provider instead of guessing at one.
         """
         name = client.name
         try:
@@ -501,16 +512,46 @@ class ParallelAutomationCoordinator:
         before = self._expected_balance(name, activation_id)
 
         price = None
+        source = None
         if balance is not None and before is not None:
             drop = round(float(before) - balance, 6)
+            if drop < 0:
+                # Money came back that we never cancelled: the provider refunded
+                # an activation on its own (expiry, or a manual cancel in the
+                # panel). The ledger was too high - re-anchor it on the real
+                # balance, otherwise every later measurement is off by it.
+                log(f"Balance rose by {-drop:.4f} while buying "
+                    f"{number or activation_id}: the provider refunded an "
+                    f"activation on its own. Re-anchoring the ledger.",
+                    prefix=name.upper())
+                self._rebaseline(name, balance)
+                before = balance
+                drop = 0.0
             cap = self._activation_price_cap(client)
             if 0 < drop <= cap:
-                price = drop
+                price, source = drop, "measured"
             else:
                 log(f"Balance moved by {drop:+.4f} while buying "
-                    f"{number or activation_id} (expected a price up to {cap:.2f}) - "
-                    f"treating its price as unknown and suspending the refund tally.",
+                    f"{number or activation_id} (expected a price up to {cap:.2f}).",
                     prefix=name.upper())
+
+        configured = self._configured_price(client)
+        if price is None and configured is not None:
+            price, source = configured, "configured"
+        if price is None:
+            remembered = self._remembered_price(name)
+            if remembered is not None:
+                price, source = remembered, "last known"
+        if price is not None and source != "measured":
+            log(f"Price of {number or activation_id} taken from the {source} "
+                f"price: {price:.4f}.", prefix=name.upper())
+        if (price is not None and configured is not None
+                and abs(price - configured) > 0.01):
+            log(f"Note: {name.upper()} charged {price:.4f} but config.json sets "
+                f"price={configured:.4f} - update it if this keeps happening.",
+                prefix=name.upper())
+        if price is not None:
+            self._remember_price(name, price)
 
         with self.open_activations_lock:
             self.open_activations.setdefault(name, {})[str(activation_id)] = {
@@ -520,9 +561,42 @@ class ParallelAutomationCoordinator:
         if price is None:
             self._suspend_tally(
                 name,
-                f"the price of {number or activation_id} could not be measured"
+                f"the price of {number or activation_id} could not be measured "
+                f"(set \"price\" in the {name} block of config.json to stop the "
+                f"guessing)"
             )
         return price
+
+    def _configured_price(self, client):
+        """The price one number costs, when the operator states it in config."""
+        conf = self._client_conf(client) or {}
+        for key in ("price", "activation_price", "number_price"):
+            try:
+                value = float(conf.get(key) or 0)
+            except (TypeError, ValueError):
+                value = 0.0
+            if value > 0:
+                return value
+        return None
+
+    def _remembered_price(self, name):
+        with self.price_lock:
+            return self.known_prices.get(name)
+
+    def _remember_price(self, name, price):
+        with self.price_lock:
+            self.known_prices[name] = float(price)
+
+    def _rebaseline(self, name, balance):
+        """
+        Re-anchor the ledger on a balance we have just read, keeping the money
+        that is still held by the provider's other activations accounted for.
+        """
+        if balance is None:
+            return
+        open_hold, _u1 = self._open_hold(name)
+        deferred_hold, _u2 = self.pending_cancels.hold_total(name)
+        self._note_balance(name, round(float(balance) + open_hold + deferred_hold, 6))
 
     def _activation_price_cap(self, client):
         """Plausible upper bound for one number's price on this provider."""
@@ -647,6 +721,10 @@ class ParallelAutomationCoordinator:
         deferred_hold, _u2 = self.pending_cancels.hold_total(name, exclude=exclude)
         self._note_balance(name, round(float(balance) + open_hold + deferred_hold, 6))
 
+    def _drain_rebaseline(self, name, balance):
+        """_rebaseline without an exclusion (used by the watcher hook)."""
+        return self._rebaseline(name, balance)
+
     def critical_stop(self, title, message, provider=None):
         return self._critical_stop(title, message, provider=provider)
 
@@ -679,6 +757,10 @@ class ParallelAutomationCoordinator:
     def _tally_is_suspended(self, name):
         with self._tally_suspension_lock:
             return name in self._tally_suspended
+
+    def tally_is_suspended(self, name):
+        """Is this provider's refund tally suspended? (hook for cancel_watch)"""
+        return self._tally_is_suspended(name)
 
     def _note_checker_failure(self):
         """Count one more consecutive failed check; returns the streak."""
@@ -1524,7 +1606,7 @@ class ParallelAutomationCoordinator:
                     # read at all - there is nothing to compare against yet.
                     try:
                         actual_balance = client.get_balance()
-                        self._note_balance(client.name, actual_balance)
+                        self._rebaseline(client.name, actual_balance)
                     except Exception:
                         actual_balance = None
                     log("Refund tally skipped (no trustworthy expected balance "
