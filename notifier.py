@@ -222,6 +222,7 @@ class TelegramBackend:
         self.accounts_callback = None
         self.milestone_callback = None
         self.notify_callback = None
+        self.disputes_callback = None
 
     @property
     def configured(self):
@@ -565,6 +566,19 @@ class TelegramBackend:
                         reply = f"❌ Notify command failed: {exc}"
                     self.send("Notifications", reply or "Notify command handled.")
                     continue
+                elif cmd == "disputes" and self.disputes_callback:
+                    # /disputes [n] - the newest provider-dispute evidence
+                    # records (refund mismatches, OTPs that arrived for a
+                    # cancel the provider refused); n = how many.
+                    parts = raw_text.split(None, 1)
+                    argument = parts[1].strip() if len(parts) > 1 else ""
+                    try:
+                        reply = self.disputes_callback(argument)
+                    except Exception as exc:
+                        reply = f"❌ Disputes command failed: {exc}"
+                    for chunk in self._chunks(reply or "No dispute records yet."):
+                        self.send("Dispute Evidence", chunk)
+                    continue
                 elif cmd == "start":
                     self.send(
                         "Meesho Automation Bot",
@@ -582,6 +596,8 @@ class TelegramBackend:
                         "/milestone remove to undo)\n"
                         "🔔 /notify all|normal|quiet - How much Telegram reports "
                         "(/notify to show)\n"
+                        "🧾 /disputes [n] - Provider dispute evidence "
+                        "(refund mismatches, OTPs after refused cancels)\n"
                         "🎁 /referral <link> - Save the Meesho referral link "
                         "(/referral off to clear, /referral to show)\n"
                         "🔎 /checker api|bot|auto - Number checker strategy "
@@ -703,12 +719,13 @@ class Notifier:
 
     def set_command_callbacks(self, status_cb=None, balance_cb=None, run_cb=None,
                               stop_cb=None, referral_cb=None, checker_cb=None,
-                              accounts_cb=None, milestone_cb=None, notify_cb=None):
+                              accounts_cb=None, milestone_cb=None, notify_cb=None,
+                              disputes_cb=None):
         """
         Attach callbacks for interactive Telegram commands (/status, /balance,
         /run [provider], /stop, /referral <link>, /checker <mode>, /accounts,
-        /milestone, /notify). Callbacks with an argument receive the text after
-        the command ("" when none).
+        /milestone, /notify, /disputes). Callbacks with an argument receive
+        the text after the command ("" when none).
         """
         self.telegram.status_callback = status_cb
         self.telegram.balance_callback = balance_cb
@@ -719,6 +736,7 @@ class Notifier:
         self.telegram.accounts_callback = accounts_cb
         self.telegram.milestone_callback = milestone_cb
         self.telegram.notify_callback = notify_cb
+        self.telegram.disputes_callback = disputes_cb
 
         # Telegram shows these from the slash-command/menu button, rather than
         # users needing to remember or discover commands from a help message.
@@ -734,6 +752,8 @@ class Notifier:
             commands.append(("milestone", "Mark accounts up to a number as used/shared"))
         if notify_cb:
             commands.append(("notify", "Telegram verbosity: all, normal or quiet"))
+        if disputes_cb:
+            commands.append(("disputes", "Provider dispute evidence (refund mismatches, refused-cancel OTPs)"))
         if referral_cb:
             commands.append(("referral", "View or set Meesho referral link"))
         if checker_cb:

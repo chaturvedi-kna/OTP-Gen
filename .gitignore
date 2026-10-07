@@ -19,6 +19,8 @@ state.*.tmp
 pending_cancels.json
 pending_cancels.*.json
 pending_cancels.*.tmp
+cancel_refused_otp.jsonl
+cancel_refused_otp.*.jsonl
 accounts.json
 accounts.*.json
 accounts.tmp

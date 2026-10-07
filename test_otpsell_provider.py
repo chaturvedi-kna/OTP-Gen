@@ -1252,6 +1252,60 @@ def test_ledger_open_hold_rows():
     ledger.close()
 
 
+def test_dispute_evidence_artifact():
+    """
+    A refund mismatch leaves SELF-CONTAINED dispute evidence on disk (JSONL)
+    - the mismatch plus the ledger picture at that moment - and /disputes
+    surfaces the newest records for a quick look on the phone.
+    """
+    reset_http()
+    coordinator = build_coordinator()
+    pname = "tempora"
+    coordinator._note_balance(pname, 100.0, source="seed")
+    coordinator._note_activation(pname, "disp-1", "9xdisp", hold=10.0)
+
+    entry = coordinator._append_dispute({
+        "type": "refund_mismatch",
+        "provider": pname,
+        "activation_id": "disp-1",
+        "number": "9xdisp",
+        "reason": "Already registered on Meesho",
+        "expected_balance": 100.0,
+        "actual_balance": 90.0,
+        "source": "immediate_cancel",
+    })
+    check("dispute: enriched with the ledger row, hold breakdown, observations",
+          (entry.get("ledger_activation") or {}).get("state") == "OPEN"
+          and (entry.get("ledger_activation") or {}).get("hold") == 10.0
+          and "in-flight holds 10.0000" in (entry.get("hold_breakdown") or "")
+          and len(entry.get("recent_balance_observations") or []) >= 1,
+          (entry.get("ledger_activation"), entry.get("hold_breakdown")))
+    path = coordinator.pending_cancels.disputes.path
+    check("dispute: the record is stamped and refers to the instance file",
+          entry.get("recorded_at") and entry.get("type") == "refund_mismatch",
+          entry)
+    check("dispute: evidence persisted on disk as JSONL",
+          os.path.exists(path) and "refund_mismatch" in open(path).read(),
+          path)
+
+    reply = coordinator.command_disputes("")
+    check("dispute: /disputes surfaces the newest record with its ledger line",
+          "refund_mismatch" in reply and "disp-1" in reply
+          and "in-flight holds" in reply, reply)
+    check("dispute: /disputes honours the count and caps junk input",
+          "refund_mismatch" in coordinator.command_disputes("1")
+          and "refund_mismatch" in coordinator.command_disputes("nope"),
+          "arg parsing")
+
+    coordinator2 = build_coordinator()
+    check("dispute: an empty log still answers cleanly",
+          "No dispute records yet" in coordinator2.command_disputes(""),
+          coordinator2.command_disputes(""))
+
+    coordinator.stop_requested.set()
+    coordinator2.stop_requested.set()
+
+
 def main():
     print("=" * 60)
     print("OTPSELL PROVIDER + SQLITE REFUND LEDGER CHECK")
@@ -1278,6 +1332,7 @@ def main():
     test_watcher_expected_rederived_while_buys_continue()
     test_otp_wait_survives_critical_stop()
     test_ledger_open_hold_rows()
+    test_dispute_evidence_artifact()
 
     os.chdir(REPO_DIR)
     print("=" * 60)

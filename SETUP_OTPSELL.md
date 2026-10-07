@@ -135,7 +135,24 @@ frozen number. The fix set on top of the SQLite ledger:
   breakdown (baseline, pending-cancel holds, in-flight holds) so a real
   dispute has its numbers attached, and `/balance` shows both hold kinds.
 
-### Worked example (each number costs 10, balance starts at 100)
+### Dispute evidence (for the provider team)
+
+Whenever money does not come back the way it should, a self-contained
+evidence record is appended to the per-instance dispute log
+(`cancel_refused_otp.<instance>.jsonl` in the run directory) — one JSON
+object per line:
+
+* `refund_mismatch` - a cancelled number's refund never arrived. The record
+  carries the order id, number, reason, expected vs. actual balance, the
+  ledger row for that activation, the hold breakdown, and the last balance
+  observations, so it stands alone when you raise it with OTPSell.
+* `otp_after_cancel_refused` - the provider refused the cancel *and* the
+  SMS arrived anyway (kept since the OTPIndia days).
+
+Every critical-stop alert names the file; on Telegram `/disputes [n]`
+shows the newest n records (default 5) with their ledger lines. Hand the
+matching JSON line (plus a panel screenshot) to the provider - the numbers
+inside are identical to what the bookkeeper used.
 
 A is bought (balance 90) and sits in its cancel window. Meanwhile B, C, D are
 bought (balance 60). When A's window ends and its cancel lands, the refund

@@ -774,6 +774,23 @@ class CancelWatchManager:
                 breakdown = f"\nLedger at stop: {hb(record.get('provider'))}."
             except Exception:
                 breakdown = ""
+        # Self-contained evidence for a provider dispute (same JSONL dispute
+        # log the refused-cancel OTP salvage records land in).
+        dappend = getattr(self.owner, "_append_dispute", None)
+        if callable(dappend):
+            with contextlib.suppress(Exception):
+                dappend({
+                    "type": "refund_mismatch",
+                    "provider": record.get("provider"),
+                    "activation_id": activation_id,
+                    "number": number,
+                    "reason": record.get("reason"),
+                    "expected_balance": expected,
+                    "actual_balance": actual,
+                    "deferred_at": record.get("deferred_at"),
+                    "last_cancel_answer": res_type,
+                    "source": "deferred_cancel_watch",
+                })
         message = (
             f"`{number}` (activation {activation_id}, {record.get('reason')})\n"
             f"Expected ~{expected}, actual {actual}; last cancel answer {res_type}{waited}.\n"
@@ -781,7 +798,8 @@ class CancelWatchManager:
             f"meanwhile are accounted), so this one looks real.\n"
             f"Deferred cancel retried and the refund still did not tally - verify "
             f"this activation in the provider panel before buying more numbers."
-            f"{breakdown}"
+            f"{breakdown}\n"
+            f"Dispute evidence appended to {self.disputes.path} (JSONL; /disputes to view)."
         )
         if callable(critical):
             critical(f"[{pname}] REFUND DID NOT TALLY (deferred cancel)", message)

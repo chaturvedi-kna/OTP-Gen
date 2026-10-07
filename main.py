@@ -423,6 +423,7 @@ class ParallelAutomationCoordinator:
             accounts_cb=self.command_accounts,
             milestone_cb=self.command_milestone,
             notify_cb=self.command_notify_level,
+            disputes_cb=self.command_disputes,
         )
 
     # -- Ledger helpers ------------------------------------------------------
@@ -550,6 +551,81 @@ class ParallelAutomationCoordinator:
             return self.refund_ledger.expected(name, holds_excluded=hold)
         except Exception:
             return None
+
+    def _append_dispute(self, entry):
+        """
+        Persist self-contained provider-dispute evidence: the dispute itself
+        plus the ledger context at that moment (the activation row, the hold
+        breakdown, and the recent balance observations), so the record alone
+        is enough to raise the case with the provider team.
+        """
+        try:
+            entry = dict(entry or {})
+        except Exception:
+            entry = {}
+        provider = entry.get("provider")
+        if provider is not None:
+            try:
+                row = self.refund_ledger.activation(provider, entry.get("activation_id"))
+                if row is not None:
+                    entry["ledger_activation"] = row
+            except Exception:
+                pass
+            try:
+                entry["hold_breakdown"] = self.hold_breakdown(provider)
+            except Exception:
+                pass
+            try:
+                entry["recent_balance_observations"] = \
+                    self.refund_ledger.recent_observations(provider, limit=12)
+            except Exception:
+                pass
+        try:
+            return self.pending_cancels.disputes.append(entry)
+        except Exception:
+            return entry
+
+    def command_disputes(self, argument):
+        """
+        /disputes [n] - the newest provider-dispute evidence records (refund
+        mismatches, OTPs that arrived for a cancel the provider refused),
+        newest first; n = how many (default 5, capped at 20).
+        """
+        try:
+            limit = int(str(argument).strip())
+        except (TypeError, ValueError):
+            limit = 5
+        limit = max(1, min(20, limit))
+        try:
+            path = self.pending_cancels.disputes.path
+            records = self.pending_cancels.disputes.records()
+        except Exception:
+            path, records = "?", []
+        if not records:
+            return f"No dispute records yet (file: {path})."
+        lines = [f"🧾 Dispute evidence ({len(records)} total; file: {path}):"]
+        for entry in records[-limit:][::-1]:
+            try:
+                when = str(entry.get("recorded_at", "?"))[:19].replace("T", " ")
+                kind = entry.get("type", "?")
+                num = entry.get("number", "?")
+                aid = entry.get("activation_id", "?")
+                parts = [f"• {when} - {kind}: `{num}` ({aid})"]
+                if kind == "refund_mismatch":
+                    parts.append(
+                        f"  expected ~{entry.get('expected_balance')}, "
+                        f"actual {entry.get('actual_balance')}"
+                    )
+                    breakdown = entry.get("hold_breakdown")
+                    if breakdown:
+                        parts.append(f"  ledger: {breakdown}")
+                code = entry.get("otp_code") or entry.get("salvaged_otp")
+                if code:
+                    parts.append(f"  OTP: `{code}`")
+                lines.append("\n".join(parts))
+            except Exception:
+                continue
+        return "\n".join(lines)
 
     def hold_breakdown(self, name):
         """One diagnostic line for mismatch alerts (/balance debug output)."""
@@ -1463,6 +1539,21 @@ class ParallelAutomationCoordinator:
                     self._note_balance(client.name, actual_balance)
                 elif expected_balance is not None and not tally_ok:
                     self.stats.increment("refunds_missing")
+                    # Self-contained evidence for a provider dispute: the
+                    # mismatch plus the ledger picture at this moment.
+                    self._append_dispute({
+                        "type": "refund_mismatch",
+                        "provider": client.name,
+                        "activation_id": activation_id,
+                        "number": number,
+                        "reason": reason,
+                        "expected_balance": expected_balance,
+                        "actual_balance": actual_balance,
+                        "salvaged_otp": (salvaged or {}).get("code"),
+                        "cancel_res": cancel_res,
+                        "source": "immediate_cancel",
+                    })
+                    dispute_path = self.pending_cancels.disputes.path
                     salvage_note = (
                         f"\nLate OTP code: `{salvaged.get('code')}`" if salvaged else
                         "\nNo OTP was seen - check the provider panel for this activation."
@@ -1475,7 +1566,8 @@ class ParallelAutomationCoordinator:
                         f"Reason for cancel: {reason}{salvage_note}\n\n"
                         "No new numbers will be purchased until you verify this activation "
                         "in the provider panel. The PRIMES bot was left on its OTP "
-                        "screen - if the OTP shows up, enter it manually."
+                        "screen - if the OTP shows up, enter it manually.\n"
+                        f"Dispute evidence appended to {dispute_path} (JSONL; /disputes to view)."
                     )
 
         result = {"tally_ok": bool(tally_ok), "salvaged": salvaged, "balance": actual_balance}
