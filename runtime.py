@@ -49,6 +49,7 @@ DEFAULT_STATE_FILE = "state.json"
 DEFAULT_PENDING_FILE = "pending_cancels.json"
 DEFAULT_DISPUTE_FILE = "cancel_refused_otp.jsonl"
 DEFAULT_ACCOUNTS_FILE = "accounts.json"
+DEFAULT_LEDGER_FILE = "refund_ledger.db"
 DEFAULT_SIGNAL_DIR = ".signals"
 
 # An instance name becomes part of a file name, so keep it boring.
@@ -129,6 +130,11 @@ def dispute_filename(instance=None):
 def accounts_filename(instance=None):
     """Linked-account ledger + milestones (accounts.<instance>.json)."""
     return namespaced_name(DEFAULT_ACCOUNTS_FILE, instance)
+
+
+def ledger_filename(instance=None):
+    """SQLite refund ledger (refund_ledger.<instance>.db) - see refund_ledger.py."""
+    return namespaced_name(DEFAULT_LEDGER_FILE, instance)
 
 
 def signal_dirname(instance):

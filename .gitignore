@@ -23,6 +23,11 @@ accounts.json
 accounts.*.json
 accounts.tmp
 accounts.*.tmp
+refund_ledger.db
+refund_ledger.*.db
+refund_ledger*.db-shm
+refund_ledger*.db-wal
+refund_ledger*.db-journal
 .signals/
 .signals-*/
 .venv/

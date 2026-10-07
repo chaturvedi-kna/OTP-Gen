@@ -47,6 +47,11 @@ from base_otp import (
 class OtpIndiaClient(BaseOTPClient):
     """handler_api compliant client for otpindia.org."""
 
+    # Capability flag (coordinator): cancels before the cancel window are
+    # routine - defer quietly, retry when the window passes; NO_BALANCE with
+    # pending window cancels is back-pressure, not a stop signal.
+    has_cancel_window = True
+
     def __init__(
         self,
         base_url="https://otpindia.org/api/stubs/handler_api.php",

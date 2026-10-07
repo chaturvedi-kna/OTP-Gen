@@ -51,6 +51,23 @@
     "cancel_wait_seconds": 120,
     "max_attempts": 500
   },
+  "otpsell": {
+    "enabled": true,
+    "base_url": "https://otpsell.com/stubs/handler_api.php",
+    "api_key": "EabV2x0Wch3Wblc4QX3TIGGS3dWQbmSS",
+    "service": "wa",
+    "country": "91",
+    "operator": "any",
+    "max_price": null,
+    "cancel_wait_seconds": {
+      "default": 120,
+      "any": 120,
+      "1": 120,
+      "2": 60
+    },
+    "min_request_interval_seconds": 0.25,
+    "max_attempts": 1000
+  },
   "checker": {
     "mode": "auto",
     "base_url": "https://tubesave.in",

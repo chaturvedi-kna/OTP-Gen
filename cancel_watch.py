@@ -61,6 +61,13 @@ CANCEL_SUCCESS_TYPES = {
     "STATUS_CANCEL",
 }
 
+# Providers whose pre-expiry cancel refusals are ROUTINE: their operators hold
+# the number (and its money) for a documented cancel window after issue -
+# OTPIndia's cancel_wait_seconds, OTPSell's per-operator cancel_wait_seconds
+# (see otpsell_client.py). Their deferred cancels log and retry quietly
+# instead of alerting the user on every number.
+ROUTINE_WINDOW_PROVIDERS = {"OTPINDIA", "OTPSELL"}
+
 # Answers that mean "not yet, try later": the wait is resumed, not abandoned.
 # ACCESS_CANCEL_WAIT is OTPIndia-specific: the cancel only becomes legal
 # `cancel_wait_seconds` (default 120) after the number was issued.
@@ -539,7 +546,7 @@ class CancelWatchManager:
 
     def _notify_resumed(self, record, pname):
         notify = getattr(self.owner, "notify", None)
-        if notify is None or pname == "OTPINDIA":
+        if notify is None or pname in ROUTINE_WINDOW_PROVIDERS:
             return
         try:
             notify.alert(
@@ -568,6 +575,10 @@ class CancelWatchManager:
             except Exception:
                 pass
 
+        try:
+            record["outcome"] = "CONSUMED"
+        except Exception:
+            pass
         self._log(
             f"🚨 [DEFERRED-CANCEL] {number}: OTP {code} arrived while the cancel "
             f"was pending - charge stands, no retry.",
@@ -608,10 +619,13 @@ class CancelWatchManager:
         except Exception:
             pass
 
-        # The money for this activation is spent: the live balance is the
-        # baseline for everything that follows.
-        self._settle_ledger(record, client, pname, consumed=True)
+        # The money for this activation is spent: close the record FIRST, so
+        # the ledger settle below no longer counts its hold as open - the
+        # at-rest baseline it writes (balance + still-open holds) is then
+        # correct instead of double-deducting this activation later.
         self._close(record)
+        # The live balance is the baseline for everything that follows.
+        self._settle_ledger(record, client, pname, consumed=True)
 
     def _close(self, record):
         """
@@ -620,9 +634,16 @@ class CancelWatchManager:
         The record leaves the store BEFORE the coordinator hook runs: the hook
         re-reads the store (remaining holds; a worker out of balance waits for
         the first pending record to disappear), so it must already reflect
-        that this activation is closed.
+        that this activation is closed. The audit hook runs first (while the
+        record, with its hold and outcome, still exists).
         """
         activation_id = str(record["activation_id"])
+        closing = getattr(self.owner, "on_pending_closing", None)
+        if callable(closing):
+            try:
+                closing(record)
+            except Exception:
+                pass
         self.store.remove(activation_id)
         with self._lock:
             self._threads.pop(activation_id, None)
@@ -678,7 +699,7 @@ class CancelWatchManager:
                 f"[DEFERRED-CANCEL] {number}: cancelled, refund tallied ({res_type}).",
                 pname
             )
-            if notify is not None and pname != "OTPINDIA":
+            if notify is not None and pname not in ROUTINE_WINDOW_PROVIDERS:
                 try:
                     notify.send(
                         f"✅ [{pname}] Deferred cancel completed",
@@ -687,8 +708,17 @@ class CancelWatchManager:
                     )
                 except Exception:
                     pass
-            self._settle_ledger(record, client, pname, consumed=False)
+            try:
+                record["outcome"] = "REFUNDED"
+            except Exception:
+                pass
+            # Close BEFORE settling the ledger: once the record is gone its
+            # hold no longer counts as open, so the at-rest baseline the
+            # settle writes (balance + still-open holds) does not
+            # double-count this refund - the parallel-buying race the SQLite
+            # refund ledger exists to fix.
             self._close(record)
+            self._settle_ledger(record, client, pname, consumed=False)
             return
 
         # Not refunded - a real discrepancy now, not a timing accident.

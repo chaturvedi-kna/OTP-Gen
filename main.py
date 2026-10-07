@@ -57,9 +57,11 @@ from checker_router import (
 from state import StateStore
 from stats import StatsStore
 from balance_guard import BalanceGuard
+from refund_ledger import RefundLedger
 from runtime import (
     accounts_filename,
     apply_instance_overrides,
+    ledger_filename,
     pending_filename,
     resolve_instance,
     state_filename,
@@ -338,8 +340,18 @@ class ParallelAutomationCoordinator:
         self.attempts_lock = threading.Lock()
         self.is_running = False
 
-        # Per-provider balance ledger (expected balance after refund, etc.)
-        self.ledger = {}
+        # Per-provider balance ledger (expected balance after refund, etc.).
+        # Backed by SQLite (refund_ledger.py): the baseline and the holds that
+        # were open when it was observed are written in ONE transaction, so
+        # fast parallel buying can no longer interleave a raw balance note
+        # with outstanding holds (the OTPIndia refund-tally race - see
+        # refund_ledger.py). It also survives restarts mid-queue.
+        self.refund_ledger = RefundLedger(
+            filename=ledger_filename(self.instance), log_fn=log
+        )
+        # Display-only activation metadata (last number handled per provider);
+        # the refund bookkeeping itself lives in refund_ledger.
+        self.ledger_meta = {}
         self.ledger_lock = threading.Lock()
 
         # PRIMES bot flow state
@@ -409,45 +421,89 @@ class ParallelAutomationCoordinator:
         )
 
     # -- Ledger helpers ------------------------------------------------------
+    #
+    # The refund tally is only as good as the baseline it is measured against.
+    # A live balance B read while deferred cancels still hold amounts H means
+    # the at-rest balance is B + H - so every note/derive below keeps the two
+    # together (atomically, in refund_ledger) instead of storing the raw read
+    # and deducting the same holds twice at tally time. See refund_ledger.py.
 
     def _ledger(self, name):
+        """Ledger view for one provider (backwards-compatible dict shape)."""
+        row = None
+        try:
+            row = self.refund_ledger.baseline(name)
+        except Exception:
+            row = None
+        entry = {
+            "expected_balance": row["baseline"] if row else None,
+            "baseline_holds": row["holds"] if row else 0.0,
+            "holds_unknown": row["holds_unknown"] if row else False,
+            "activation_id": None,
+            "number": None,
+        }
         with self.ledger_lock:
-            return self.ledger.setdefault(name, {
-                "expected_balance": None,
-                "activation_id": None,
-                "number": None,
-            })
+            meta = self.ledger_meta.get(name, {})
+        entry["activation_id"] = meta.get("activation_id")
+        entry["number"] = meta.get("number")
+        return entry
 
-    def _note_balance(self, name, balance):
+    def _note_balance(self, name, balance, source=""):
+        """
+        Record a provider balance observation together with the holds that
+        were open when it was taken (the at-rest balance is their sum). Both
+        land in the ledger in one transaction, so a watcher settling a refund
+        cannot interleave with the worker's own note.
+        """
         if balance is None:
             return
-        with self.ledger_lock:
-            entry = self.ledger.setdefault(name, {})
-            entry["expected_balance"] = float(balance)
+        try:
+            balance = float(balance)
+        except (TypeError, ValueError):
+            return
+        try:
+            holds, unknown = self.pending_cancels.hold_total(name)
+        except Exception:
+            holds, unknown = 0.0, False
+        self.refund_ledger.note_balance(
+            name, balance, source=source, holds=holds, holds_unknown=unknown
+        )
 
-    def _note_activation(self, name, activation_id, number):
+    def _note_activation(self, name, activation_id, number, operator=None):
         with self.ledger_lock:
-            entry = self.ledger.setdefault(name, {"expected_balance": None})
-            entry["activation_id"] = activation_id
-            entry["number"] = number
+            self.ledger_meta.setdefault(name, {})
+            self.ledger_meta[name]["activation_id"] = activation_id
+            self.ledger_meta[name]["number"] = number
+        try:
+            self.refund_ledger.record_purchase(
+                name, activation_id, number=number, operator=operator
+            )
+        except Exception:
+            pass
 
     def _expected_balance(self, name, activation_id):
         """
         The balance this provider should be back at once the activation is
-        refunded - minus the money still held by deferred cancellations.
+        refunded - minus the money still held by OTHER deferred cancellations.
 
-        Without the deduction, a number bought while a refused cancel is still
-        waiting for expiry would always look like a refund mismatch (the
-        deferred activation's price is still missing from the balance), which
-        critical-stopped the run over a timing problem.
+        Derived from the stored (baseline, baseline_holds) pair:
+
+            baseline + baseline_holds       <- at-rest balance
+              - holds_open_now(exclude X)   <- money others still wait for
+
+        Without the hold deduction, a number bought while a refused cancel is
+        still waiting for expiry would always look like a refund mismatch
+        (the deferred activation's price is still missing from the balance),
+        which critical-stopped the run over a timing problem. Without the
+        baseline_holds add-back, a baseline refreshed while holds were open
+        (fast parallel buying) understated every later tally by the held
+        amounts - and a refund that never arrived passed unnoticed.
         """
-        with self.ledger_lock:
-            entry = self.ledger.get(name, {})
-            base = entry.get("expected_balance")
-        if base is None:
-            return None
         hold, _unknown = self.pending_cancels.hold_total(name, exclude=activation_id)
-        return base - hold
+        try:
+            return self.refund_ledger.expected(name, holds_excluded=hold)
+        except Exception:
+            return None
 
     # -- hooks for the deferred-cancellation watcher (cancel_watch.py) -------
 
@@ -539,7 +595,16 @@ class ParallelAutomationCoordinator:
             seen.add(client.name)
             try:
                 bal = client.get_balance()
-                lines.append(f"• {client.name.upper()}: {bal:.4f}")
+                line = f"• {client.name.upper()}: {bal:.4f}"
+                try:
+                    hold, unknown = self.pending_cancels.hold_total(client.name)
+                    if hold > 0 or unknown:
+                        line += (f"  (held by pending cancels: {hold:.4f}"
+                                 f"{' + unknown' if unknown else ''}; "
+                                 f"at rest after refunds: {bal + hold:.4f})")
+                except Exception:
+                    pass
+                lines.append(line)
             except Exception as exc:
                 lines.append(f"• {client.name.upper()}: Error ({exc})")
         return "\n".join(lines)
@@ -1020,10 +1085,23 @@ class ParallelAutomationCoordinator:
         self.stop_requested.set()
         log("Stop requested via command.")
 
-    def _wait_for_pending_otpindia_refunds(self, client):
-        """Wait quietly until ONE of OTPIndia's pending cancels has refunded.
+    @staticmethod
+    def _has_cancel_window(client):
+        """
+        Provider with a routine post-purchase cancel window (OTPIndia's
+        cancel_wait_seconds, OTPSell's per-operator windows). Their cancels
+        are routinely deferred and matured in the background, so NO_BALANCE
+        while any of them is pending is back-pressure, not a stop signal, and
+        their deferrals are not alert-worthy.
+        """
+        return (getattr(client, "name", "") == "otpindia") or bool(
+            getattr(client, "has_cancel_window", False))
 
-        OTPIndia holds the purchase amount until its two-minute cancel window
+    def _wait_for_pending_otpindia_refunds(self, client):
+        """Wait quietly until ONE of the window provider's pending cancels has
+        refunded (OTPIndia; OTPSell with its per-operator windows).
+
+        A window provider holds the purchase amount until its cancel window
         elapses. If the worker has used the available balance while one or more
         routine cancels are pending, NO_BALANCE is a temporary back-pressure
         signal, not a reason to stop the provider worker.
@@ -1041,7 +1119,7 @@ class ParallelAutomationCoordinator:
         nothing pending to wait for.
         """
         provider = getattr(client, "name", "")
-        if provider != "otpindia":
+        if not self._has_cancel_window(client):
             return False
 
         def provider_pending():
@@ -1400,6 +1478,13 @@ class ParallelAutomationCoordinator:
             client, activation_id, number, reason, expected_balance,
             hold=hold, error_detail=detail, retry_after_seconds=retry_after,
         )
+        try:
+            self.refund_ledger.mark_deferred(
+                client.name, activation_id, hold=hold,
+                hold_unknown=hold is None, reason=reason
+            )
+        except Exception:
+            pass
 
         if hold is None:
             self._suspend_tally(
@@ -1424,10 +1509,11 @@ class ParallelAutomationCoordinator:
         except (TypeError, ValueError):
             retry_in = 0.0
         retry_note = "cancel window" if retry_after is not None else "activation expiry"
-        # OTPIndia's ACCESS_CANCEL_WAIT is its documented, routine two-minute
-        # window. Keep it in logs/status, but don't alert the user for each
-        # expected cancellation.
-        if client.name != "otpindia":
+        # A window provider's ACCESS_CANCEL_WAIT is its documented, routine
+        # window (OTPIndia's two minutes; OTPSell's per-operator windows).
+        # Keep it in logs/status, but don't alert the user for each expected
+        # cancellation.
+        if not self._has_cancel_window(client):
             self.notify.send(
                 f"⏳ [{pname}] Cancel refused - deferred",
                 f"`{number}` ({reason}): provider said `{detail or 'ERROR'}`; "
@@ -1443,6 +1529,22 @@ class ParallelAutomationCoordinator:
             "balance": balance,
             "record": record,
         }
+
+    def on_pending_closing(self, record):
+        """
+        A deferred cancellation is leaving the pending store: close its audit
+        row in the refund ledger while the record (hold, number) still exists.
+        """
+        try:
+            record = record or {}
+            outcome = "REFUNDED"
+            if str(record.get("outcome") or "").strip():
+                outcome = str(record["outcome"]).upper()
+            self.refund_ledger.mark_resolved(
+                record.get("provider"), record.get("activation_id"), outcome=outcome
+            )
+        except Exception:
+            pass
 
     def on_pending_resolved(self, provider):
         """A deferred cancellation finished: refresh the ledger bookkeeping."""
@@ -1563,6 +1665,14 @@ class ParallelAutomationCoordinator:
                         service=india_conf.get("service"),
                         server=india_conf.get("server")
                     )
+                elif client.name == "otpsell":
+                    sell_conf = self.config.get("otpsell", {})
+                    res = client.get_number(
+                        service=sell_conf.get("service"),
+                        country=sell_conf.get("country"),
+                        operator=sell_conf.get("operator"),
+                        max_price=sell_conf.get("max_price")
+                    )
                 else:
                     otp_conf = self.config.get("otp", {})
                     res = client.get_number(
@@ -1668,7 +1778,8 @@ class ParallelAutomationCoordinator:
             activation_id = res["activation_id"]
             raw_number = res["number"]
             clean_number = CheckerClient.format_number(raw_number)
-            self._note_activation(client.name, activation_id, clean_number)
+            self._note_activation(client.name, activation_id, clean_number,
+                                  operator=res.get("operator"))
 
             context = NumberContext(
                 client=client,
@@ -3486,7 +3597,7 @@ def set_checker_mode(config_path, mode):
 def main():
     parser = argparse.ArgumentParser(description="Meesho OTP automation with parallel provider clients.")
     parser.add_argument("--provider",
-                        help="Provider(s): tempora, vsimpro, otpdoctor, otpcart, otpindia, "
+                        help="Provider(s): tempora, vsimpro, otpdoctor, otpcart, otpindia, otpsell, "
                              "'all', or comma-combinations e.g. 'tempora,vsimpro'")
     parser.add_argument("--instance",
                         help="Name of this run, for parallel copies (e.g. one Termux tab per provider). "

@@ -77,7 +77,7 @@ You can interact with the running tool via Telegram anytime:
 - **`/status`**: Checks whether the tool is RUNNING or IDLE, global attempts, active target number, and provider balances.
 - **`/run`**: Starts searching for fresh numbers from Telegram if the script was stopped or idle (uses `active_otp_provider` from `config.json`).
 - **`/run <provider>`**: Starts **only that provider** for this run — e.g. `/run vsimpro`, `/run otpindia`, `/run tempora,vsimpro` or `/run all`. Unknown names and providers without credentials are rejected with an explanation. The choice applies to this run only; the next bare `/run` returns to `active_otp_provider`. (`/status` shows the current run selection while it differs from Mode.)
-- **`/balance`**: Retrieves live balances for every configured provider (TemporaSMS, VSImpro, OtpDoctor, OTPCart, OTPIndia).
+- **`/balance`**: Retrieves live balances for every configured provider (TemporaSMS, VSImpro, OtpDoctor, OTPCart, OTPIndia, OTPSell), including money currently held by pending cancels and the at-rest balance.
 - **`/stop`**: Gracefully stops the active search.
 - **`/referral <link>`**: Saves/updates the Meesho referral link (`/referral off` clears it, `/referral` shows it).
 - **`/checker api|bot|auto`**: Shows or switches the number-checker strategy (API only / PRIMES bot only / API first with the bot as fallback). See `SETUP_CHECKER.md`.
@@ -142,6 +142,11 @@ Every provider lives in its own `config.json` block and is picked up by
   window has passed. Keep it at the provider's 2 minutes unless they change it.
 - Rate limit is 900 requests/minute — the defaults are far below it.
 - CLI: `python main.py --provider otpindia` (also accepts the alias `india`).
+
+**OTPSell** (`otpsell.com`) is supported the same way (`/run otpsell`, alias
+`sell`), with per-operator cancel windows and operator rotation pools — see
+[SETUP_OTPSELL.md](SETUP_OTPSELL.md), which also explains the SQLite refund
+ledger that keeps refund tallies exact under fast parallel buying.
 
 How the cancel window shapes an OTPIndia run:
 
