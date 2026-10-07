@@ -736,10 +736,13 @@ class CancelWatchManager:
         Re-baseline the provider ledger once a deferred activation is closed.
 
         The hold is gone (refunded or legitimately spent), so the live balance
-        becomes the expected balance for the next number.
+        becomes the expected balance for the next number - plus whatever the
+        provider's other activations still hold (settle_balance adds it back),
+        so the baseline does not drift downwards with every settle.
         """
+        settle = getattr(self.owner, "settle_balance", None)
         note = getattr(self.owner, "note_balance", None)
-        if not callable(note):
+        if not callable(settle) and not callable(note):
             return
         try:
             balance = client.get_balance()
@@ -747,6 +750,10 @@ class CancelWatchManager:
             self._log(f"[DEFERRED-CANCEL] Balance fetch failed: {exc}", pname)
             return
         try:
-            note(record.get("provider"), balance)
+            if callable(settle):
+                settle(record.get("provider"), balance,
+                       exclude=str(record.get("activation_id")))
+            else:
+                note(record.get("provider"), balance)
         except Exception:
             pass

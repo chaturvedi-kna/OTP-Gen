@@ -73,6 +73,7 @@ from accounts import (
 )
 from cancel_watch import (
     CANCEL_RETRY_TYPES,
+    CANCEL_SUCCESS_TYPES,
     CancelWatchManager,
     PendingCancelStore,
     resolve_settings as resolve_cancel_settings,
@@ -342,6 +343,18 @@ class ParallelAutomationCoordinator:
         self.ledger = {}
         self.ledger_lock = threading.Lock()
 
+        # Numbers that are paid for and NOT closed yet (bought, still being
+        # checked / waiting for the OTP / waiting for the cancel window).
+        # Their price is missing from the live balance, so a refund tally must
+        # subtract it: without this, a cancel taken while another number is
+        # still open always looks like a missing refund and critical-stops the
+        # run over money that is simply still in use.
+        #   {provider: {activation_id: {"price": float|None, "number": str}}}
+        # A price of None means it could not be measured - the tally is then
+        # suspended for that provider instead of guessing (see _suspend_tally).
+        self.open_activations = {}
+        self.open_activations_lock = threading.Lock()
+
         # PRIMES bot flow state
         self.bot_at_number_prompt = False  # bot sitting on offer/number prompt after Change Number
         self.bot_change_attempts = 0
@@ -434,12 +447,14 @@ class ParallelAutomationCoordinator:
     def _expected_balance(self, name, activation_id):
         """
         The balance this provider should be back at once the activation is
-        refunded - minus the money still held by deferred cancellations.
+        refunded - minus the money still held by deferred cancellations AND by
+        numbers that are still open (bought, not closed yet).
 
-        Without the deduction, a number bought while a refused cancel is still
-        waiting for expiry would always look like a refund mismatch (the
-        deferred activation's price is still missing from the balance), which
-        critical-stopped the run over a timing problem.
+        Without the open-activation deduction, a number bought while a refused
+        cancel is still waiting for expiry would always look like a refund
+        mismatch (that number's price is still missing from the balance), which
+        critical-stopped the run over a timing problem. Without the deferred
+        deduction the same is true of the activation whose cancel was refused.
         """
         with self.ledger_lock:
             entry = self.ledger.get(name, {})
@@ -447,7 +462,114 @@ class ParallelAutomationCoordinator:
         if base is None:
             return None
         hold, _unknown = self.pending_cancels.hold_total(name, exclude=activation_id)
-        return base - hold
+        open_hold, _open_unknown = self._open_hold(name, exclude=activation_id)
+        return base - hold - open_hold
+
+    # -- open activations (paid for, not closed yet) -------------------------
+
+    def _open_activation(self, client, activation_id, number=""):
+        """
+        Record a freshly bought number as open and measure what it cost.
+
+        The price is the drop between the balance the ledger expected before
+        the purchase and the balance right after it. A drop that is not a
+        believable price (zero, negative, or above the configured max) means
+        something moved out-of-band meanwhile - an expiry refund, a manual
+        cancel in the provider panel - so the price stays unknown and the
+        refund tally is suspended for this provider rather than guessed.
+        """
+        name = client.name
+        try:
+            balance = float(client.get_balance())
+        except Exception as exc:
+            log(f"Could not read the balance after buying {number or activation_id}: {exc}",
+                prefix=name.upper())
+            balance = None
+
+        # The balance this provider should be at RIGHT NOW (baseline minus the
+        # money the other open/deferred activations still hold) - that is what
+        # the new number's price is measured against.
+        before = self._expected_balance(name, activation_id)
+
+        price = None
+        if balance is not None and before is not None:
+            drop = round(float(before) - balance, 6)
+            cap = self._activation_price_cap(client)
+            if 0 < drop <= cap:
+                price = drop
+            else:
+                log(f"Balance moved by {drop:+.4f} while buying "
+                    f"{number or activation_id} (expected a price up to {cap:.2f}) - "
+                    f"treating its price as unknown and suspending the refund tally.",
+                    prefix=name.upper())
+
+        with self.open_activations_lock:
+            self.open_activations.setdefault(name, {})[str(activation_id)] = {
+                "price": price,
+                "number": number,
+            }
+        if price is None:
+            self._suspend_tally(
+                name,
+                f"the price of {number or activation_id} could not be measured"
+            )
+        return price
+
+    def _activation_price_cap(self, client):
+        """Plausible upper bound for one number's price on this provider."""
+        conf = self._client_conf(client) or {}
+        for key in ("max_price", "price_cap"):
+            try:
+                value = float(conf.get(key) or 0)
+            except (TypeError, ValueError):
+                value = 0.0
+            if value > 0:
+                return value
+        return 1000.0
+
+    def _open_hold(self, name, exclude=None):
+        """
+        Money still held by numbers that were bought and not closed yet.
+
+        Returns (total, whether any of those holds is unknown).
+        """
+        total = 0.0
+        unknown = False
+        with self.open_activations_lock:
+            items = list((self.open_activations.get(name) or {}).items())
+        for act_id, info in items:
+            if exclude and str(act_id) == str(exclude):
+                continue
+            price = (info or {}).get("price")
+            if price is None:
+                unknown = True
+            else:
+                try:
+                    total += float(price)
+                except (TypeError, ValueError):
+                    unknown = True
+        return total, unknown
+
+    def _close_activation(self, name, activation_id, number=""):
+        """
+        An activation is finished (refunded, consumed or handed to the watcher):
+        take it out of the open list so it stops holding money in the ledger.
+        """
+        with self.open_activations_lock:
+            info = (self.open_activations.get(name) or {}).pop(str(activation_id), None)
+        if info is None:
+            return
+        log(f"Activation {activation_id} ({number or info.get('number') or '?'}) "
+            f"closed; it no longer holds money on {name.upper()}.",
+            prefix=name.upper())
+        self._recheck_tally_suspension(name)
+
+    def _recheck_tally_suspension(self, name):
+        """Lift the tally suspension once every hold on this provider is known."""
+        _open, open_unknown = self._open_hold(name)
+        _held, deferred_unknown = self.pending_cancels.hold_total(name)
+        if not (open_unknown or deferred_unknown):
+            self._clear_tally_suspension(name)
 
     # -- hooks for the deferred-cancellation watcher (cancel_watch.py) -------
 
@@ -471,6 +593,21 @@ class ParallelAutomationCoordinator:
 
     def note_balance(self, name, balance):
         return self._note_balance(name, balance)
+
+    def settle_balance(self, name, balance, exclude=None):
+        """
+        Re-baseline the ledger after a deferred cancellation was resolved.
+
+        The live balance becomes the expected balance for the next number, but
+        the money that is STILL held by the provider's other open/deferred
+        activations has to be added back: otherwise every settle would drag the
+        baseline down by that money and the next refund would look missing.
+        """
+        if balance is None:
+            return
+        open_hold, _u1 = self._open_hold(name, exclude=exclude)
+        deferred_hold, _u2 = self.pending_cancels.hold_total(name, exclude=exclude)
+        self._note_balance(name, round(float(balance) + open_hold + deferred_hold, 6))
 
     def critical_stop(self, title, message):
         return self._critical_stop(title, message)
@@ -1218,6 +1355,9 @@ class ParallelAutomationCoordinator:
                     "balance": actual_balance}
 
         self.stats.increment("numbers_cancelled")
+        # The activation leaves our hands in this call (refunded, consumed or
+        # parked with the watcher): it must stop holding money in the ledger.
+        self._close_activation(client.name, activation_id, number)
 
         salvaged = None
         tally_ok = True
@@ -1287,19 +1427,34 @@ class ParallelAutomationCoordinator:
                 if refund_delay > 0:
                     time.sleep(refund_delay)
 
-                if expected_balance is not None and self._tally_is_suspended(client.name):
-                    # A deferred cancellation on this provider is holding an
-                    # amount that could not be measured, so the expected
-                    # balance is a guess: re-baseline instead of stopping the
-                    # run over a difference that is probably just that money.
+                if self.stop_requested.is_set():
+                    # The run is already stopping (a critical stop fired, or the
+                    # user asked for it): a refund can no longer be waited for,
+                    # and a second critical stop would only bury the first one.
+                    # Re-baseline so the next run starts from the real balance.
                     try:
                         actual_balance = client.get_balance()
                         self._note_balance(client.name, actual_balance)
                     except Exception:
                         actual_balance = None
-                    log(f"Refund tally skipped (suspended while a deferred "
-                        f"cancellation is pending); new balance baseline: "
-                        f"{actual_balance}", prefix=pname)
+                    log("Refund tally skipped (the run is stopping); new balance "
+                        f"baseline: {actual_balance}", prefix=pname)
+                    tally_ok = True
+                elif (expected_balance is None
+                      or self._tally_is_suspended(client.name)):
+                    # A deferred cancellation on this provider is holding an
+                    # amount that could not be measured, so the expected
+                    # balance is a guess: re-baseline instead of stopping the
+                    # run over a difference that is probably just that money.
+                    # The same goes for a provider whose baseline was never
+                    # read at all - there is nothing to compare against yet.
+                    try:
+                        actual_balance = client.get_balance()
+                        self._note_balance(client.name, actual_balance)
+                    except Exception:
+                        actual_balance = None
+                    log("Refund tally skipped (no trustworthy expected balance "
+                        f"yet); new balance baseline: {actual_balance}", prefix=pname)
                     tally_ok = True
                 else:
                     tally_ok, actual_balance = self.guard.verify_refund(
@@ -1372,6 +1527,9 @@ class ParallelAutomationCoordinator:
         and let the caller carry on with the next number.
         """
         pname = client.name.upper()
+        # From here on the money is tracked as a deferred hold, not as an open
+        # activation: stop counting it twice in the ledger.
+        self._close_activation(client.name, activation_id, number)
         hold = None
         balance = None
         try:
@@ -1464,6 +1622,76 @@ class ParallelAutomationCoordinator:
         # Wake a worker that ran out of balance while these cancels were
         # pending: one refund is enough for the next number.
         self._pending_resolved_event.set()
+
+    def _drain_open_activations(self):
+        """
+        Close every number that is still paid for when the run ends.
+
+        A critical stop used to abandon the number that was waiting for its
+        OTP: the money stayed deducted and, if the SMS landed afterwards, it
+        was spent on a code nobody was there to read. Cancelling here takes the
+        refund back - or records the cancel as deferred, so the next run
+        finishes it once the provider's cancel window has passed.
+        """
+        with self.open_activations_lock:
+            snapshot = {
+                pname: dict(acts)
+                for pname, acts in self.open_activations.items() if acts
+            }
+        if not snapshot:
+            return
+
+        log("Closing the numbers that are still open before the run ends...")
+        still_held = []
+        for pname, acts in snapshot.items():
+            client = self.client_by_name(pname)
+            if client is None:
+                log(f"Cannot close the open {pname.upper()} number(s): no client "
+                    f"for that provider is available.", prefix=pname.upper())
+                still_held.extend((pname, aid) for aid in acts)
+                continue
+            for activation_id, info in acts.items():
+                number = (info or {}).get("number") or str(activation_id)
+                try:
+                    res = client.cancel(activation_id) or {}
+                except Exception as exc:
+                    res = {"type": "ERROR", "error": str(exc)}
+                res_type = res.get("type")
+                if res_type in CANCEL_SUCCESS_TYPES:
+                    log(f"{number} ({activation_id}) closed on stop: {res_type}.",
+                        prefix=pname.upper())
+                    self._close_activation(pname, activation_id, number)
+                    continue
+                # Refused (OTPSell's / OTPIndia's two-minute cancel window) or
+                # the call failed: hand it to the watcher so the refund is still
+                # chased instead of forgotten.
+                log(f"{number} ({activation_id}) could not be closed on stop "
+                    f"(provider answered {res_type or 'nothing'}); recording it as "
+                    f"a pending cancel so the next run finishes it.",
+                    prefix=pname.upper())
+                try:
+                    self._defer_cancellation(
+                        client, activation_id, number,
+                        "Run stopped before this number was closed",
+                        self._expected_balance(pname, activation_id),
+                        cancel_res=res if res_type else None,
+                        cancel_error=str(res.get("error") or ""),
+                    )
+                except Exception as exc:
+                    log(f"Could not record the pending cancel for {activation_id}: {exc}",
+                        prefix=pname.upper())
+                self._close_activation(pname, activation_id, number)
+                still_held.append((pname, activation_id))
+
+        if still_held:
+            self.notify.alert(
+                "⏳ Numbers still open at stop",
+                "These numbers could not be cancelled before the run ended and "
+                "are recorded as pending cancels - the next run resumes them and "
+                "chases the refund:\n"
+                + "\n".join(f"• `{act}` ({pname.upper()})"
+                            for pname, act in still_held),
+            )
 
     # -- Parallel Worker Loop ------------------------------------------------
 
@@ -1680,6 +1908,9 @@ class ParallelAutomationCoordinator:
             raw_number = res["number"]
             clean_number = CheckerClient.format_number(raw_number)
             self._note_activation(client.name, activation_id, clean_number)
+            # Its price is now missing from the live balance: register it so
+            # every later refund tally on this provider subtracts it.
+            self._open_activation(client, activation_id, clean_number)
 
             context = NumberContext(
                 client=client,
@@ -2138,6 +2369,9 @@ class ParallelAutomationCoordinator:
                 self._note_balance(context.provider_name, bal)
             except Exception:
                 pass
+            # The charge stands: this number is spent, not pending a refund.
+            self._close_activation(context.provider_name, context.activation_id,
+                                   context.clean_number)
             try:
                 self.bot.return_to_menu()
             except Exception:
@@ -3089,6 +3323,15 @@ class ParallelAutomationCoordinator:
             self.stop_requested.set()
             for t in workers:
                 t.join(timeout=2.0)
+            # Never leave a paid number open: a stop that lands while a number
+            # is waiting for its OTP must cancel it (refund) instead of
+            # abandoning money that an incoming SMS would then spend for
+            # nothing. See _drain_open_activations.
+            try:
+                self._drain_open_activations()
+            except Exception as exc:
+                log(f"Could not close the open activations on stop: {exc}")
+                log(traceback.format_exc())
             if self.bot.ready:
                 self.bot.stop()
             self.is_running = False
@@ -3172,6 +3415,8 @@ class ParallelAutomationCoordinator:
                 self._note_balance(target.provider_name, target.client.get_balance())
             except Exception:
                 pass
+            self._close_activation(target.provider_name, target.activation_id,
+                                   target.clean_number)
             self.stop_requested.set()
             return "stop"
 
