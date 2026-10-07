@@ -101,7 +101,8 @@ class MultiProvider(object):
     """Provider that keeps every order's price and refunds on cancel."""
 
     def __init__(self, name="otpsell", balance=460.0, price=PRICE,
-                 cancel_script=None, max_price=None, fail_first_balance=False):
+                 cancel_script=None, max_price=None, fail_first_balance=False,
+                 refund_visible_after=0):
         self.name = name
         self.price = price
         self.balance = balance
@@ -119,6 +120,10 @@ class MultiProvider(object):
         self.fail_first_balance = fail_first_balance
         self.balance_calls = 0
         self.out_of_band_refund = 0.0
+        # The provider credits a refund a few balance reads later (it does not
+        # appear the instant the cancel is accepted).
+        self.refund_visible_after = refund_visible_after
+        self._pending_refund = 0.0
 
     def _next_id(self):
         self._seq[0] += 1
@@ -128,6 +133,11 @@ class MultiProvider(object):
         self.balance_calls += 1
         if self.fail_first_balance and self.balance_calls == 1:
             raise RuntimeError("balance temporarily unavailable")
+        if self._pending_refund and self.refund_visible_after > 0:
+            self.refund_visible_after -= 1
+            if self.refund_visible_after <= 0:
+                self.balance = round(self.balance + self._pending_refund, 6)
+                self._pending_refund = 0.0
         return self.balance
 
     def get_number(self, **kwargs):
@@ -157,7 +167,11 @@ class MultiProvider(object):
             order = self.orders.get(activation_id)
             if order and order["open"] and activation_id not in self.no_refund:
                 order["open"] = False
-                self.balance = round(self.balance + order["price"], 6)
+                if self.refund_visible_after > 0:
+                    self._pending_refund = round(
+                        self._pending_refund + order["price"], 6)
+                else:
+                    self.balance = round(self.balance + order["price"], 6)
                 self.refunded.append(activation_id)
         return answer
 
@@ -769,6 +783,118 @@ def scenario_out_of_band_refund_reanchors_the_ledger():
     coordinator.stop_requested.set()
 
 
+# ---------------------------------------------------------------------------
+# 8. the expected balance moves while the refund is being waited for
+# ---------------------------------------------------------------------------
+
+def scenario_numbers_bought_during_the_refund_wait():
+    """
+    The reported case, with the reported numbers.
+
+    A deferred cancellation is chased in the background for up to a minute
+    while the worker keeps hunting - that is the whole point of deferring. Every
+    number it buys meanwhile holds money, so the balance this provider should
+    return to moves as well:
+
+        Expected ~426.2, actual 384.8   (three numbers bought during the wait)
+
+    Comparing against the value captured when the wait started reports a
+    missing refund that is simply money still in use.
+    """
+    coordinator = build_coordinator(cancel_error_expiry_seconds=600,
+                                    cancel_error_poll_interval_seconds=1)
+    coordinator.settings["refund_wait_seconds"] = 3
+    coordinator.settings["poll_interval_seconds"] = 0.1
+    coordinator.guard.refund_wait = 3
+    coordinator.guard.poll_interval = 0.1
+    # 426.20 to spend, 13.80 a number - the reported arithmetic. The refund only
+    # reaches the balance a few reads after the cancel is accepted.
+    client = MultiProvider(balance=426.2, price=13.8, refund_visible_after=3,
+                           cancel_script=[{"type": "ACCESS_CANCEL_WAIT",
+                                           "seconds": 1},
+                                          {"type": "ACCESS_CANCEL"}])
+    coordinator.config["otpsell"]["price"] = 13.8
+    coordinator.clients = [client]
+    coordinator._note_balance("otpsell", 426.2)
+
+    a = client.get_number()
+    coordinator._open_activation(client, a["activation_id"], a["number"])
+    result = coordinator.handle_cancellation(
+        client, a["activation_id"], a["number"], "Already registered on Meesho")
+    check("moving target: the first cancel is deferred", result.get("deferred") is True,
+          result)
+
+    coordinator.pending_cancels.store.update(a["activation_id"],
+                                             expiry_at=time.time() - 1)
+
+    # The worker keeps hunting while the watcher waits out the refund.
+    bought = []
+    stop_buying = threading.Event()
+
+    def keep_hunting():
+        while not stop_buying.is_set() and len(bought) < 3:
+            extra = client.get_number()
+            coordinator._open_activation(client, extra["activation_id"],
+                                         extra["number"])
+            bought.append(extra["activation_id"])
+            stop_buying.wait(0.05)
+
+    hunter = threading.Thread(target=keep_hunting, daemon=True)
+    hunter.start()
+    try:
+        ok = wait_until(lambda: a["activation_id"] not in
+                        [r["activation_id"]
+                         for r in coordinator.pending_cancels.pending()],
+                        timeout=30)
+    finally:
+        stop_buying.set()
+        hunter.join(timeout=2)
+
+    check("moving target: the watcher closed the cancellation", ok,
+          coordinator.pending_cancels.pending())
+    check("moving target: the refund DID tally - no false stop",
+          not coordinator.stopped, coordinator.stopped)
+    check("moving target: three numbers really were bought during the wait",
+          len(bought) == 3, bought)
+    check("moving target: the live balance is 426.2 minus the three active "
+          "numbers (384.8)",
+          abs(client.get_balance() - 384.8) < 0.01, client.get_balance())
+    check("moving target: the ledger agrees with the live balance",
+          abs(coordinator._expected_balance("otpsell", None)
+              - client.get_balance()) < 0.01,
+          f"model {coordinator._expected_balance('otpsell', None)}, "
+          f"live {client.get_balance()}")
+    coordinator.stop_requested.set()
+
+
+def scenario_refund_that_never_lands_still_fails_with_a_moving_target():
+    """The dynamic comparison must not swallow a genuinely missing refund."""
+    coordinator = build_coordinator(cancel_error_expiry_seconds=600,
+                                    cancel_error_poll_interval_seconds=1)
+    client = MultiProvider(balance=426.2, price=13.8,
+                           cancel_script=[{"type": "ACCESS_CANCEL_WAIT",
+                                           "seconds": 1}] * 20)
+    coordinator.config["otpsell"]["price"] = 13.8
+    coordinator.clients = [client]
+    coordinator._note_balance("otpsell", 426.2)
+
+    a = client.get_number()
+    coordinator._open_activation(client, a["activation_id"], a["number"])
+    result = coordinator.handle_cancellation(
+        client, a["activation_id"], a["number"], "Already registered on Meesho")
+    check("moving target (real loss): the cancel is deferred",
+          result.get("deferred") is True, result)
+
+    coordinator.pending_cancels.store.update(a["activation_id"],
+                                             expiry_at=time.time() - 1)
+    ok = wait_until(lambda: bool(coordinator.stopped), timeout=30)
+    check("moving target (real loss): a refund that never lands still stops "
+          "the provider", ok, coordinator.stopped)
+    check("moving target (real loss): nothing was bought to hide behind",
+          len(client.orders) == 1, list(client.orders))
+    coordinator.stop_requested.set()
+
+
 def main():
     print("=" * 70)
     print("Refund tally vs. open activations")
@@ -782,6 +908,8 @@ def main():
         scenario_suspended_tally_never_stops_a_deferred_cancel()
         scenario_configured_price_removes_the_guessing()
         scenario_out_of_band_refund_reanchors_the_ledger()
+        scenario_numbers_bought_during_the_refund_wait()
+        scenario_refund_that_never_lands_still_fails_with_a_moving_target()
         scenario_stop_closes_open_numbers()
         scenario_stop_defers_a_refused_cancel()
         scenario_unmeasurable_price_suspends_tally()

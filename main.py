@@ -1613,8 +1613,16 @@ class ParallelAutomationCoordinator:
                         f"yet); new balance baseline: {actual_balance}", prefix=pname)
                     tally_ok = True
                 else:
+                    # Re-evaluated on every poll: numbers this provider buys
+                    # while the refund is being waited for hold money too, and
+                    # the balance it should return to moves with them.
+                    def _expected_now(_name=client.name, _activation=activation_id,
+                                      _fallback=expected_balance):
+                        value = self._expected_balance(_name, _activation)
+                        return value if value is not None else _fallback
+
                     tally_ok, actual_balance = self.guard.verify_refund(
-                        client, expected_balance,
+                        client, _expected_now,
                         activation_id=activation_id, number=number,
                         stop_event=self.stop_requested, prefix=pname,
                     )

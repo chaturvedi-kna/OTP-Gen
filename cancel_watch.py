@@ -647,6 +647,24 @@ class CancelWatchManager:
         if expected is None:
             expected = record.get("expected_balance")
 
+        # The expected balance is re-evaluated on every poll (see
+        # BalanceGuard.verify_refund): this cancellation is chased in the
+        # background precisely so the worker can keep hunting, and every number
+        # it buys meanwhile holds money too. The value captured now is only the
+        # starting point - comparing against it for the whole wait turns those
+        # numbers into a phantom "missing refund".
+        expected_source = expected
+        if callable(expected_getter):
+            def expected_source(_getter=expected_getter,
+                                _provider=record.get("provider"),
+                                _activation=activation_id,
+                                _fallback=record.get("expected_balance")):
+                try:
+                    value = _getter(_provider, _activation)
+                except Exception:
+                    value = None
+                return value if value is not None else _fallback
+
         # A hold this provider still owns cannot be measured (an activation
         # whose price is unknown), so the expected balance is a guess - the
         # coordinator suspends the tally for exactly that reason. Comparing
@@ -679,7 +697,7 @@ class CancelWatchManager:
         if guard is not None and expected is not None:
             try:
                 tally_ok, actual = guard.verify_refund(
-                    client, expected,
+                    client, expected_source,
                     activation_id=activation_id, number=number,
                     stop_event=getattr(self.owner, "stop_requested", None),
                     prefix=pname,

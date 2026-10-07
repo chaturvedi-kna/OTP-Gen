@@ -46,9 +46,33 @@ class BalanceGuard:
         Poll the provider balance until it is back at/above expected_balance
         (minus tolerance), or until refund_wait elapses.
 
+        expected_balance may be a number OR a callable returning one. A callable
+        is re-evaluated on every poll, because the balance this provider should
+        be at keeps moving while we wait: a deferred cancellation is chased in
+        the background precisely so the worker can keep hunting, and every
+        number it buys meanwhile holds money too. Comparing against the value
+        captured when the wait started turns those numbers into a phantom
+        "missing refund".
+
         Returns (ok: bool, actual_balance: float).
         """
-        if not self.enabled or expected_balance is None:
+        if not self.enabled:
+            try:
+                return True, float(client.get_balance())
+            except Exception:
+                return True, None
+
+        def current_expected():
+            value = (expected_balance() if callable(expected_balance)
+                     else expected_balance)
+            try:
+                return None if value is None else float(value)
+            except (TypeError, ValueError):
+                return None
+
+        target = current_expected()
+        if target is None:
+            # Nothing trustworthy to compare against yet: do not invent one.
             try:
                 return True, float(client.get_balance())
             except Exception:
@@ -63,10 +87,18 @@ class BalanceGuard:
                 self._log(f"[BALANCE-GUARD] balance fetch failed: {exc}", prefix)
                 last_balance = None
 
-            if last_balance is not None and last_balance >= expected_balance - self.tolerance:
+            target = current_expected()
+            if target is None:
+                # The expected balance stopped being computable (a hold became
+                # unmeasurable): stop comparing rather than guess.
+                self._log("[BALANCE-GUARD] expected balance is no longer "
+                          "computable - not tallying this refund.", prefix)
+                return True, last_balance
+
+            if last_balance is not None and last_balance >= target - self.tolerance:
                 self._log(
                     f"[BALANCE-GUARD] Refund tallied: balance {last_balance:.4f} "
-                    f">= expected {expected_balance:.4f} (tol {self.tolerance})",
+                    f">= expected {target:.4f} (tol {self.tolerance})",
                     prefix
                 )
                 return True, last_balance
@@ -80,7 +112,7 @@ class BalanceGuard:
 
         self._log(
             f"[BALANCE-GUARD] REFUND MISMATCH after {self.refund_wait:.0f}s: "
-            f"expected ~{expected_balance:.4f}, actual {last_balance}",
+            f"expected ~{target:.4f}, actual {last_balance}",
             prefix
         )
         return False, last_balance
