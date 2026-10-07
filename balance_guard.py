@@ -81,6 +81,11 @@ class BalanceGuard:
         deadline = time.time() + wait_seconds
         last_balance = None
         last_expected = first_expected
+        # Exposed for callers that compose mismatch alerts AFTER this call:
+        # they should show the last RE-DERIVED expectation (the one that
+        # actually failed), not whatever number they froze before the wait.
+        self.last_expected = last_expected
+        self.last_balance = last_balance
         while True:
             current_expected = read_expected()
             if current_expected is not None:
@@ -91,6 +96,9 @@ class BalanceGuard:
             except Exception as exc:
                 self._log(f"[BALANCE-GUARD] balance fetch failed: {exc}", prefix)
                 last_balance = None
+
+            self.last_expected = last_expected
+            self.last_balance = last_balance
 
             if last_balance is not None and last_balance >= last_expected - self.tolerance:
                 self._log(

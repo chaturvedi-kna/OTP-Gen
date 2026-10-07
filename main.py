@@ -357,6 +357,8 @@ class ParallelAutomationCoordinator:
         # Display-only activation metadata (last number handled per provider);
         # the refund bookkeeping itself lives in refund_ledger.
         self.ledger_meta = {}
+        # Per-provider throttle for the stale in-flight reconciliation.
+        self._inflight_reconciled_at = {}
         self.ledger_lock = threading.Lock()
 
         # PRIMES bot flow state
@@ -552,6 +554,106 @@ class ParallelAutomationCoordinator:
         except Exception:
             return None
 
+    def _reconcile_inflight(self, client, stale_seconds=None, force=False):
+        """
+        Best-effort close of in-flight (OPEN) ledger rows that can no longer
+        be in play.
+
+        Numbers bought but never cleanly closed - an aborted run, an
+        interrupted /stop, a recovery flow that died mid-way, rows left by an
+        older build that did not close them at all - keep their price in
+        every tally forever: their money is already back in the balance, yet
+        the ghost holds skew expectations (and a balance note taken while
+        they were open pairs baseline+holds higher than the truth). Sweep
+        rows older than the longest life an activation could have: one
+        get_status per row decides where the money went.
+
+          STATUS_OK              -> the OTP arrived: charge stands (CONSUMED)
+          STATUS_CANCEL/NO_ACTIVATION -> the money came back (REFUNDED/EXPIRED)
+          anything else / error  -> leave the row; retried on the next sweep
+
+        Throttled per provider (the sweep costs one status call per stale
+        row) unless force=True.
+        """
+        name = getattr(client, "name", None)
+        get_status = getattr(client, "get_status", None)
+        if not name or not callable(get_status):
+            return
+        now_ts = time.time()
+        if stale_seconds is None:
+            stale_seconds = max(
+                1500.0,
+                float(self.settings.get("cancel_error_expiry_seconds", 900))
+                + float(self.settings.get("cancel_error_grace_seconds", 10))
+                + 240.0,
+            )
+        with self.ledger_lock:
+            last_sweep = self._inflight_reconciled_at.get(name, 0.0)
+        if not force and now_ts - last_sweep < 120.0:
+            return
+        with self.ledger_lock:
+            self._inflight_reconciled_at[name] = now_ts
+        try:
+            rows = self.refund_ledger.open_activations(name, states=("OPEN",))
+        except Exception:
+            return
+        pname = name.upper()
+        for row in rows:
+            aid = row.get("activation_id")
+            try:
+                acquired = datetime.fromisoformat(str(row.get("acquired_at") or ""))
+                if acquired.tzinfo is None:
+                    acquired = acquired.replace(tzinfo=timezone.utc)
+                age = now_ts - acquired.timestamp()
+            except Exception:
+                age = stale_seconds + 1.0  # unparseable: let the provider decide
+            if age < stale_seconds:
+                continue
+            try:
+                status = get_status(aid)
+            except Exception:
+                continue
+            stype = (status or {}).get("type")
+            if stype == "STATUS_OK":
+                outcome, why = "CONSUMED", "its OTP was delivered after all"
+            elif stype in ("STATUS_CANCEL", "NO_ACTIVATION"):
+                outcome, why = ("REFUNDED" if stype == "STATUS_CANCEL" else "EXPIRED",
+                                f"provider reports {stype} (money back)")
+            else:
+                continue
+            self._mark_activation_closed(name, aid, outcome)
+            rows_note = row.get("number") or aid
+            log(f"In-flight hold reconciled: {rows_note} closed as {outcome} "
+                f"({why}); ghost hold removed from refund tallies.",
+                prefix=pname)
+
+    def _confirm_refund_once(self, client, activation_id, probes=3, delay=2.0):
+        """
+        Last-chance confirmation before a refund mismatch may stop the run.
+
+        A verify can end in False without money actually missing: the wait
+        expired one second before the refund landed, or ghost in-flight
+        holds (never-closed buys) pushed the derived expectation over the
+        line. Sweep those ghosts and take a few FRESH comparisons against a
+        re-derived expectation; only a real shortfall survives.
+        Returns (confirmed, balance).
+        """
+        self._reconcile_inflight(client, force=True)
+        balance = None
+        tolerance = float(getattr(self.guard, "tolerance", 0.5))
+        for i in range(max(1, probes)):
+            expected_now = self._expected_balance(client.name, activation_id)
+            try:
+                balance = float(client.get_balance())
+            except Exception:
+                balance = None
+            if (expected_now is not None and balance is not None
+                    and balance >= expected_now - tolerance):
+                return True, balance
+            if i < probes - 1:
+                time.sleep(delay)
+        return False, balance
+
     def _append_dispute(self, entry):
         """
         Persist self-contained provider-dispute evidence: the dispute itself
@@ -739,6 +841,7 @@ class ParallelAutomationCoordinator:
                 bal = client.get_balance()
                 line = f"• {client.name.upper()}: {bal:.4f}"
                 try:
+                    self._reconcile_inflight(client)
                     hold, unknown = self._hold_totals(client.name)
                     if hold > 0 or unknown:
                         line += (f"  (held by cancels + in-flight numbers: {hold:.4f}"
@@ -1538,37 +1641,71 @@ class ParallelAutomationCoordinator:
                     self._mark_activation_closed(client.name, activation_id, "REFUNDED")
                     self._note_balance(client.name, actual_balance)
                 elif expected_balance is not None and not tally_ok:
-                    self.stats.increment("refunds_missing")
-                    # Self-contained evidence for a provider dispute: the
-                    # mismatch plus the ledger picture at this moment.
-                    self._append_dispute({
-                        "type": "refund_mismatch",
-                        "provider": client.name,
-                        "activation_id": activation_id,
-                        "number": number,
-                        "reason": reason,
-                        "expected_balance": expected_balance,
-                        "actual_balance": actual_balance,
-                        "salvaged_otp": (salvaged or {}).get("code"),
-                        "cancel_res": cancel_res,
-                        "source": "immediate_cancel",
-                    })
-                    dispute_path = self.pending_cancels.disputes.path
-                    salvage_note = (
-                        f"\nLate OTP code: `{salvaged.get('code')}`" if salvaged else
-                        "\nNo OTP was seen - check the provider panel for this activation."
-                    )
-                    self._critical_stop(
-                        f"[{pname}] REFUND DID NOT TALLY",
-                        f"Number: {number}\nActivation: {activation_id}\n"
-                        f"Expected balance: ~{expected_balance:.4f}\nActual balance: {actual_balance}\n"
-                        f"({self.hold_breakdown(client.name)})\n"
-                        f"Reason for cancel: {reason}{salvage_note}\n\n"
-                        "No new numbers will be purchased until you verify this activation "
-                        "in the provider panel. The PRIMES bot was left on its OTP "
-                        "screen - if the OTP shows up, enter it manually.\n"
-                        f"Dispute evidence appended to {dispute_path} (JSONL; /disputes to view)."
-                    )
+                    if self.stop_requested.is_set():
+                        # The verify did not lose the money - it was aborted by
+                        # a stop that came from elsewhere. That stop already
+                        # explained itself; escalating again would double-report.
+                        log("Refund verify ended without a tally, but the run is "
+                            "already stopping (another cause) - not escalating.",
+                            prefix=pname)
+                    else:
+                        # Before accusing anyone: sweep ghost in-flight holds and
+                        # re-confirm against a FRESH expectation. A refund that
+                        # landed right at the deadline passes here instead of a
+                        # false critical stop.
+                        confirmed, confirmed_balance = self._confirm_refund_once(
+                            client, activation_id)
+                        if confirmed:
+                            tally_ok = True
+                            actual_balance = confirmed_balance
+                            self.stats.increment("refunds_verified")
+                            self.stats.increment("refunds_confirmed_last_chance")
+                            self._mark_activation_closed(client.name, activation_id, "REFUNDED")
+                            self._note_balance(client.name, confirmed_balance)
+                            log("Refund confirmed on the last-chance re-check "
+                                "after the wait - no stop.", prefix=pname)
+                        else:
+                            if confirmed_balance is not None:
+                                actual_balance = confirmed_balance
+                            self.stats.increment("refunds_missing")
+                            # Show what actually failed: the LAST RE-DERIVED
+                            # expectation, not the value frozen before the wait.
+                            last_expected = getattr(self.guard, "last_expected", None)
+                            shown_expected = (last_expected if last_expected is not None
+                                              else expected_balance)
+                            # Self-contained evidence for a provider dispute.
+                            self._append_dispute({
+                                "type": "refund_mismatch",
+                                "provider": client.name,
+                                "activation_id": activation_id,
+                                "number": number,
+                                "reason": reason,
+                                "expected_balance": shown_expected,
+                                "expected_balance_at_cancel": expected_balance,
+                                "actual_balance": actual_balance,
+                                "salvaged_otp": (salvaged or {}).get("code"),
+                                "cancel_res": cancel_res,
+                                "source": "immediate_cancel",
+                            })
+                            dispute_path = self.pending_cancels.disputes.path
+                            salvage_note = (
+                                f"\nLate OTP code: `{salvaged.get('code')}`" if salvaged else
+                                "\nNo OTP was seen - check the provider panel for this activation."
+                            )
+                            self._critical_stop(
+                                f"[{pname}] REFUND DID NOT TALLY",
+                                f"Number: {number}\nActivation: {activation_id}\n"
+                                f"Expected balance: ~{shown_expected:.4f} (re-derived each poll)\n"
+                                f"Actual balance: {actual_balance}\n"
+                                f"({self.hold_breakdown(client.name)})\n"
+                                f"Reason for cancel: {reason}{salvage_note}\n\n"
+                                "Ghost holds were swept and the refund re-confirmed - "
+                                "this one looks real. No new numbers will be purchased "
+                                "until you verify this activation in the provider panel. "
+                                "The PRIMES bot was left on its OTP screen - if the OTP "
+                                "shows up, enter it manually.\n"
+                                f"Dispute evidence appended to {dispute_path} (JSONL; /disputes to view)."
+                            )
 
         result = {"tally_ok": bool(tally_ok), "salvaged": salvaged, "balance": actual_balance}
 
@@ -1820,6 +1957,11 @@ class ParallelAutomationCoordinator:
             # SAFETY GATE: never buy a number while a refund discrepancy is open.
             if self.stop_requested.is_set():
                 break
+
+            # Keep in-flight holds honest: sweep buys that can no longer be in
+            # play (aborted runs, leftovers from older builds) so ghost holds
+            # never skew the refund tallies taken on this provider.
+            self._reconcile_inflight(client)
 
             self.worker_statuses[client.name] = f"Attempt {current_attempt}/{client_max_attempts}: Requesting number"
             log(f"Requesting number (Attempt {current_attempt}/{client_max_attempts})...", prefix=pname)

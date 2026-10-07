@@ -133,7 +133,17 @@ frozen number. The fix set on top of the SQLite ledger:
   `automation.keep_otp_wait_on_critical_stop: false`.
 * **Diagnostics in alerts** — a critical-stop alert now carries the ledger
   breakdown (baseline, pending-cancel holds, in-flight holds) so a real
-  dispute has its numbers attached, and `/balance` shows both hold kinds.
+  dispute has its numbers attached, and `/balance` shows both hold kinds. It
+  also prints the *last re-derived* expectation (the one that actually
+  failed), not the value frozen when the tally started.
+* **Ghost-hold sweeps + last-chance confirmation** — numbers bought but
+  never cleanly closed (aborted runs, rows left by older builds) get swept
+  against the provider (`get_status`: `STATUS_OK` → CONSUMED,
+  `STATUS_CANCEL`/`NO_ACTIVATION` → REFUNDED/EXPIRED) so their money stops
+  appearing in tallies once it is back. Before any critical stop, the tally
+  sweeps ghosts and takes a few fresh comparisons (a refund that landed
+  right at the deadline passes here); and a tally that ended because the
+  run was already stopping elsewhere never escalates a second time.
 
 ### Dispute evidence (for the provider team)
 

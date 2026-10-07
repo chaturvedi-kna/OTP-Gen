@@ -1306,6 +1306,119 @@ def test_dispute_evidence_artifact():
     coordinator2.stop_requested.set()
 
 
+def test_stale_inflight_reconciliation():
+    """
+    Ghost in-flight holds get swept against the provider: rows left OPEN by
+    an aborted run (or an older build that never closed them) keep their
+    price in every tally forever unless they are closed against the truth.
+    NO_ACTIVATION -> EXPIRED (money back), STATUS_CANCEL -> REFUNDED,
+    STATUS_OK -> CONSUMED (charge stands), anything else -> left alone.
+    """
+    reset_http()
+    coordinator = build_coordinator()
+    pname = "tempora"
+    coordinator._note_balance(pname, 100.0, source="seed")
+    for act in ("stale-exp", "stale-use", "stale-live", "fresh"):
+        coordinator._note_activation(pname, act, "9x" + act, hold=10.0)
+    check("reconcile: four ghost/live buys hold 40",
+          coordinator._hold_totals(pname) == (40.0, False),
+          coordinator._hold_totals(pname))
+
+    class StatusClient:
+        name = pname
+        def get_status(self, activation_id):
+            return {
+                "stale-exp": {"type": "NO_ACTIVATION"},
+                "stale-use": {"type": "STATUS_OK", "code": "111223"},
+                "stale-live": {"type": "STATUS_WAIT_CODE"},
+                "fresh": {"type": "STATUS_CANCEL"},
+            }.get(activation_id)
+
+    client = StatusClient()
+    coordinator._reconcile_inflight(client, stale_seconds=0.0, force=True)
+    ledger = coordinator.refund_ledger
+    check("reconcile: NO_ACTIVATION row closed as EXPIRED (money back)",
+          (ledger.activation(pname, "stale-exp") or {}).get("state") == "EXPIRED",
+          ledger.activation(pname, "stale-exp"))
+    check("reconcile: STATUS_OK row closed as CONSUMED (charge stands)",
+          (ledger.activation(pname, "stale-use") or {}).get("state") == "CONSUMED",
+          ledger.activation(pname, "stale-use"))
+    check("reconcile: WAIT_CODE row left alone (no verdict yet)",
+          (ledger.activation(pname, "stale-live") or {}).get("state") == "OPEN",
+          ledger.activation(pname, "stale-live"))
+    check("reconcile: STATUS_CANCEL row closed as REFUNDED (money back)",
+          (ledger.activation(pname, "fresh") or {}).get("state") == "REFUNDED",
+          ledger.activation(pname, "fresh"))
+    check("reconcile: only the undecided row still holds",
+          coordinator._hold_totals(pname) == (10.0, False),
+          coordinator._hold_totals(pname))
+
+    # The next sweep closes what the provider has settled by then.
+    client.get_status = lambda aid: {"type": "STATUS_CANCEL"}
+    coordinator._reconcile_inflight(client, stale_seconds=0.0, force=True)
+    check("reconcile: a later sweep closes the settled remainder as REFUNDED",
+          (ledger.activation(pname, "stale-live") or {}).get("state") == "REFUNDED"
+          and (ledger.activation(pname, "fresh") or {}).get("state") == "REFUNDED",
+          (ledger.activation(pname, "stale-live"), ledger.activation(pname, "fresh")))
+    check("reconcile: holds fully swept clean",
+          coordinator._hold_totals(pname) == (0.0, False),
+          coordinator._hold_totals(pname))
+
+    coordinator.stop_requested.set()
+
+
+def test_refund_last_chance_confirmation():
+    """
+    The last-chance re-check: a refund that lands right as the wait expires
+    (or a derived expectation that was inflated by ghost holds) is confirmed
+    against a FRESH expectation instead of critical-stopping the run - and a
+    genuinely missing refund still fails.
+    """
+    reset_http()
+    coordinator = build_coordinator()
+    pname = "tempora"
+    coordinator._note_balance(pname, 100.0, source="seed")
+    coordinator._note_activation(pname, "X", "9xX", hold=10.0)
+    coordinator.pending_cancels.store.add({
+        "provider": pname, "activation_id": "X", "number": "9xX",
+        "hold": 10.0, "expiry_at": time.time() + 600,
+        "deferred_at_epoch": time.time(),
+    })
+    coordinator.refund_ledger.mark_deferred(pname, "X", hold=10.0)
+
+    class RisingWallet:
+        name = pname
+        def __init__(self):
+            self.calls = 0
+        def get_balance(self):
+            self.calls += 1
+            return 100.0 if self.calls >= 2 else 90.0
+        def get_status(self, activation_id):
+            return {"type": "STATUS_WAIT_CODE"}
+
+    wallet = RisingWallet()
+    ok, bal = coordinator._confirm_refund_once(wallet, "X", probes=3, delay=0.01)
+    check("last-chance: a refund landing mid-confirm is accepted (no stop)",
+          ok is True and bal == 100.0 and wallet.calls == 2, (ok, bal, wallet.calls))
+
+    class FlatWallet:
+        name = pname
+        def __init__(self):
+            self.calls = 0
+        def get_balance(self):
+            self.calls += 1
+            return 90.0
+        def get_status(self, activation_id):
+            return {"type": "STATUS_WAIT_CODE"}
+
+    flat = FlatWallet()
+    ok2, bal2 = coordinator._confirm_refund_once(flat, "X", probes=3, delay=0.01)
+    check("last-chance: a genuinely missing refund still fails",
+          ok2 is False and bal2 == 90.0 and flat.calls == 3, (ok2, bal2, flat.calls))
+
+    coordinator.stop_requested.set()
+
+
 def main():
     print("=" * 60)
     print("OTPSELL PROVIDER + SQLITE REFUND LEDGER CHECK")
@@ -1333,6 +1446,8 @@ def main():
     test_otp_wait_survives_critical_stop()
     test_ledger_open_hold_rows()
     test_dispute_evidence_artifact()
+    test_stale_inflight_reconciliation()
+    test_refund_last_chance_confirmation()
 
     os.chdir(REPO_DIR)
     print("=" * 60)

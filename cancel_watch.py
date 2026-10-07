@@ -721,6 +721,38 @@ class CancelWatchManager:
                 self._log(f"[DEFERRED-CANCEL] Refund check failed: {exc}", pname)
                 tally_ok, actual = False, None
 
+        if not tally_ok and expected is not None:
+            # Same guardrails as the immediate path: a verify that ended
+            # without a tally because the run is already stopping elsewhere
+            # must not escalate again (the first stop explained itself), and
+            # a refund that landed right at the deadline - or ghost
+            # in-flight holds inflating the derived expectation - is caught
+            # by one last re-confirmed comparison before anyone is accused.
+            if stop_event is not None and stop_event.is_set():
+                self._log(
+                    "[DEFERRED-CANCEL] Tally ended without a match while the run "
+                    "is already stopping (another cause) - record kept for the "
+                    "next start, no escalation.", pname)
+                with self._lock:
+                    self._threads.pop(activation_id, None)
+                return
+            confirm = getattr(self.owner, "_confirm_refund_once", None)
+            if callable(confirm):
+                try:
+                    ok_again, bal_again = confirm(client, activation_id)
+                except Exception:
+                    ok_again, bal_again = False, None
+                if ok_again:
+                    tally_ok, actual = True, bal_again
+                    if stats is not None:
+                        with contextlib.suppress(Exception):
+                            stats.increment("refunds_confirmed_last_chance")
+                    self._log(
+                        "[DEFERRED-CANCEL] Refund confirmed on the last-chance "
+                        "re-check after the wait - no stop.", pname)
+                elif bal_again is not None:
+                    actual = bal_again
+
         if tally_ok:
             if stats is not None:
                 try:
@@ -774,6 +806,15 @@ class CancelWatchManager:
                 breakdown = f"\nLedger at stop: {hb(record.get('provider'))}."
             except Exception:
                 breakdown = ""
+        # What actually failed: the LAST re-derived expectation (the guard
+        # polls a getter), not the value frozen before the wait.
+        shown_expected = expected
+        try:
+            last_seen = getattr(guard, "last_expected", None)
+            if last_seen is not None:
+                shown_expected = last_seen
+        except Exception:
+            pass
         # Self-contained evidence for a provider dispute (same JSONL dispute
         # log the refused-cancel OTP salvage records land in).
         dappend = getattr(self.owner, "_append_dispute", None)
@@ -785,7 +826,8 @@ class CancelWatchManager:
                     "activation_id": activation_id,
                     "number": number,
                     "reason": record.get("reason"),
-                    "expected_balance": expected,
+                    "expected_balance": shown_expected,
+                    "expected_balance_at_defer": record.get("expected_balance"),
                     "actual_balance": actual,
                     "deferred_at": record.get("deferred_at"),
                     "last_cancel_answer": res_type,
@@ -793,9 +835,11 @@ class CancelWatchManager:
                 })
         message = (
             f"`{number}` (activation {activation_id}, {record.get('reason')})\n"
-            f"Expected ~{expected}, actual {actual}; last cancel answer {res_type}{waited}.\n"
-            f"The expectation was re-derived while the tally waited (numbers bought "
-            f"meanwhile are accounted), so this one looks real.\n"
+            f"Expected ~{shown_expected} (re-derived each poll), actual {actual}; "
+            f"last cancel answer {res_type}{waited}.\n"
+            f"The expectation was re-derived while the tally waited, ghost in-flight "
+            f"holds were swept, and the refund was re-confirmed once more - this one "
+            f"looks real.\n"
             f"Deferred cancel retried and the refund still did not tally - verify "
             f"this activation in the provider panel before buying more numbers."
             f"{breakdown}\n"
