@@ -197,7 +197,7 @@ def build_coordinator(**automation):
     coordinator.notify.telegram.send = lambda *a, **k: False
     coordinator.notify.termux.send = lambda *a, **k: False
     coordinator.stopped = []
-    coordinator._critical_stop = lambda title, message: (
+    coordinator._critical_stop = lambda title, message, provider=None: (
         coordinator.stopped.append((title, message)),
         coordinator.stop_requested.set(),
     )

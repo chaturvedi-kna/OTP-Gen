@@ -710,7 +710,8 @@ class CancelWatchManager:
             f"this activation in the provider panel before buying more numbers."
         )
         if callable(critical):
-            critical(f"[{pname}] REFUND DID NOT TALLY (deferred cancel)", message)
+            critical(f"[{pname}] REFUND DID NOT TALLY (deferred cancel)", message,
+                     provider=record.get("provider"))
         elif notify is not None:
             try:
                 notify.alert(f"🛑 [{pname}] REFUND DID NOT TALLY", message)

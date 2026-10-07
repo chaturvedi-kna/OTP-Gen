@@ -211,10 +211,18 @@ def build_coordinator(**automation):
     coordinator.notify.telegram.send = lambda *a, **k: False
     coordinator.notify.termux.send = lambda *a, **k: False
     coordinator.stopped = []
-    coordinator._critical_stop = lambda title, message: (
-        coordinator.stopped.append((title, message)),
-        coordinator.stop_requested.set(),
-    )
+    coordinator.provider_stops = []
+    # Record the stop AND run the real logic, so the provider-scoping in
+    # _critical_stop itself is what gets exercised.
+    _real_stop = m.ParallelAutomationCoordinator._critical_stop.__get__(coordinator)
+
+    def _record_stop(title, message, provider=None):
+        coordinator.stopped.append((title, message))
+        if provider is not None:
+            coordinator.provider_stops.append(provider)
+        _real_stop(title, message, provider=provider)
+
+    coordinator._critical_stop = _record_stop
     return coordinator
 
 
@@ -419,11 +427,25 @@ def scenario_real_missing_refund_still_stops():
     coordinator.pending_cancels.store.update(a["activation_id"],
                                              expiry_at=time.time() - 1)
     ok = wait_until(lambda: bool(coordinator.stopped), timeout=25)
-    check("missing refund: the run still critical-stops when money is lost", ok,
+    check("missing refund: the run still stops when money is lost", ok,
           coordinator.stopped)
     check("missing refund: the alert names the activation",
           any(a["activation_id"] in msg for _t, msg in coordinator.stopped),
           coordinator.stopped)
+    check("missing refund: only OTPSell is stopped - OTPSell's own problem "
+          "must not take the other providers' numbers down with it",
+          coordinator.provider_stops == ["otpsell"],
+          coordinator.provider_stops)
+    check("missing refund: the run itself is not halted",
+          not coordinator.stop_requested.is_set(),
+          coordinator.stop_requested.is_set())
+    check("missing refund: the provider is marked stopped",
+          coordinator.provider_stopped("otpsell") is True
+          and coordinator.provider_stopped("otpindia") is False,
+          coordinator.stopped_providers)
+    check("missing refund: the worker would stop buying on OTPSell only",
+          coordinator._worker_should_stop(client) is True,
+          coordinator._worker_should_stop(client))
     coordinator.stop_requested.set()
 
 
@@ -512,6 +534,92 @@ def scenario_unmeasurable_price_suspends_tally():
     coordinator.stop_requested.set()
 
 
+def scenario_other_provider_number_survives_a_tally_stop():
+    """
+    The reported cross-provider case.
+
+    OTPSell trips a refund-tally stop while OTPIndia has a number 60 seconds
+    into its OTP wait - i.e. before OTPIndia's own 120s cancel window has
+    passed, so that number cannot be cancelled yet. The other provider's
+    number must NOT be abandoned: it keeps waiting for its OTP and, if none
+    arrives, it is cancelled (deferred until the window passes) and refunded.
+    """
+    coordinator = build_coordinator(cancel_error_expiry_seconds=600,
+                                    cancel_error_poll_interval_seconds=1)
+    sell = MultiProvider(name="otpsell", balance=460.0,
+                         cancel_script=[{"type": "ACCESS_CANCEL_WAIT",
+                                         "seconds": 1}] * 20)
+    india = MultiProvider(name="otpindia", balance=200.0,
+                          cancel_script=[{"type": "ACCESS_CANCEL_WAIT",
+                                          "seconds": 120}] * 5)
+    coordinator.clients = [sell, india]
+    coordinator._note_balance("otpsell", 460.0)
+    coordinator._note_balance("otpindia", 200.0)
+
+    # OTPIndia's number, 60s into its wait (cancel window still 60s away).
+    india_number = india.get_number()
+    coordinator._open_activation(india, india_number["activation_id"],
+                                 india_number["number"])
+
+    # OTPSell trips the refund tally.
+    sell_number = sell.get_number()
+    coordinator._open_activation(sell, sell_number["activation_id"],
+                                 sell_number["number"])
+    coordinator.pending_cancels.store.update(
+        sell_number["activation_id"], expiry_at=time.time() - 1)
+    coordinator.handle_cancellation(
+        sell, sell_number["activation_id"], sell_number["number"],
+        "Already registered on Meesho")
+    ok = wait_until(lambda: bool(coordinator.stopped), timeout=25)
+    check("cross-provider: OTPSell's refund mismatch is reported", ok,
+          coordinator.stopped)
+    check("cross-provider: only OTPSell is stopped",
+          coordinator.provider_stops == ["otpsell"], coordinator.provider_stops)
+    check("cross-provider: the run itself keeps going",
+          not coordinator.stop_requested.is_set(),
+          coordinator.stop_requested.is_set())
+
+    # OTPIndia's number is still in play: not cancelled, not abandoned.
+    check("cross-provider: OTPIndia's number is not cancelled mid-wait",
+          india.cancel_calls == [], india.cancel_calls)
+    check("cross-provider: OTPIndia's number is still tracked as open",
+          coordinator._open_hold("otpindia") == (PRICE, False),
+          coordinator._open_hold("otpindia"))
+    check("cross-provider: OTPIndia's worker would keep hunting",
+          coordinator._worker_should_stop(india) is False,
+          coordinator._worker_should_stop(india))
+    check("cross-provider: the OTP wait is stretched to cover the cancel window",
+          coordinator._otp_wait_timeout(types.SimpleNamespace(
+              client=india, activation_id=india_number["activation_id"],
+              clean_number=india_number["number"])) >= 120.0,
+          "stretched")
+
+    # No OTP arrives: the cancel at 60s is refused by the window, so it is
+    # deferred and the watcher finishes it once the window has passed.
+    india.cancel_script = [{"type": "ACCESS_CANCEL_WAIT", "seconds": 1},
+                           {"type": "ACCESS_CANCEL"}]
+    result = coordinator.handle_cancellation(
+        india, india_number["activation_id"], india_number["number"],
+        "Recovery: otp_timeout")
+    check("cross-provider: OTPIndia's cancel inside the window is deferred",
+          result.get("deferred") is True, result)
+    check("cross-provider: the run is STILL not halted by it",
+          not coordinator.stop_requested.is_set(),
+          coordinator.stop_requested.is_set())
+    ok = wait_until(lambda: india_number["activation_id"] not in
+                    [r["activation_id"] for r in coordinator.pending_cancels.pending()],
+                    timeout=25)
+    check("cross-provider: the watcher still cancels it once the window passes", ok,
+          coordinator.pending_cancels.pending())
+    check("cross-provider: OTPIndia's money comes back",
+          india_number["activation_id"] in india.refunded, india.refunded)
+    check("cross-provider: OTPIndia's number was never abandoned open",
+          india.open_ids() == [], india.open_ids())
+    check("cross-provider: no extra stop was raised for OTPIndia",
+          coordinator.provider_stops == ["otpsell"], coordinator.provider_stops)
+    coordinator.stop_requested.set()
+
+
 def main():
     print("=" * 70)
     print("Refund tally vs. open activations")
@@ -521,6 +629,7 @@ def main():
         scenario_reported_numbers()
         scenario_out_of_band_refund()
         scenario_real_missing_refund_still_stops()
+        scenario_other_provider_number_survives_a_tally_stop()
         scenario_stop_closes_open_numbers()
         scenario_stop_defers_a_refused_cancel()
         scenario_unmeasurable_price_suspends_tally()

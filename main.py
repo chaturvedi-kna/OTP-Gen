@@ -328,6 +328,15 @@ class ParallelAutomationCoordinator:
         self.active_target = None
         self.active_target_lock = threading.Lock()
 
+        # Providers stopped on their own, mapped to the reason. A problem that
+        # is local to one provider (a refund tally that did not tally) must not
+        # take the whole run down with it: the other providers keep hunting, and
+        # the numbers they have in play are neither abandoned nor interrupted
+        # half way through an OTP wait. A stop without a provider (a broken
+        # checker, a failed referral step, a user /stop) is global.
+        self.stopped_providers = {}
+        self.stopped_providers_lock = threading.Lock()
+
         # Metrics & Worker Status
         self.worker_statuses = {}
         self.worker_attempts = {}
@@ -571,6 +580,35 @@ class ParallelAutomationCoordinator:
         if not (open_unknown or deferred_unknown):
             self._clear_tally_suspension(name)
 
+    # -- provider-scoped stops ----------------------------------------------
+
+    def provider_stop_reason(self, name):
+        """Why this provider was stopped on its own, or None if it is running."""
+        with self.stopped_providers_lock:
+            return self.stopped_providers.get(name)
+
+    def provider_stopped(self, name):
+        return self.provider_stop_reason(name) is not None
+
+    def _worker_should_stop(self, client):
+        """
+        Should this provider's worker stop buying numbers?
+
+        Either the whole run is stopping, or this provider alone was stopped
+        (a refund tally that did not tally). The other providers keep going.
+        """
+        if self.stop_requested.is_set():
+            return True
+        return self.provider_stopped(client.name)
+
+    def _stop_provider(self, name, title):
+        """Stop one provider's worker; returns False if it already was."""
+        with self.stopped_providers_lock:
+            if name in self.stopped_providers:
+                return False
+            self.stopped_providers[name] = title
+        return True
+
     # -- hooks for the deferred-cancellation watcher (cancel_watch.py) -------
 
     def _client_conf(self, client):
@@ -609,8 +647,8 @@ class ParallelAutomationCoordinator:
         deferred_hold, _u2 = self.pending_cancels.hold_total(name, exclude=exclude)
         self._note_balance(name, round(float(balance) + open_hold + deferred_hold, 6))
 
-    def critical_stop(self, title, message):
-        return self._critical_stop(title, message)
+    def critical_stop(self, title, message, provider=None):
+        return self._critical_stop(title, message, provider=provider)
 
     def pending_cancel_hold(self, name=None, exclude=None):
         """(amount still held, whether any of it is unknown) - see cancel_watch."""
@@ -652,11 +690,40 @@ class ParallelAutomationCoordinator:
         with self.attempts_lock:
             self.checker_failure_streak = 0
 
-    def _critical_stop(self, title, message):
-        """Halt ALL workers and send a max-priority alert."""
+    def _critical_stop(self, title, message, provider=None):
+        """
+        Halt the run and send a max-priority alert.
+
+        provider: when the problem is local to ONE provider (a refund tally that
+        did not tally), only that provider's worker is stopped. The other
+        providers keep hunting and the numbers they have in play are neither
+        abandoned nor interrupted half way through an OTP wait - stopping them
+        too used to strand a paid number that could neither be cancelled (its
+        provider's cancel window had not passed) nor watched (the run was
+        over). Without a provider the whole run stops.
+        """
         log(f"CRITICAL STOP: {title} - {message}")
-        self.stop_requested.set()
         self.stats.increment("critical_stops")
+
+        if provider is not None:
+            fresh = self._stop_provider(provider, title)
+            if not fresh:
+                # Already stopped for this provider: a second alert would only
+                # bury the first one.
+                log(f"{provider.upper()} is already stopped ({title}); "
+                    f"not alerting again.")
+                return
+            self.worker_statuses[provider] = f"Stopped ({title})"
+            self.notify.alert(
+                f"🛑 {title}",
+                message + f"\n\nOnly {provider.upper()} is stopped - the other "
+                f"providers keep running and their in-flight numbers are safe. "
+                f"No new numbers will be bought from {provider.upper()} until "
+                f"you /run again."
+            )
+            return
+
+        self.stop_requested.set()
         self.notify.alert(f"🛑 {title}", message + "\n\nAutomation STOPPED - manual check needed.")
 
     # -- Status and Balances for Telegram & CLI ------------------------------
@@ -709,6 +776,13 @@ class ParallelAutomationCoordinator:
         cooldown = self.checker.cooldown_remaining()
         if cooldown > 0:
             lines.append(f"  ⚠️ API cooling down, bot checker in use for ~{cooldown:.0f}s")
+
+        # A provider stopped by its own refund tally: the rest of the run goes on.
+        stopped = [(name, reason) for name, reason in self.stopped_providers.items()]
+        if stopped:
+            for name, reason in sorted(stopped):
+                lines.append(f"  🛑 {name.upper()}: {reason} "
+                             f"(stopped alone; other providers keep running)")
 
         if self.worker_max_attempts:
             att_parts = []
@@ -1479,7 +1553,8 @@ class ParallelAutomationCoordinator:
                         f"Reason for cancel: {reason}{salvage_note}\n\n"
                         "No new numbers will be purchased until you verify this activation "
                         "in the provider panel. The PRIMES bot was left on its OTP "
-                        "screen - if the OTP shows up, enter it manually."
+                        "screen - if the OTP shows up, enter it manually.",
+                        provider=client.name,
                     )
 
         result = {"tally_ok": bool(tally_ok), "salvaged": salvaged, "balance": actual_balance}
@@ -1718,7 +1793,7 @@ class ParallelAutomationCoordinator:
         except Exception as exc:
             log(f"Warning: Could not fetch initial balance: {exc}", prefix=pname)
 
-        while not self.stop_requested.is_set():
+        while not self._worker_should_stop(client):
             # If a target is being processed, pause fetching
             if self.target_found_event.is_set():
                 self.worker_statuses[client.name] = "Paused (target being processed)"
@@ -1753,7 +1828,7 @@ class ParallelAutomationCoordinator:
                         chunk = min(5.0, wait_for - slept)
                         time.sleep(chunk)
                         slept += chunk
-                    if self.stop_requested.is_set():
+                    if self._worker_should_stop(client):
                         break
                     # Re-check after pause
                     continue
@@ -1768,7 +1843,7 @@ class ParallelAutomationCoordinator:
                 self.total_attempts += 1
 
             # SAFETY GATE: never buy a number while a refund discrepancy is open.
-            if self.stop_requested.is_set():
+            if self._worker_should_stop(client):
                 break
 
             self.worker_statuses[client.name] = f"Attempt {current_attempt}/{client_max_attempts}: Requesting number"
@@ -1811,7 +1886,7 @@ class ParallelAutomationCoordinator:
                     )
             except OTPNoBalance as exc:
                 if self._wait_for_pending_otpindia_refunds(client):
-                    if self.stop_requested.is_set():
+                    if self._worker_should_stop(client):
                         break
                     continue
                 balance_wait = getattr(client, "balance_wait_seconds", 0) or client_conf.get("balance_update_delay_seconds", 0)
@@ -1867,7 +1942,7 @@ class ParallelAutomationCoordinator:
 
             if res_type == "NO_BALANCE":
                 if self._wait_for_pending_otpindia_refunds(client):
-                    if self.stop_requested.is_set():
+                    if self._worker_should_stop(client):
                         break
                     continue
                 log(f"Provider reported fatal error: NO_BALANCE (Insufficient Balance)", prefix=pname)
@@ -1945,7 +2020,7 @@ class ParallelAutomationCoordinator:
                 self.stats.increment("bot_claims_denied")
                 self.handle_cancellation(client, activation_id, clean_number,
                                          f"Checker busy: {exc}")
-                if self.stop_requested.is_set():
+                if self._worker_should_stop(client):
                     return
                 continue
             except (CheckerUnavailable, CheckerError) as exc:
@@ -2021,7 +2096,7 @@ class ParallelAutomationCoordinator:
                                 log(f"Self-heal: {pname} still paused, {remaining:.0f}s left...",
                                     prefix=pname)
 
-                        if self.stop_requested.is_set():
+                        if self._worker_should_stop(client):
                             return
 
                         log(f"Self-heal: {pname} resuming after {wait_for:.0f}s pause - "
@@ -2052,7 +2127,7 @@ class ParallelAutomationCoordinator:
                     log(f"Checker error (mode {self.checker.mode}): {exc}. "
                         f"Cancelling number...", prefix=pname)
                 self.handle_cancellation(client, activation_id, clean_number, f"Checker error: {exc}")
-                if self.stop_requested.is_set():
+                if self._worker_should_stop(client):
                     return
                 # With the bot (or the bot fallback) in the checking path, a run
                 # of failures means the checker itself is broken: stop instead
@@ -2097,7 +2172,7 @@ class ParallelAutomationCoordinator:
                 reason = "Already registered on Meesho" if is_registered else "Not registered on Meesho"
                 log(f"Number {clean_number} does not match target. Cancelling on {pname}...", prefix=pname)
                 self.handle_cancellation(client, activation_id, clean_number, reason)
-                if self.stop_requested.is_set():
+                if self._worker_should_stop(client):
                     return
                 continue
 
@@ -2124,12 +2199,12 @@ class ParallelAutomationCoordinator:
                     "found_at": now()
                 })
                 # This worker parks here while the coordinator drives the bot/OTP flow.
-                while self.target_found_event.is_set() and not self.stop_requested.is_set():
+                while self.target_found_event.is_set() and not self._worker_should_stop(client):
                     time.sleep(0.5)
             else:
                 log(f"Another worker already claimed target. Cancelling duplicate...", prefix=pname)
                 self.handle_cancellation(client, activation_id, clean_number, "Duplicate target match")
-                if self.stop_requested.is_set():
+                if self._worker_should_stop(client):
                     return
 
         log(f"Worker stopped.", prefix=pname)
@@ -3065,6 +3140,10 @@ class ParallelAutomationCoordinator:
         self.is_running = True
         self.stop_requested.clear()
         self.target_found_event.clear()
+        # A provider stopped by a refund tally in a previous run starts hunting
+        # again: /run is the explicit "I have looked at it" signal.
+        with self.stopped_providers_lock:
+            self.stopped_providers.clear()
         self.total_attempts = 0
         self.bot_at_number_prompt = False
         self.bot_change_attempts = 0
