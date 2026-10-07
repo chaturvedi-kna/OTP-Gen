@@ -41,32 +41,61 @@ class BalanceGuard:
         return client.get_balance()
 
     def verify_refund(self, client, expected_balance, activation_id=None, number=None,
-                      stop_event=None, prefix=""):
+                      stop_event=None, prefix="", refund_wait=None):
         """
-        Poll the provider balance until it is back at/above expected_balance
-        (minus tolerance), or until refund_wait elapses.
+        Poll the provider balance until it is back at/above the expected
+        balance (minus tolerance), or until the wait elapses.
+
+        expected_balance may be a number or a zero-arg CALLABLE. A callable is
+        re-evaluated on EVERY poll: while this tally waits, other threads keep
+        buying numbers (their money leaves the balance) and other refunds
+        land, so an expectation frozen before the wait would compare the live
+        balance against moments that no longer exist. Re-deriving it each poll
+        is what keeps fast parallel buying from producing a false mismatch -
+        the expectation drops by exactly the debits that happened meanwhile,
+        and only a genuinely missing refund keeps failing.
+
+        refund_wait overrides the configured waiting time for this tally
+        (deferred cancels are patient - their money already waited minutes).
 
         Returns (ok: bool, actual_balance: float).
         """
-        if not self.enabled or expected_balance is None:
+
+        def read_expected():
+            if callable(expected_balance):
+                try:
+                    return expected_balance()
+                except Exception:
+                    return None
+            return expected_balance
+
+        first_expected = read_expected()
+        if not self.enabled or first_expected is None:
             try:
                 return True, float(client.get_balance())
             except Exception:
                 return True, None
 
-        deadline = time.time() + max(1.0, self.refund_wait)
+        wait_seconds = max(1.0, float(refund_wait if refund_wait is not None
+                                        else self.refund_wait))
+        deadline = time.time() + wait_seconds
         last_balance = None
+        last_expected = first_expected
         while True:
+            current_expected = read_expected()
+            if current_expected is not None:
+                last_expected = current_expected
+
             try:
                 last_balance = float(client.get_balance())
             except Exception as exc:
                 self._log(f"[BALANCE-GUARD] balance fetch failed: {exc}", prefix)
                 last_balance = None
 
-            if last_balance is not None and last_balance >= expected_balance - self.tolerance:
+            if last_balance is not None and last_balance >= last_expected - self.tolerance:
                 self._log(
                     f"[BALANCE-GUARD] Refund tallied: balance {last_balance:.4f} "
-                    f">= expected {expected_balance:.4f} (tol {self.tolerance})",
+                    f">= expected {last_expected:.4f} (tol {self.tolerance})",
                     prefix
                 )
                 return True, last_balance
@@ -79,8 +108,8 @@ class BalanceGuard:
             time.sleep(self.poll_interval)
 
         self._log(
-            f"[BALANCE-GUARD] REFUND MISMATCH after {self.refund_wait:.0f}s: "
-            f"expected ~{expected_balance:.4f}, actual {last_balance}",
+            f"[BALANCE-GUARD] REFUND MISMATCH after {wait_seconds:.0f}s: "
+            f"expected ~{last_expected:.4f}, actual {last_balance}",
             prefix
         )
         return False, last_balance

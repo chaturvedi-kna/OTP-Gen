@@ -2,7 +2,7 @@
 Meesho OTP Automation Orchestrator.
 
 Parallel worker execution for SMS providers (TemporaSMS, VSImpro, OtpDoctor,
-OTPCart, OTPIndia) with checker validation, refund/balance safety gating,
+OTPCart, OTPIndia, OTPSell) with checker validation, refund/balance safety gating,
 interactive Telegram commands (/run [provider], /status, /balance, /stop), and
 optional end-to-end automation of the PRIMES Meesho concierge Telegram bot via
 a Telethon userbot.
@@ -325,6 +325,11 @@ class ParallelAutomationCoordinator:
 
         # Thread synchronization primitives
         self.stop_requested = threading.Event()
+        # Why the run is stopping: "user" (/stop) aborts everything at once;
+        # "critical" (refund mismatch, broken checker) stops the buying but
+        # must NOT strand an in-flight OTP wait - that number is already paid
+        # for, so its code still gets its full window (see wait_for_otp).
+        self._stop_source = None
         self.target_found_event = threading.Event()
         self.active_target = None
         self.active_target_lock = threading.Lock()
@@ -448,6 +453,39 @@ class ParallelAutomationCoordinator:
         entry["number"] = meta.get("number")
         return entry
 
+    def _hold_totals(self, name, exclude=None):
+        """
+        (money currently held by the provider for `name`, any-hold-unknown).
+
+        Two sources, merged by activation id:
+          1. the pending-cancel queue (JSON store) - deferred cancels whose
+             refunds the watcher is still maturing;
+          2. IN-FLIGHT purchases from the SQLite ledger (state OPEN) - numbers
+             already bought and debited but not yet deferred/consumed (e.g.
+             the number the PRIMES bot is doing a login for right now).
+
+        Without (2), a refund tallied while another number is mid-checkout
+        compares the balance against a world where that number's price never
+        left it - the false "REFUND DID NOT TALLY" that stopped runs whenever
+        a deferred refund and the next buys overlapped.
+        """
+        queued, queued_unknown = self.pending_cancels.hold_total(name, exclude=exclude)
+        try:
+            inflight, inflight_unknown = self.refund_ledger.open_hold_total(
+                name, states=("OPEN",))
+        except Exception:
+            inflight, inflight_unknown = 0.0, False
+        if exclude is not None:
+            # An OPEN row for the excluded activation is its own hold - never
+            # deducted from its own tally.
+            try:
+                row = self.refund_ledger.activation(name, exclude)
+                if row and row.get("state") == "OPEN" and row.get("hold") is not None:
+                    inflight = max(0.0, inflight - float(row["hold"]))
+            except Exception:
+                pass
+        return (queued + inflight), bool(queued_unknown or inflight_unknown)
+
     def _note_balance(self, name, balance, source=""):
         """
         Record a provider balance observation together with the holds that
@@ -462,29 +500,37 @@ class ParallelAutomationCoordinator:
         except (TypeError, ValueError):
             return
         try:
-            holds, unknown = self.pending_cancels.hold_total(name)
+            holds, unknown = self._hold_totals(name)
         except Exception:
             holds, unknown = 0.0, False
         self.refund_ledger.note_balance(
             name, balance, source=source, holds=holds, holds_unknown=unknown
         )
 
-    def _note_activation(self, name, activation_id, number, operator=None):
+    def _note_activation(self, name, activation_id, number, operator=None, hold=None):
         with self.ledger_lock:
             self.ledger_meta.setdefault(name, {})
             self.ledger_meta[name]["activation_id"] = activation_id
             self.ledger_meta[name]["number"] = number
         try:
             self.refund_ledger.record_purchase(
-                name, activation_id, number=number, operator=operator
+                name, activation_id, number=number, operator=operator, hold=hold
             )
+        except Exception:
+            pass
+
+    def _mark_activation_closed(self, name, activation_id, outcome):
+        """The activation is fully settled: its in-flight hold stops counting."""
+        try:
+            self.refund_ledger.mark_resolved(name, activation_id, outcome=outcome)
         except Exception:
             pass
 
     def _expected_balance(self, name, activation_id):
         """
         The balance this provider should be back at once the activation is
-        refunded - minus the money still held by OTHER deferred cancellations.
+        refunded - minus the money still held by OTHER pending cancels and
+        OTHER in-flight purchases.
 
         Derived from the stored (baseline, baseline_holds) pair:
 
@@ -499,11 +545,30 @@ class ParallelAutomationCoordinator:
         (fast parallel buying) understated every later tally by the held
         amounts - and a refund that never arrived passed unnoticed.
         """
-        hold, _unknown = self.pending_cancels.hold_total(name, exclude=activation_id)
+        hold, _unknown = self._hold_totals(name, exclude=activation_id)
         try:
             return self.refund_ledger.expected(name, holds_excluded=hold)
         except Exception:
             return None
+
+    def hold_breakdown(self, name):
+        """One diagnostic line for mismatch alerts (/balance debug output)."""
+        try:
+            queued, queued_unknown = self.pending_cancels.hold_total(name)
+            inflight, inflight_unknown = self.refund_ledger.open_hold_total(
+                name, states=("OPEN",))
+            row = self.refund_ledger.baseline(name) or {}
+            base = row.get("baseline")
+            parts = [
+                f"baseline {base if base is not None else '?'}",
+                f"pending-cancel holds {queued:.4f}"
+                f"{'+?' if queued_unknown else ''}",
+                f"in-flight holds {inflight:.4f}"
+                f"{'+?' if inflight_unknown else ''}",
+            ]
+            return "; ".join(parts)
+        except Exception as exc:
+            return f"breakdown unavailable ({exc})"
 
     # -- hooks for the deferred-cancellation watcher (cancel_watch.py) -------
 
@@ -574,6 +639,7 @@ class ParallelAutomationCoordinator:
     def _critical_stop(self, title, message):
         """Halt ALL workers and send a max-priority alert."""
         log(f"CRITICAL STOP: {title} - {message}")
+        self._stop_source = "critical"
         self.stop_requested.set()
         self.stats.increment("critical_stops")
         self.notify.alert(f"🛑 {title}", message + "\n\nAutomation STOPPED - manual check needed.")
@@ -597,9 +663,9 @@ class ParallelAutomationCoordinator:
                 bal = client.get_balance()
                 line = f"• {client.name.upper()}: {bal:.4f}"
                 try:
-                    hold, unknown = self.pending_cancels.hold_total(client.name)
+                    hold, unknown = self._hold_totals(client.name)
                     if hold > 0 or unknown:
-                        line += (f"  (held by pending cancels: {hold:.4f}"
+                        line += (f"  (held by cancels + in-flight numbers: {hold:.4f}"
                                  f"{' + unknown' if unknown else ''}; "
                                  f"at rest after refunds: {bal + hold:.4f})")
                 except Exception:
@@ -1082,6 +1148,7 @@ class ParallelAutomationCoordinator:
         return "▶️ Started search for target number."
 
     def request_stop(self):
+        self._stop_source = "user"
         self.stop_requested.set()
         log("Stop requested via command.")
 
@@ -1252,6 +1319,7 @@ class ParallelAutomationCoordinator:
             # stands and the code is reported immediately.
             self.stats.increment("late_otp_salvaged")
             self.stats.increment("numbers_consumed")
+            self._mark_activation_closed(client.name, activation_id, "CONSUMED")
             code = salvaged_now.get("code")
             sms = salvaged_now.get("sms", "")
             log(f"🚨 OTP arrived despite the refused cancel! Code: {code}", prefix=pname)
@@ -1311,6 +1379,7 @@ class ParallelAutomationCoordinator:
             except Exception:
                 pass
             self.stats.increment("numbers_consumed")
+            self._mark_activation_closed(client.name, activation_id, "CONSUMED")
             log(f"Number consumed (SMS delivered); new balance baseline: {actual_balance}", prefix=pname)
         else:
             # Salvage race: an OTP may have landed as the cancel was processed.
@@ -1354,6 +1423,7 @@ class ParallelAutomationCoordinator:
                 except Exception:
                     pass
                 self.stats.increment("numbers_consumed")
+                self._mark_activation_closed(client.name, activation_id, "CONSUMED")
                 log(f"Number consumed (late OTP delivered); new balance "
                     f"baseline: {actual_balance}", prefix=pname)
                 tally_ok = True
@@ -1377,14 +1447,19 @@ class ParallelAutomationCoordinator:
                         f"{actual_balance}", prefix=pname)
                     tally_ok = True
                 else:
+                    # NOTE: the expectation is RE-DERIVED on every poll inside
+                    # the guard - numbers bought while this tally waits would
+                    # otherwise make a correct refund look missing.
                     tally_ok, actual_balance = self.guard.verify_refund(
-                        client, expected_balance,
+                        client,
+                        lambda: self._expected_balance(client.name, activation_id),
                         activation_id=activation_id, number=number,
                         stop_event=self.stop_requested, prefix=pname,
                     )
 
                 if expected_balance is not None and tally_ok:
                     self.stats.increment("refunds_verified")
+                    self._mark_activation_closed(client.name, activation_id, "REFUNDED")
                     self._note_balance(client.name, actual_balance)
                 elif expected_balance is not None and not tally_ok:
                     self.stats.increment("refunds_missing")
@@ -1396,6 +1471,7 @@ class ParallelAutomationCoordinator:
                         f"[{pname}] REFUND DID NOT TALLY",
                         f"Number: {number}\nActivation: {activation_id}\n"
                         f"Expected balance: ~{expected_balance:.4f}\nActual balance: {actual_balance}\n"
+                        f"({self.hold_breakdown(client.name)})\n"
                         f"Reason for cancel: {reason}{salvage_note}\n\n"
                         "No new numbers will be purchased until you verify this activation "
                         "in the provider panel. The PRIMES bot was left on its OTP "
@@ -1454,7 +1530,18 @@ class ParallelAutomationCoordinator:
         except Exception as exc:
             log(f"Could not read the balance for the deferred cancel: {exc}", prefix=pname)
 
-        if balance is not None and expected_balance is not None:
+        # Best hold: the price measured at purchase time - exactly THIS
+        # activation's money. The expected-minus-balance difference also
+        # contains whatever else was bought in between under parallel load,
+        # so it is only a fallback (e.g. price check disabled).
+        try:
+            row = self.refund_ledger.activation(client.name, activation_id)
+            if row and row.get("hold") is not None:
+                hold = float(row["hold"])
+        except Exception:
+            pass
+
+        if hold is None and balance is not None and expected_balance is not None:
             # How much of the expected balance is still tied up in this
             # activation: every later refund tally is measured against the
             # expected balance minus this hold.
@@ -1645,6 +1732,19 @@ class ParallelAutomationCoordinator:
             self.worker_statuses[client.name] = f"Attempt {current_attempt}/{client_max_attempts}: Requesting number"
             log(f"Requesting number (Attempt {current_attempt}/{client_max_attempts})...", prefix=pname)
 
+            # Price read (before): the number's cost is measured as the
+            # balance difference ACROSS the getNumber call - raw reads,
+            # immune to whatever the ledger model has or has not settled yet
+            # (a refund that landed but was not booked would distort any
+            # model-based prediction). automation.price_check_on_buy=false
+            # skips this extra read.
+            pre_buy_balance = None
+            if self.settings.get("price_check_on_buy", True):
+                try:
+                    pre_buy_balance = float(client.get_balance())
+                except Exception:
+                    pre_buy_balance = None
+
             # Request number based on provider type
             try:
                 if client.name == "tempora":
@@ -1778,8 +1878,23 @@ class ParallelAutomationCoordinator:
             activation_id = res["activation_id"]
             raw_number = res["number"]
             clean_number = CheckerClient.format_number(raw_number)
+
+            # Price the purchase immediately: balance before getNumber minus
+            # balance right after it. Booked as an IN-FLIGHT hold, this price
+            # is what keeps every refund tally honest while this number is
+            # still being checked / driven through the bot - any tally taken
+            # during that time counts this money as still out.
+            price = None
+            if pre_buy_balance is not None:
+                try:
+                    live_after = float(client.get_balance())
+                    measured = round(pre_buy_balance - live_after, 6)
+                    if 0 < measured < 1000:
+                        price = measured
+                except Exception:
+                    price = None
             self._note_activation(client.name, activation_id, clean_number,
-                                  operator=res.get("operator"))
+                                  operator=res.get("operator"), hold=price)
 
             context = NumberContext(
                 client=client,
@@ -2228,6 +2343,8 @@ class ParallelAutomationCoordinator:
             except Exception as exc:
                 log(f"Note: could not record the linked account: {exc}", prefix=pname)
             # The account is created - accept the provider charge (status 6).
+            self._mark_activation_closed(context.provider_name,
+                                         context.activation_id, "CONSUMED")
             try:
                 context.client.finish(context.activation_id)
                 log(f"Activation {context.activation_id} finished after link.", prefix=pname)
@@ -2845,6 +2962,31 @@ class ParallelAutomationCoordinator:
             f"- no refund is possible before that.", prefix=pname)
         return window_left
 
+    def _otp_wait_should_continue(self, context):
+        """False when this OTP wait must be aborted early.
+
+        A USER /stop aborts right away. A CRITICAL stop (refund mismatch,
+        broken checker) halts the buying, but an in-flight target number is
+        already paid for: abandoning its OTP wait now would throw away both
+        the money and a possibly-usable code (exactly what happened when a
+        false refund mismatch stopped the run mid-OTP). The wait keeps going
+        to the end of its window so a late OTP can still be surfaced, and the
+        normal recovery then cancels/recovers the number.
+        automation.keep_otp_wait_on_critical_stop=false restores the old
+        immediate-abort behaviour.
+        """
+        if not self.stop_requested.is_set():
+            return True
+        if getattr(self, "_stop_source", None) != "critical":
+            return False
+        if not self.settings.get("keep_otp_wait_on_critical_stop", True):
+            return False
+        with self.active_target_lock:
+            target = self.active_target
+        if target is None or target is not context:
+            return False
+        return str(getattr(target, "activation_id", "")) == str(context.activation_id)
+
     def wait_for_otp(self, context):
         """
         Poll the provider for the SMS.
@@ -2865,8 +3007,14 @@ class ParallelAutomationCoordinator:
 
         log(f"Waiting for OTP on {context.clean_number} ({pname}) (Timeout: {timeout:.0f}s)...", prefix=pname)
         last_log = 0
+        stop_noted = False
 
-        while (time.time() - start_time) < timeout and not self.stop_requested.is_set():
+        while (time.time() - start_time) < timeout and self._otp_wait_should_continue(context):
+            if self.stop_requested.is_set() and not stop_noted:
+                stop_noted = True
+                log(f"Run stopping (critical), but {context.clean_number} is already "
+                    f"paid - keeping its OTP wait to the end of the window so a "
+                    f"late code can still be used.", prefix=pname)
             elapsed = int(time.time() - start_time)
             try:
                 status_res = context.client.get_status(context.activation_id)
@@ -2930,6 +3078,7 @@ class ParallelAutomationCoordinator:
     def run(self):
         self.is_running = True
         self.stop_requested.clear()
+        self._stop_source = None
         self.target_found_event.clear()
         self.total_attempts = 0
         self.bot_at_number_prompt = False
@@ -3262,6 +3411,8 @@ class ParallelAutomationCoordinator:
                 return "continue" if not self.stop_requested.is_set() else "stop"
 
             # Manual mode: surface the OTP and finish (historical behavior).
+            self._mark_activation_closed(target.provider_name,
+                                         target.activation_id, "CONSUMED")
             self.notify.otp_result(code, target.clean_number, sms, provider_name=target.provider_name)
             if self.settings.get("auto_finish_activation", True):
                 try:

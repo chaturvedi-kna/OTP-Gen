@@ -958,6 +958,300 @@ def test_cancel_expectation_with_parallel_buys():
     coordinator2.stop_requested.set()
 
 
+# --- in-flight holds: the live-run failure mode ---------------------------------
+
+class _WalletClient:
+    """A minimal provider client backed by a mutable balance."""
+    def __init__(self, name, balance):
+        self.name = name
+        self.balance = balance
+        self.fail_balance = False
+    def get_balance(self):
+        if self.fail_balance:
+            raise RuntimeError("balance unreadable")
+        return self.balance
+
+
+def test_inflight_holds_and_buy_pricing():
+    """
+    In-flight holds: numbers bought but not yet deferred/consumed.
+
+    The OTPSell live run false-stopped because an expected balance was frozen
+    while ~6 more buys happened during the tally's poll. The fix prices every
+    purchase at buy-time (predicted live balance - balance right after
+    getNumber) and counts that price as an IN-FLIGHT hold in every expected
+    calculation. This checks the math end to end.
+    """
+    reset_http()
+    coordinator = build_coordinator()
+    pname = "tempora"
+    wallet = _WalletClient(pname, 100.0)
+
+    coordinator._note_balance(pname, wallet.get_balance(), source="seed")
+
+    def buy(act):
+        """What the worker does: price = balance before - after getNumber."""
+        before = wallet.get_balance()
+        wallet.balance -= 10.0                      # provider debits the number
+        price = round(before - wallet.get_balance(), 6)
+        coordinator._note_activation(pname, act, "9x" + act, hold=price)
+        return before, price
+
+    before_a, price_a = buy("A")
+    check("in-flight: A priced at 10 across the buy",
+          before_a == 100.0 and price_a == 10.0, (before_a, price_a))
+
+    before_b, price_b = buy("B")
+    check("in-flight: B priced at 10 while A is still in play",
+          before_b == 90.0 and price_b == 10.0, (before_b, price_b))
+
+    total, unknown = coordinator._hold_totals(pname)
+    check("in-flight: two OPEN purchases hold 20, all known",
+          total == 20.0 and unknown is False, (total, unknown))
+    check("in-flight: an activation never pays its own hold twice",
+          coordinator._hold_totals(pname, exclude="A") == (10.0, False),
+          coordinator._hold_totals(pname, exclude="A"))
+
+    before_c, price_c = buy("C")
+    check("in-flight: C priced at 10 while A and B are still in play",
+          before_c == 80.0 and price_c == 10.0, (before_c, price_c))
+    check("in-flight: expected(A) = at-rest 100 - 20 held by others",
+          coordinator._expected_balance(pname, "A") == 80.0,
+          coordinator._expected_balance(pname, "A"))
+
+    # B is consumed by the bot (charge stands): its hold must STOP counting.
+    coordinator._mark_activation_closed(pname, "B", "CONSUMED")
+    coordinator._note_balance(pname, wallet.get_balance(), source="consume")
+    check("in-flight: B's charge booked against at-rest (100-10=90)",
+          coordinator._expected_balance(pname, "X") == 70.0
+          and coordinator._ledger(pname)["expected_balance"] == 70.0,
+          coordinator._ledger(pname))
+
+    # A's window refuses its cancel; the balance is unreadable. The recorded
+    # purchase price becomes the deferred hold - never 'unknown', bookkeeping
+    # stays exact.
+    wallet.fail_balance = True
+    res = coordinator._defer_cancellation(
+        wallet, "A", "9xA", "Already registered on Meesho",
+        coordinator._expected_balance(pname, "A"),
+        cancel_res={"type": "ACCESS_CANCEL_WAIT", "seconds": 60},
+    )
+    record = coordinator.pending_cancels.store.get("A")
+    check("in-flight: unreadable balance falls back to the measured price",
+          res.get("deferred") is True and record is not None
+          and record.get("hold") == 10.0, (res.get("deferred"), record))
+    ledger_row = coordinator.refund_ledger.activation(pname, "A")
+    check("in-flight: the deferred row left the OPEN set (no double count)",
+          ledger_row is not None and ledger_row.get("state") == "DEFERRED",
+          ledger_row)
+    total_after, unknown_after = coordinator._hold_totals(pname)
+    check("in-flight: A moved from in-flight to queued - total unchanged (20)",
+          total_after == 20.0 and unknown_after is False,
+          (total_after, unknown_after))
+    check("in-flight: hold contents diagnosable for alerts",
+          "in-flight holds 10.0000" in coordinator.hold_breakdown(pname)
+          and "pending-cancel holds 10.0000" in coordinator.hold_breakdown(pname),
+          coordinator.hold_breakdown(pname))
+
+    coordinator.stop_requested.set()
+
+
+def test_watcher_expected_rederived_while_buys_continue():
+    """
+    The exact live-run false stop, reproduced deterministically: A's deferred
+    refund tally runs its poll WHILE another number is being bought. A FROZEN
+    expectation compares the world-that-was against the balance-that-is and
+    cries mismatch; the re-derived expectation drops with the new debit and
+    the (correct) refund tallies cleanly - no critical stop.
+    """
+    reset_http()
+    coordinator = build_coordinator()
+    pname = "tempora"
+    wallet = _WalletClient(pname, 100.0)
+    coordinator._note_balance(pname, wallet.get_balance(), source="seed")
+
+    # A is bought and parked as a deferred cancel (10 held).
+    wallet.balance -= 10.0
+    coordinator._note_activation(pname, "A", "9xA", hold=10.0)
+    coordinator.pending_cancels.store.add({
+        "provider": pname, "activation_id": "A", "number": "9xA",
+        "hold": 10.0, "expiry_at": time.time() + 600,
+        "deferred_at_epoch": time.time(),
+    })
+    coordinator.refund_ledger.mark_deferred(pname, "A", hold=10.0)
+
+    # The watcher retries A's cancel: the refund LANDS (+10 -> 100), and the
+    # expectation is frozen the way the old code froze it.
+    wallet.balance += 10.0
+    frozen = coordinator._expected_balance(pname, "A")
+    check("watcher: frozen expectation is 100 while nothing else is in play",
+          frozen == 100.0, frozen)
+
+    bought = {"b": False}
+
+    def expected_for_a():
+        # What the live run did: another number is bought DURING the poll.
+        # (Priced exactly like the worker: balance before - after getNumber.)
+        if not bought["b"]:
+            bought["b"] = True
+            before = wallet.get_balance()
+            wallet.balance -= 10.0
+            coordinator._note_activation(
+                pname, "B", "9xB",
+                hold=round(before - wallet.get_balance(), 6))
+        return coordinator._expected_balance(pname, "A")
+
+    coordinator.guard.poll_interval_seconds = 0.05
+    ok, actual = coordinator.guard.verify_refund(
+        wallet, expected_for_a, activation_id="A", prefix=pname.upper(),
+        refund_wait=2.0)
+    check("watcher: refund tallies although a buy landed mid-poll",
+          ok is True and actual == 90.0, (ok, actual))
+    check("watcher: the buy was booked (B in-flight, expected(A) == 90)",
+          coordinator._expected_balance(pname, "A") == 90.0,
+          coordinator._expected_balance(pname, "A"))
+
+    # A genuinely MISSING refund still fails - the re-derivation is not a
+    # rubber stamp. A's 10 was never refunded and B now holds 10, so the
+    # balance (80 after a phantom extra debit) can never reach 90.
+    wallet.balance = 80.0
+    ok2, actual2 = coordinator.guard.verify_refund(
+        wallet, expected_for_a, activation_id="A", prefix=pname.upper())
+    check("watcher: a real shortfall is still detected",
+          ok2 is False and actual2 == 80.0, (ok2, actual2))
+
+    coordinator.stop_requested.set()
+
+
+def test_otp_wait_survives_critical_stop():
+    """
+    A paid in-flight OTP wait must never be sacrificed to a critical stop.
+    The live incident: a false refund mismatch stopped the run, the 80s OTP
+    wait aborted at second ~20, and the code that landed afterwards was
+    charged but never seen. Now a critical stop only halts the BUYING - the
+    active target's wait runs to its natural end, while /stop still aborts
+    right away.
+    """
+    reset_http()
+
+    class ScriptedClient:
+        def __init__(self):
+            self.name = "tempora"
+            self.polls = 0
+            self.stop_after = 3
+            self.code_after = 5
+            self.coordinator = None
+        def get_status(self, activation_id):
+            self.polls += 1
+            if self.polls == self.stop_after and self.coordinator is not None:
+                self.coordinator._stop_source = "critical"
+                self.coordinator.stop_requested.set()
+            if self.polls >= self.code_after:
+                return {"type": "STATUS_OK", "code": "447191",
+                        "sms": "Your Meesho OTP is 447191"}
+            return {"type": "STATUS_WAIT_CODE"}
+
+    coordinator = build_coordinator(
+        otp_timeout_seconds=5.0, otp_poll_interval_seconds=0.05,
+        timeout_salvage_probes=0, keep_otp_wait_on_critical_stop=True,
+    )
+    client = ScriptedClient()
+    client.coordinator = coordinator
+    ctx = m.NumberContext(client, "act-otp", "919123456789", "9123456789")
+    with coordinator.active_target_lock:
+        coordinator.active_target = ctx
+
+    started = time.time()
+    kind, status = coordinator.wait_for_otp(ctx)
+    elapsed = time.time() - started
+    check("otp wait: code arriving AFTER a critical stop is still delivered",
+          kind == "ok" and (status or {}).get("code") == "447191"
+          and client.polls >= 5, (kind, status, client.polls))
+    check("otp wait: the wait outlived the stop instead of aborting",
+          elapsed > 0.15, round(elapsed, 3))
+    check("otp wait: no early 'timeout' misread after a stop",
+          kind != "timeout", kind)
+
+    # The toggle restores the old abort-on-any-stop behaviour.
+    coordinator2 = build_coordinator(
+        otp_timeout_seconds=5.0, otp_poll_interval_seconds=0.05,
+        timeout_salvage_probes=0, keep_otp_wait_on_critical_stop=False,
+    )
+    client2 = ScriptedClient()
+    client2.coordinator = coordinator2
+    ctx2 = m.NumberContext(client2, "act-otp2", "919123456789", "9123456789")
+    with coordinator2.active_target_lock:
+        coordinator2.active_target = ctx2
+    started2 = time.time()
+    kind2, _ = coordinator2.wait_for_otp(ctx2)
+    elapsed2 = time.time() - started2
+    check("otp wait: toggle off -> the old immediate abort",
+          kind2 == "timeout" and elapsed2 < 1.5 and client2.polls <= 4,
+          (kind2, round(elapsed2, 3), client2.polls))
+
+    # A USER /stop always aborts, protected or not.
+    coordinator3 = build_coordinator(
+        otp_timeout_seconds=5.0, otp_poll_interval_seconds=0.05,
+        timeout_salvage_probes=0, keep_otp_wait_on_critical_stop=True,
+    )
+    client3 = ScriptedClient()
+    client3.code_after = 50
+    ctx3 = m.NumberContext(client3, "act-otp3", "919123456789", "9123456789")
+    with coordinator3.active_target_lock:
+        coordinator3.active_target = ctx3
+
+    def user_stop():
+        time.sleep(0.15)
+        coordinator3._stop_source = "user"
+        coordinator3.stop_requested.set()
+
+    threading.Thread(target=user_stop, daemon=True).start()
+    started3 = time.time()
+    kind3, _ = coordinator3.wait_for_otp(ctx3)
+    elapsed3 = time.time() - started3
+    check("otp wait: /stop aborts immediately even for the active target",
+          kind3 == "timeout" and elapsed3 < 2.0, (kind3, round(elapsed3, 3)))
+    check("otp wait: /stop really came from the user path",
+          coordinator3._stop_source == "user", coordinator3._stop_source)
+
+    coordinator.stop_requested.set()
+    coordinator2.stop_requested.set()
+    coordinator3.stop_requested.set()
+
+
+def test_ledger_open_hold_rows():
+    """OPEN purchase rows carry the measured price and leave the open set."""
+    case_dir = os.path.join(SCRATCH_DIR, "ledger_open_holds")
+    os.makedirs(case_dir, exist_ok=True)
+    ledger = RefundLedger(filename=os.path.join(case_dir, "ledger.db"))
+
+    ledger.note_balance("otpsell", 100.0, source="seed", holds=0.0)
+    ledger.record_purchase("otpsell", "a1", number="91x1", hold=10.0)
+    ledger.record_purchase("otpsell", "a2", number="91x2", hold=None)
+    total, unknown = ledger.open_hold_total("otpsell")
+    check("ledger holds: one priced + one unpriced OPEN row",
+          total == 10.0 and unknown is True, (total, unknown))
+
+    row = ledger.activation("otpsell", "a1")
+    check("ledger holds: activation() returns the priced OPEN row",
+          row is not None and row.get("state") == "OPEN"
+          and row.get("hold") == 10.0, row)
+    check("ledger holds: unknown activation -> None",
+          ledger.activation("otpsell", "nope") is None,
+          ledger.activation("otpsell", "nope"))
+
+    ledger.mark_deferred("otpsell", "a1", hold=10.0, reason="window")
+    total2, unknown2 = ledger.open_hold_total("otpsell")
+    check("ledger holds: DEFERRED rows do not count as in-flight",
+          total2 == 0.0 and unknown2 is True, (total2, unknown2))
+
+    ledger.mark_resolved("otpsell", "a2", outcome="CONSUMED")
+    total3, unknown3 = ledger.open_hold_total("otpsell")
+    check("ledger holds: resolved rows leave every tally",
+          total3 == 0.0 and unknown3 is False, (total3, unknown3))
+    ledger.close()
+
+
 def main():
     print("=" * 60)
     print("OTPSELL PROVIDER + SQLITE REFUND LEDGER CHECK")
@@ -980,6 +1274,10 @@ def main():
     test_ledger_thread_safety_smoke()
     test_refund_race_regression()
     test_cancel_expectation_with_parallel_buys()
+    test_inflight_holds_and_buy_pricing()
+    test_watcher_expected_rederived_while_buys_continue()
+    test_otp_wait_survives_critical_stop()
+    test_ledger_open_hold_rows()
 
     os.chdir(REPO_DIR)
     print("=" * 60)

@@ -294,11 +294,20 @@ class RefundLedger:
 
     # -- activation audit trail -------------------------------------------------
 
-    def record_purchase(self, provider, activation_id, number=None, operator=None):
-        """A number was bought: open an audit row (idempotent)."""
+    def record_purchase(self, provider, activation_id, number=None, operator=None,
+                        hold=None):
+        """A number was bought: open an audit row (idempotent).
+
+        hold: the measured price when known (measured right after getNumber,
+        see the worker's price check). While the row stays OPEN it counts as
+        an IN-FLIGHT hold: money the provider already deducted but that is not
+        yet queued as a deferred cancel. That is what lets a refund tally
+        recompute correctly while other numbers are still being bought.
+        """
         self._upsert_activation(
             provider, activation_id,
             number=number, operator=operator, state="OPEN",
+            hold=hold, hold_unknown=hold is None,
             acquired_at=_utcnow(),
         )
 
@@ -353,6 +362,28 @@ class RefundLedger:
         except Exception as exc:
             self._log(f"refund ledger activation write failed: {exc}")
 
+    def activation(self, provider, activation_id):
+        """One audit row (dict) or None."""
+        if self._db is None:
+            return None
+        try:
+            with self._lock:
+                cur = self._db.execute(
+                    "SELECT provider, activation_id, number, operator, state, hold,"
+                    " hold_unknown, reason, acquired_at, updated_at FROM activations"
+                    " WHERE provider = ? AND activation_id = ?",
+                    (str(provider), str(activation_id)),
+                )
+                row = cur.fetchone()
+            if row is None:
+                return None
+            cols = ["provider", "activation_id", "number", "operator", "state",
+                    "hold", "hold_unknown", "reason", "acquired_at", "updated_at"]
+            return dict(zip(cols, row))
+        except Exception as exc:
+            self._log(f"refund ledger activation lookup failed: {exc}")
+            return None
+
     def open_activations(self, provider=None, states=("OPEN", "DEFERRED")):
         """Audit listing of activations that are not fully closed."""
         if self._db is None:
@@ -375,6 +406,40 @@ class RefundLedger:
         except Exception as exc:
             self._log(f"refund ledger open_activations failed: {exc}")
             return []
+
+    def open_hold_total(self, provider, states=("OPEN",)):
+        """
+        (total, unknown) of holds for activations in the given states.
+
+        Default: IN-FLIGHT purchases (bought, not yet deferred/consumed/
+        refunded) - the watcher queue's JSON store covers DEFERRED ones, so
+        the coordinator merges the two for its refund math.
+        """
+        if self._db is None:
+            return 0.0, False
+        try:
+            placeholders = ",".join("?" for _ in states)
+            with self._lock:
+                cur = self._db.execute(
+                    f"SELECT hold FROM activations WHERE provider = ?"
+                    f" AND state IN ({placeholders})",
+                    [str(provider), *states],
+                )
+                rows = cur.fetchall()
+        except Exception as exc:
+            self._log(f"refund ledger open_hold_total failed: {exc}")
+            return 0.0, False
+        total = 0.0
+        unknown = False
+        for (hold,) in rows:
+            if hold is None:
+                unknown = True
+                continue
+            try:
+                total += float(hold)
+            except (TypeError, ValueError):
+                unknown = True
+        return total, unknown
 
     # -- maintenance -------------------------------------------------------------
 

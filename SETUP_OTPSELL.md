@@ -103,6 +103,38 @@ Behaviour on a missing refund is unchanged where it matters: it still
 critical-stops and alerts (except now it actually detects it under parallel
 load instead of waving it through).
 
+### Live-run hardening (why a tally can never race the buying again)
+
+A real run once stopped on a false `REFUND DID NOT TALLY`: the watcher's
+expectation was frozen when a deferred refund started polling, ~6 numbers
+were bought during the 60 s poll, and the live balance could never reach the
+frozen number. The fix set on top of the SQLite ledger:
+
+* **In-flight holds** — every purchase is priced the moment it happens
+  (`balance before getNumber − balance right after`) and recorded as an OPEN
+  row in the ledger. Any refund tally taken while that number is still being
+  checked / driven through the bot counts its money as still out. When the
+  number is consumed (code submitted, account created) or deferred, the hold
+  moves to its end state and stops counting. Disable with
+  `automation.price_check_on_buy: false`.
+* **Expectations are re-derived every poll** — `verify_refund` accepts a
+  getter instead of a frozen number, so numbers bought while a refund is
+  being tallied lower the expectation by exactly their price. Only a
+  genuinely missing refund keeps failing.
+* **Deferred refunds are patient** — once a refused cancel is finally
+  accepted (the money already waited out the whole window), the tally waits
+  `automation.deferred_refund_wait_seconds` (default `240`) before it calls
+  the mismatch, which providers that credit refunds asynchronously need.
+* **A critical stop never strands a paid OTP wait** — a refund mismatch
+  stops the *buying*, but the active target's OTP wait runs to the end of
+  its window so a late code can still be used (before, it was aborted
+  mid-wait and the provider charged the delivered SMS anyway). A user
+  `/stop` still aborts immediately; restore the old behaviour with
+  `automation.keep_otp_wait_on_critical_stop: false`.
+* **Diagnostics in alerts** — a critical-stop alert now carries the ledger
+  breakdown (baseline, pending-cancel holds, in-flight holds) so a real
+  dispute has its numbers attached, and `/balance` shows both hold kinds.
+
 ### Worked example (each number costs 10, balance starts at 100)
 
 A is bought (balance 90) and sits in its cancel window. Meanwhile B, C, D are

@@ -88,6 +88,11 @@ DEFAULT_SETTINGS = {
     # Hard cap for one deferred cancellation (a stuck provider must not keep a
     # watcher alive forever); on expiry it is reported, not silently dropped.
     "cancel_error_max_wait_seconds": 1800,
+    # How long the deferred refund tally stays patient before declaring a
+    # mismatch: providers credit refunds asynchronously (and meanwhile other
+    # numbers keep being bought), so a generous wait + per-tick re-derived
+    # expectation keeps real losses visible without false critical stops.
+    "deferred_refund_wait_seconds": 240,
 }
 
 SETTING_ALIASES = {
@@ -117,7 +122,7 @@ def resolve_settings(settings):
     merged["cancel_error_retry_attempts"] = max(1, int(merged["cancel_error_retry_attempts"]))
     for key in ("cancel_error_expiry_seconds", "cancel_error_grace_seconds",
                 "cancel_error_poll_interval_seconds", "cancel_error_retry_delay_seconds",
-                "cancel_error_max_wait_seconds"):
+                "cancel_error_max_wait_seconds", "deferred_refund_wait_seconds"):
         merged[key] = max(0.0, float(merged[key]))
     return merged
 
@@ -675,13 +680,42 @@ class CancelWatchManager:
 
         actual = None
         tally_ok = True
-        if guard is not None and expected is not None:
+        stop_event = getattr(self.owner, "stop_requested", None)
+        if stop_event is not None and stop_event.is_set():
+            # The run is already stopping: buying has halted, so a live re-derivation
+            # could not settle, and a mismatch now would only alert over a shutdown.
+            # Keep the record - the next run retries the tally.
+            self._log("[DEFERRED-CANCEL] Skipping refund tally (run is stopping).", pname)
+        elif guard is not None and expected is not None:
+            # Re-derive the expectation on EVERY poll: the worker keeps buying
+            # numbers while this tally waits (each buy lowers the live
+            # balance), so an expectation frozen before the wait made a
+            # correct refund look missing - the false "REFUND DID NOT TALLY"
+            # that stopped the OTPSell live run. The getter counts the holds
+            # of the numbers bought meanwhile, so only a genuinely missing
+            # refund keeps failing.
+            wait_seconds = self.settings.get("deferred_refund_wait_seconds", 240)
+
+            def _remaining_expected(frozen=expected, getter=expected_getter,
+                                    aid=activation_id, provider=record.get("provider")):
+                if stop_event is not None and stop_event.is_set():
+                    return frozen
+                if callable(getter):
+                    try:
+                        val = getter(provider, aid)
+                        if val is not None:
+                            return float(val)
+                    except Exception:
+                        pass
+                return frozen
+
             try:
                 tally_ok, actual = guard.verify_refund(
-                    client, expected,
+                    client, _remaining_expected,
                     activation_id=activation_id, number=number,
-                    stop_event=getattr(self.owner, "stop_requested", None),
+                    stop_event=stop_event,
                     prefix=pname,
+                    refund_wait=wait_seconds,
                 )
             except Exception as exc:
                 self._log(f"[DEFERRED-CANCEL] Refund check failed: {exc}", pname)
@@ -733,11 +767,21 @@ class CancelWatchManager:
         except Exception:
             pass
         critical = getattr(self.owner, "critical_stop", None)
+        breakdown = ""
+        hb = getattr(self.owner, "hold_breakdown", None)
+        if callable(hb):
+            try:
+                breakdown = f"\nLedger at stop: {hb(record.get('provider'))}."
+            except Exception:
+                breakdown = ""
         message = (
             f"`{number}` (activation {activation_id}, {record.get('reason')})\n"
             f"Expected ~{expected}, actual {actual}; last cancel answer {res_type}{waited}.\n"
+            f"The expectation was re-derived while the tally waited (numbers bought "
+            f"meanwhile are accounted), so this one looks real.\n"
             f"Deferred cancel retried and the refund still did not tally - verify "
             f"this activation in the provider panel before buying more numbers."
+            f"{breakdown}"
         )
         if callable(critical):
             critical(f"[{pname}] REFUND DID NOT TALLY (deferred cancel)", message)

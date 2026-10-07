@@ -224,6 +224,9 @@
     "cancel_error_poll_interval_seconds": 20,
     "cancel_error_retry_attempts": 3,
     "cancel_error_retry_delay_seconds": 30,
-    "cancel_error_max_wait_seconds": 1800
+    "cancel_error_max_wait_seconds": 1800,
+    "deferred_refund_wait_seconds": 240,
+    "price_check_on_buy": true,
+    "keep_otp_wait_on_critical_stop": true
   }
 }
